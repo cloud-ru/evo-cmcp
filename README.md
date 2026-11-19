@@ -14,15 +14,12 @@ Registry и Container Apps — и развёртывает `docker-compose`-пр
 - **MCP-сервер для AI-агентов** (Claude Code, Cursor и др.): `evo mcp` по stdio
   или Streamable HTTP, в том числе в Docker. У каждого инструмента MCP есть
   команда консольной утилиты с тем же ответом: `--json` команды — то, что видит агент, кроме
-  шести команд из закрытого списка ([mcp.md](docs/mcp.md#ответ-инструмента-и---json-команды)):
-  `evo deploy`, `evo destroy`, `evo doctor` и трёх устаревших алиасов.
+  команд из закрытого списка ([mcp.md](docs/mcp.md#ответ-инструмента-и---json-команды)):
+  `evo deploy`, `evo destroy`, `evo doctor` 
 - **Ничего платного без согласия**: создание ресурсов и удаление данных
   показывают превью с ценой и ждут подтверждения — одинаково у человека и у
   агента.
 
-**CREW edition** — редакция для команд Cloud.ru. Вопросы и ошибки — в
-[Issues](https://github.com/cloud-ru/evo-cmcp/issues/new/choose); уязвимость —
-не в Issues, а приватным отчётом: [SECURITY.md](SECURITY.md).
 
 ## Возможности (v1.9.0)
 
