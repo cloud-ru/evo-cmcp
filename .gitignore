@@ -1,0 +1,28 @@
+/evo
+/cloudru-vm
+/cloudru-vm-*
+*.bak-*
+.DS_Store
+
+# Рабочее состояние движка: приватный ключ доступа к сборочным ВМ
+# (.cloudru-vm/ — старое имя, читается до v2.0).
+.evo/
+.cloudru-vm/
+# Собранный бинарь
+/bin/
+
+# Креды. Движок ходит в облако от имени сервисного аккаунта: утёкший ключ
+# даёт создание ВМ, дисков и образов за чужой счёт.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+credentials.yaml
+
+# Вывод goreleaser
+/dist/
+# Байткод Python.
+__pycache__/
+.cache/

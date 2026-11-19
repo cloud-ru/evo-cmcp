@@ -1,0 +1,126 @@
+# Релизная сборка: бинари под 6 платформ, архивы, SBOM архивов,
+# checksums.txt, подпись cosign keyless.
+# Локальная проверка без публикации и подписи (без syft — и без SBOM):
+#   goreleaser check
+#   goreleaser release --snapshot --clean --skip=sign,sbom
+version: 2
+
+project_name: evo
+
+# Один и тот же main собирается дважды: evo и alias cloudru-vm на один
+# переходный период (удаляется в v2.0). Бинарь узнаёт alias по имени файла
+# (os.Args[0]) и печатает в stderr строку о переименовании. Две сборки, а не
+# symlink в архиве: в zip для Windows symlink нет, а копия под другим именем
+# работает на всех шести платформах одинаково.
+builds:
+  - id: evo
+    main: ./cmd/evo
+    binary: evo
+    env: &env
+      # Статический бинарь: без libc на машине пользователя и без
+      # кросс-компилятора C на CI.
+      - CGO_ENABLED=0
+    goos: &goos [linux, darwin, windows]
+    goarch: &goarch [amd64, arm64]
+    flags: &flags
+      - -trimpath
+    ldflags: &ldflags
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .FullCommit }}
+      - -X main.date={{ .CommitDate }}
+    # Время файлов = время коммита: одна и та же ревизия даёт те же байты.
+    mod_timestamp: &mod_timestamp "{{ .CommitTimestamp }}"
+
+  # alias: тот же код, другое имя файла. Убрать в v2.0 вместе с install.sh.
+  - id: cloudru-vm-alias
+    main: ./cmd/evo
+    binary: cloudru-vm
+    env: *env
+    goos: *goos
+    goarch: *goarch
+    flags: *flags
+    ldflags: *ldflags
+    mod_timestamp: *mod_timestamp
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    # evo_1.0.0_linux_amd64.tar.gz — install.sh собирает то же имя. В
+    # архиве оба бинаря: evo и alias cloudru-vm (ids не заданы — все builds).
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - NOTICE*
+      - README.md
+      # CHANGELOG — с разделом «Миграция» версии; на него ссылается guide.md.
+      - CHANGELOG.md
+      # README ссылается на docs/*.md — в распакованном архиве они должны
+      # быть рядом (и те, на которые ссылаются они сами: rename.md).
+      # Документы процесса разработки — нет.
+      - docs/agent-skill.md
+      - docs/auth.md
+      - docs/commands.md
+      - docs/exit-codes.md
+      - docs/guide.md
+      - docs/install.md
+      - docs/mcp.md
+      - docs/rename.md
+      - docs/tools.md
+      - docs/troubleshooting.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# SBOM каждого архива (SPDX JSON, syft): evo_1.3.0_linux_amd64.tar.gz.sbom.json.
+# Файлы SBOM входят в checksums.txt, поэтому их покрывает его подпись и
+# attestation происхождения (release.yml). syft ставится в release.yml.
+sboms:
+  - artifacts: archive
+
+# Keyless: сертификат выдаёт Fulcio на OIDC-токен GitHub Actions, запись
+# ложится в Rekor. Ключей хранить не нужно; проверка — по identity workflow
+# (команда в docs/install.md). Бандл .sigstore.json содержит подпись,
+# сертификат и доказательство включения в журнал.
+signs:
+  - id: checksum
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+  - id: archive
+    cmd: cosign
+    artifacts: archive
+    signature: "${artifact}.sigstore.json"
+    args: ["sign-blob", "--bundle=${signature}", "${artifact}", "--yes"]
+
+# Сборка из main (ci.yml, dev-build) — не выпуск: в версии -dev и sha.
+# main собирает следующую minor (1.7.x → 1.8.0-dev-<sha>), а не patch
+# последнего тега.
+snapshot:
+  version_template: "{{ incminor .Version }}-dev-{{ .ShortCommit }}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^Merge "
+
+release:
+  github:
+    owner: cloud-ru
+    name: evo-cmcp
+  # Отображаемое имя продукта (internal/product); бинарь и архивы — evo.
+  name_template: "evo CMCP {{ .Tag }}"
+  # v1.0.0-rc.1 и подобные помечаются как pre-release.
+  prerelease: auto
+  # Анонс выпуска — над списком коммитов, из файла в репозитории
+  # docs/release-notes/<тег>.md: известные
+  # ограничения и миграцию пишет релиз до тега, а не руками на GitHub.
+  # readFile отдаёт пустую строку, если файла нет: выпуск без анонса идёт,
+  header: '{{ readFile (printf "docs/release-notes/%s.md" .Tag) }}'

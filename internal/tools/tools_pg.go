@@ -1,0 +1,859 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/config"
+	"github.com/cloud-ru/evo-cmcp/internal/deployplan"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/postgresql"
+	"github.com/cloud-ru/evo-cmcp/internal/pricing"
+)
+
+// specMenuCap caps how many specifications the need_specification menu returns.
+// The full list (17+ specs, each ~10 fields) overflows the agent trajectory
+// (trajectory-array-size-limit). Cheapest-first + a truncated count is enough
+// to pick from.
+const specMenuCap = 12
+
+// compactSpecs returns a compact, cheapest-first, capped view of PG specs:
+// only the fields an agent needs to choose (id, display_name, cpu, memory,
+// deployment_mode, min_storage_gb). Returns the menu and how many were dropped.
+func compactSpecs(specs []map[string]any, cap int) ([]map[string]any, int) {
+	sorted := make([]map[string]any, len(specs))
+	copy(sorted, specs)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ci, cj := toF(sorted[i]["cpu"]), toF(sorted[j]["cpu"])
+		if ci != cj {
+			return ci < cj
+		}
+		return toF(sorted[i]["memory"]) < toF(sorted[j]["memory"])
+	})
+	trunc := 0
+	if len(sorted) > cap {
+		trunc = len(sorted) - cap
+		sorted = sorted[:cap]
+	}
+	out := make([]map[string]any, 0, len(sorted))
+	for _, s := range sorted {
+		minStorage := specMinStorage(s)
+		name := s["display_name"]
+		if name == nil {
+			name = s["name"] // Kafka/Redis specs use "name"
+		}
+		row := map[string]any{
+			"id": s["id"], "display_name": name,
+			"cpu": s["cpu"], "memory": s["memory"],
+			"deployment_mode": s["deployment_mode"], "min_storage_gb": minStorage,
+		}
+		// The limits a create is checked against, when the service lists
+		// them (PG max_hosts, Kafka min/max_brokers).
+		for _, k := range []string{"max_hosts", "min_brokers", "max_brokers"} {
+			if v, ok := s[k]; ok && v != nil {
+				row[k] = v
+			}
+		}
+		out = append(out, row)
+	}
+	return out, trunc
+}
+
+// pgClient builds an authenticated Managed PostgreSQL client.
+func (s *Registry) pgClient(ctx context.Context) (*postgresql.Client, error) {
+	cli, _, err := s.pgClientEng(ctx)
+	return cli, err
+}
+
+// pgClientEng also returns the engine (for subnet resolution in pg_create).
+// Uses authedEngine (not newEngine) so eng.Cloud (the compute adapter) carries a
+// valid bearer — otherwise eng.Cloud.ListSubnets 403s with "RBAC: access denied".
+func (s *Registry) pgClientEng(ctx context.Context) (*postgresql.Client, *engine.Engine, error) {
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return postgresql.New(tok.Value, eng.Config.ProjectID, ""), eng, nil
+}
+
+func pgInt(args map[string]any, key string, def int) int {
+	switch v := args[key].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func toF(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case string:
+		f, _ := strconv.ParseFloat(n, 64)
+		return f
+	}
+	return 0
+}
+
+// --- Clusters: read ---
+
+func (s *Registry) handlePgList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListClusters(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{
+			"id":      m["id"],
+			"name":    m["name"],
+			"status":  firstNonNil(m["status"], m["state"]),
+			"version": m["version"],
+			"health":  m["health"],
+		})
+	}
+	return toJSON(map[string]any{"clusters": out}), false
+}
+
+func (s *Registry) handlePgGet(ctx context.Context, args map[string]any) (string, bool) {
+	id, err := aliasArg(args, "id", "cluster_id")
+	if err != nil {
+		return errResult(err), true
+	}
+	if id == "" {
+		return usageT("'id' is required (get it from pg_list)", "нужен 'id' (из pg_list)"), true
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.GetCluster(ctx, id)
+	if err != nil {
+		return errResult(err), true
+	}
+	m["access"] = pgAccess()
+	return toJSON(m), false
+}
+
+func pgAccess() string {
+	return i18n.T("placed in the subnets of subnet_ids; the PostgreSQL API takes no public-access parameter; evo sets up none",
+		"размещён в подсетях subnet_ids; API PostgreSQL не принимает параметра публичного доступа; evo его не настраивает")
+}
+
+// --- Reference ---
+
+func (s *Registry) handlePgVersions(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListVersions(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(map[string]any{"versions": items}), false
+}
+
+func (s *Registry) handlePgSpecs(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	// /v1/specifications requires a version_name (404 without it) → default to latest.
+	version := stringArg(args, "version")
+	if version == "" {
+		if vers, e := cli.ListVersions(ctx); e == nil {
+			version = pickLatestVersion(vers)
+		}
+	}
+	items, err := cli.ListSpecifications(ctx, version)
+	if err != nil {
+		return errResult(err), true
+	}
+	// Cheapest-first + cap so the 17-element array can't overflow the agent
+	// trajectory (trajectory-array-size-limit → non-deliverable turn).
+	sort.SliceStable(items, func(i, j int) bool {
+		ci, cj := toF(items[i]["cpu"]), toF(items[j]["cpu"])
+		if ci != cj {
+			return ci < cj
+		}
+		return toF(items[i]["memory"]) < toF(items[j]["memory"])
+	})
+	trunc := 0
+	if len(items) > specMenuCap {
+		trunc = len(items) - specMenuCap
+		items = items[:specMenuCap]
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{
+			"id":              m["id"],
+			"display_name":    m["display_name"],
+			"cpu":             m["cpu"],
+			"memory_gb":       m["memory"],
+			"deployment_mode": m["deployment_mode"],
+			"flavor_type":     m["flavor_type"],
+			"min_storage_gb":  m["min_storage_gb"],
+			"max_hosts":       m["max_hosts"],
+		})
+	}
+	res := map[string]any{"specifications": out}
+	if trunc > 0 {
+		res["specifications_truncated"] = trunc
+	}
+	return toJSON(res), false
+}
+
+func (s *Registry) handlePgOperation(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "operation_id")
+	if id == "" {
+		return usageT("'operation_id' is required", "нужен 'operation_id'"), true
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return s.operation(ctx, "pg_operation", args, func(ctx context.Context) (any, error) { return cli.GetOperation(ctx, id) })
+}
+
+// --- Cluster lifecycle (mutations) ---
+
+func pickLatestVersion(versions []map[string]any) string {
+	best, bestN := "", -1
+	for _, v := range versions {
+		name, _ := v["name"].(string)
+		if name == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(name); err == nil {
+			if n > bestN {
+				bestN, best = n, name
+			}
+		} else if best == "" {
+			best = name
+		}
+	}
+	return best
+}
+
+func findSpec(specs []map[string]any, specID string, cpu, ram int) map[string]any {
+	if specID != "" {
+		for _, sp := range specs {
+			if id, _ := sp["id"].(string); id == specID {
+				return sp
+			}
+		}
+		return nil
+	}
+	if cpu > 0 && ram > 0 {
+		for _, sp := range specs {
+			if int(toF(sp["cpu"])) == cpu && int(toF(sp["memory"])) == ram {
+				return sp
+			}
+		}
+	}
+	return nil
+}
+
+func pgMaxHosts(spec map[string]any) int {
+	if n := int(toF(spec["max_hosts"])); n > 0 {
+		return n
+	}
+	switch mode, _ := spec["deployment_mode"].(string); strings.ToLower(mode) {
+	case "standard":
+		return 2
+	case "business":
+		return 3
+	}
+	return 0
+}
+
+func (s *Registry) planPgCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	if name == "" {
+		return nil, usageErr("'name' is required", "нужен 'name'")
+	}
+	instances := pgInt(args, "instances", 1)
+	cli, eng, err := s.pgClientEng(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := cli.ListClusters(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list clusters: %w", "проверка, что имя свободно: список кластеров: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("PostgreSQL cluster", "кластер PostgreSQL"), name, id, st, "pg_get id="+id)), nil
+	}
+
+	// Resolve version (default: latest available).
+	versions, err := cli.ListVersions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("list versions: %w", "список версий: %w"), err)
+	}
+	version := stringArg(args, "version")
+	if err := notInCatalogue(i18n.T("PostgreSQL version", "версии PostgreSQL"), version, listed(versions, "name"), "pg_versions"); err != nil {
+		return nil, err
+	}
+	if version == "" {
+		version = pickLatestVersion(versions)
+	}
+
+	// Resolve specification (by id, or by cpu+ram).
+	specs, err := cli.ListSpecifications(ctx, version)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("list specifications: %w", "список спецификаций: %w"), err)
+	}
+	specArg, cpu, ram := stringArg(args, "specification_id"), pgInt(args, "cpu", 0), pgInt(args, "ram", 0)
+	spec := findSpec(specs, specArg, cpu, ram)
+	if spec == nil {
+		// Not enough info to pick a spec — hand the agent a COMPACT, capped menu.
+		// Returning all 17 full spec objects overflows the agent trajectory
+		// (trajectory-array-size-limit → non-deliverable turn). Keep the key
+		// fields, cheapest-first, capped.
+		menu, trunc := compactSpecs(specs, specMenuCap)
+		out := map[string]any{
+			"resolved_version":         version,
+			"available_specifications": menu,
+		}
+		if trunc > 0 {
+			out["specifications_truncated"] = trunc
+		}
+		return answered(needSpecResult("pg_specs", specArg, cpu, ram, out)), nil
+	}
+	specID, _ := spec["id"].(string)
+	if maxHosts := pgMaxHosts(spec); maxHosts > 0 && instances > maxHosts {
+		return answered(usageResult(fmt.Errorf("instances %d: specification %s (%s) takes 1-%d nodes", instances, quoteCloud(specID), quoteCloud(fmt.Sprint(firstNonNil(spec["deployment_mode"], spec["display_name"]))), maxHosts)), true), nil
+	}
+
+	storageGB, err := specStorage(args, "storage_gb", spec, 50)
+	if err != nil {
+		return nil, err
+	}
+	initialDB := stringArg(args, "initial_database")
+	if initialDB == "" {
+		initialDB = "defaultdb"
+	}
+
+	// Backup config. Backups CANNOT be enabled/disabled after creation (API rule),
+	// and without a backup spec the cluster reports "backup disabled" (manual
+	// pg_backup_create + pg_backups both 400). So enable automatic backups BY
+	// DEFAULT with the documented defaults (weekly Sun 03:00, 14-day retention);
+	// allow overrides, or no_backup:true to opt out.
+	backupEnabled := true
+	if nb, _ := args["no_backup"].(bool); nb {
+		backupEnabled = false
+	}
+	var backupSpec map[string]any
+	if backupEnabled {
+		schedule := stringArg(args, "backup_schedule")
+		if schedule == "" {
+			schedule = "0 3 * * 0"
+		}
+		retention := pgInt(args, "backup_retention_days", 14)
+		backupSpec = map[string]any{"schedule": schedule, "retention_policy_days": retention}
+	}
+
+	// The subnet defines the zone: explicit subnet_id, else the configured
+	// region's, else a subnet of an open zone (ru.AZ-2 first) — as Kafka
+	// and Redis. It was the project's first subnet of any zone, a closed
+	// one included (final audit, N-06).
+	subnetID, subnetName, _, zone, err := dbaasSubnet(ctx, eng, stringArg(args, "subnet_id"))
+	if err != nil {
+		return dbaasSubnetErr(err)
+	}
+
+	willCreate := map[string]any{
+		"name":             name,
+		"version":          version,
+		"specification_id": specID,
+		"cpu":              spec["cpu"],
+		"memory_gb":        spec["memory"],
+		"deployment_mode":  spec["deployment_mode"],
+		"storage_gb":       storageGB,
+		"instances":        instances,
+		"subnet_id":        subnetID,
+		"zone":             zone,
+		"initial_database": initialDB,
+		"backup_enabled":   backupEnabled,
+	}
+	if subnetName != "" {
+		willCreate["subnet_name"] = subnetName
+	}
+	if backupSpec != nil {
+		willCreate["backup_schedule"] = backupSpec["schedule"]
+		willCreate["backup_retention_days"] = backupSpec["retention_policy_days"]
+	}
+	priced, err := s.completePreview(ctx, eng, pgCreatePreview(eng.Config, willCreate))
+	if err != nil {
+		return nil, err
+	}
+	preview := map[string]any{"message": i18n.T("pg_create provisions a BILLABLE Managed PostgreSQL cluster (~minutes).",
+		"pg_create создаёт ПЛАТНЫЙ кластер Managed PostgreSQL (несколько минут)."),
+		"will_create": willCreate,
+		"preview":     priced,
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		body := map[string]any{
+			"name":             name,
+			"project_id":       cli.ProjectID(),
+			"version":          version,
+			"specification_id": specID,
+			"storage":          map[string]any{"pg_data_gb": storageGB},
+			"initial_database": initialDB,
+			"instances":        instances,
+			"subnet_ids":       []string{subnetID},
+		}
+		if backupSpec != nil {
+			body["backup"] = backupSpec
+		}
+		if d := stringArg(args, "description"); d != "" {
+			body["description"] = d
+		}
+		op, err := cli.CreateCluster(ctx, body)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			return lostCreate(ctx, "pg_create", cli.ListClusters, i18n.T("PostgreSQL cluster", "кластер PostgreSQL"), name, willCreate, "pg_get id", fmt.Errorf(i18n.T("create cluster: %w", "создание кластера: %w"), err))
+		}
+		out := map[string]any{
+			"status":       "creating",
+			"operation_id": op.ID,
+			"created":      willCreate,
+			"note": i18n.T("Cluster creation is async (~minutes). Poll pg_operation(operation_id) until done=true; then pg_list/pg_get for status READY.",
+				fmt.Sprintf("Кластер создаётся асинхронно (несколько минут). Ход: evo pg operation %s — до done=true; затем evo pg list или evo pg get — до статуса READY.", quoteCloud(op.ID))),
+		}
+		if op.ResourceID != "" {
+			out["cluster_id"] = op.ResourceID
+		} else {
+			out["note"] = i18n.T("Cluster creation is async (~minutes). Poll pg_operation(operation_id) until done=true; pg_list shows the cluster's id by its name, then pg_get for status READY.",
+				fmt.Sprintf("Кластер создаётся асинхронно (несколько минут). Ход: evo pg operation %s — до done=true; id кластера по имени покажет evo pg list, затем evo pg get <id> — до статуса READY.", quoteCloud(op.ID)))
+		}
+		s.goingOn(ctx, out, "pg_operation", op.ID, op.ResourceID, nil)
+		return toJSON(out), false
+	}}, nil
+}
+
+func (s *Registry) planPgDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	id, err := aliasArg(args, "id", "cluster_id")
+	if err != nil {
+		return nil, err
+	}
+	if id == "" {
+		return nil, usageErr("'id' is required (from pg_list)", "нужен 'id' (из pg_list)")
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deletePlan("pg_delete", "pg_delete PERMANENTLY deletes PostgreSQL cluster %s, its databases and all its backups.",
+		"pg_delete БЕЗВОЗВРАТНО удаляет кластер PostgreSQL %s, его базы данных и все резервные копии.",
+		id, func() (map[string]any, error) { return cli.GetCluster(ctx, id) },
+		func(ctx context.Context) (string, bool) {
+			op, err := cli.DeleteCluster(ctx, id)
+			if err != nil {
+				msg := fmt.Sprintf("delete cluster: %v", err)
+				switch {
+				case strings.Contains(msg, "force flag"):
+					return errResult(clierrors.New(clierrors.CodeAPIError, msg,
+						i18n.T("Cloud.ru deletes a FAILED cluster only with force, which its public API does not accept: delete it in the Cloud.ru console or ask support.", "Кластер в FAILED Cloud.ru удаляет только с force, а публичный API его не принимает: удалите кластер в консоли Cloud.ru или обратитесь в поддержку."))), true
+				case strings.Contains(msg, "FailedPrecondition"):
+					return errResult(clierrors.New(clierrors.CodeAPIError, msg,
+						i18n.T("The cluster is still being created (DEPLOYING): Cloud.ru deletes it through the API once it is READY. Check it with pg_get, then call pg_delete again; a cluster that ends FAILED is deleted only in the Cloud.ru console.", "Кластер ещё создаётся (DEPLOYING): через API Cloud.ru удалит его, когда он станет READY. Проверьте его через pg_get и повторите pg_delete; кластер, оказавшийся в FAILED, удаляется только в консоли Cloud.ru."))), true
+				}
+				return s.deleteFailed("pg_delete", id, fmt.Errorf(i18n.T("delete cluster: %w", "удаление кластера: %w"), err))
+			}
+			return deleteOutcome(ctx, args, opWatch("pg_delete", id, map[string]any{"id": id}, op.ID, "pg_operation", cli.GetOperation))
+		}), nil
+}
+
+// --- Databases ---
+
+func (s *Registry) handlePgDatabases(ctx context.Context, args map[string]any) (string, bool) {
+	cid := stringArg(args, "cluster_id")
+	if cid == "" {
+		return usageT("'cluster_id' is required", "нужен 'cluster_id'"), true
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListDatabases(ctx, cid)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(map[string]any{"databases": items}), false
+}
+
+func (s *Registry) planPgDbCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	cid := stringArg(args, "cluster_id")
+	name := stringArg(args, "name")
+	owner := stringArg(args, "owner")
+	if cid == "" || name == "" || owner == "" {
+		return answered(usageT("'cluster_id', 'name' and 'owner' are required", "нужны 'cluster_id', 'name' и 'owner'"), true), nil
+	}
+	if p := s.pgTakenBeforeQuestion(ctx, pgDatabase, name, cid, func(cli pgLister) func(context.Context) ([]map[string]any, error) {
+		return func(ctx context.Context) ([]map[string]any, error) { return cli.ListDatabases(ctx, cid) }
+	}); p != nil {
+		return p, nil
+	}
+	preview := map[string]any{"message": i18n.Tf("pg_db_create creates database %q (owner %q) in cluster %s.",
+		"pg_db_create создаёт базу данных %q (владелец %q) в кластере %s.", name, owner, cid),
+		"name": name, "owner": owner, "cluster_id": cid}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		cli, err := s.pgClient(ctx)
+		if err != nil {
+			return errResult(err), true
+		}
+		body := map[string]any{"cluster_id": cid, "name": name, "owner": owner}
+		if v := stringArg(args, "lc_collate"); v != "" {
+			body["lc_collate"] = v
+		}
+		if v := stringArg(args, "lc_ctype"); v != "" {
+			body["lc_ctype"] = v
+		}
+		databases := func(ctx context.Context) ([]map[string]any, error) { return cli.ListDatabases(ctx, cid) }
+		if err := pgNameTaken(ctx, pgDatabase, name, cid, databases); err != nil {
+			return errResult(err), true
+		}
+		db, err := cli.CreateDatabase(ctx, cid, body)
+		if err != nil {
+			err = noReceipt(err, i18n.Tf("The database may have been made: pg_databases cluster_id=%s shows it — read it before any repeat.",
+				"База могла быть создана: её покажет evo pg databases %s — прочитайте до любого повтора.", cid))
+			err = fmt.Errorf(i18n.T("create database: %w", "создание базы: %w"), err)
+			return errResult(pgCreateOfExisting(ctx, pgDatabase, name, databases, err)), true
+		}
+		return toJSON(map[string]any{"status": "created", "database": db}), false
+	}}, nil
+}
+
+func (s *Registry) planPgDbDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	cid := stringArg(args, "cluster_id")
+	name := stringArg(args, "name")
+	if cid == "" || name == "" {
+		return nil, usageErr("'cluster_id' and 'name' are required", "нужны 'cluster_id' и 'name'")
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := cli.GetCluster(ctx, cid); err != nil {
+		return nil, err
+	}
+	items, err := cli.ListDatabases(ctx, cid)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.ContainsFunc(items, func(m map[string]any) bool { return m["name"] == name }) {
+		return answered(s.deleteFailed("pg_db_delete", name, clierrors.New(clierrors.CodeNotFound,
+			i18n.Tf("no database %q in cluster %s", "базы данных %q в кластере %s нет", name, cid), ""))), nil
+	}
+	preview := map[string]any{"message": i18n.Tf("pg_db_delete PERMANENTLY drops database %q in cluster %s.",
+		"pg_db_delete БЕЗВОЗВРАТНО удаляет базу данных %q в кластере %s.", name, cid)}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		if err := cli.DeleteDatabase(ctx, cid, name); err != nil {
+			return s.deleteFailed("pg_db_delete", name, fmt.Errorf(i18n.T("delete database: %w", "удаление базы: %w"), err))
+		}
+		return toJSON(map[string]any{"status": "deleted", "database": name}), false
+	}}, nil
+}
+
+// --- Users ---
+
+func (s *Registry) handlePgUsers(ctx context.Context, args map[string]any) (string, bool) {
+	cid := stringArg(args, "cluster_id")
+	if cid == "" {
+		return usageT("'cluster_id' is required", "нужен 'cluster_id'"), true
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListUsers(ctx, cid)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(map[string]any{"users": items}), false
+}
+
+func (s *Registry) planPgUserCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	cid := stringArg(args, "cluster_id")
+	name := stringArg(args, "name")
+	password := stringArg(args, "password")
+	if cid == "" || name == "" || password == "" {
+		return nil, usageErr("'cluster_id', 'name' and 'password' are required", "нужны 'cluster_id', 'name' и 'password'")
+	}
+	if err := pgPasswordRule(password); err != nil {
+		return nil, err
+	}
+	if p := s.pgTakenBeforeQuestion(ctx, pgUser, name, cid, func(cli pgLister) func(context.Context) ([]map[string]any, error) {
+		return func(ctx context.Context) ([]map[string]any, error) { return cli.ListUsers(ctx, cid) }
+	}); p != nil {
+		return p, nil
+	}
+	preview := map[string]any{"message": i18n.Tf("pg_user_create creates user %q in cluster %s.",
+		"pg_user_create создаёт пользователя %q в кластере %s.", name, cid),
+		"name": name, "cluster_id": cid}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		cli, err := s.pgClient(ctx)
+		if err != nil {
+			return errResult(err), true
+		}
+		users := func(ctx context.Context) ([]map[string]any, error) { return cli.ListUsers(ctx, cid) }
+		if err := pgNameTaken(ctx, pgUser, name, cid, users); err != nil {
+			return errResult(err), true
+		}
+		body := map[string]any{"cluster_id": cid, "name": name, "password": password}
+		u, err := cli.CreateUser(ctx, cid, body)
+		if err != nil {
+			err = noReceipt(err, i18n.Tf("The user may have been made: pg_users cluster_id=%s shows it — read it before any repeat.",
+				"Пользователь мог быть создан: его покажет evo pg users %s — прочитайте до любого повтора.", cid))
+			err = fmt.Errorf(i18n.T("create user: %w", "создание пользователя: %w"), err)
+			return errResult(pgCreateOfExisting(ctx, pgUser, name, users, err)), true
+		}
+		// Never echo the password back.
+		return toJSON(map[string]any{"status": "created", "user": u}), false
+	}}, nil
+}
+
+// pgNamed is a thing of a PostgreSQL cluster known by its name — a user, a
+// database — for the answer of a create that failed while the cluster has
+// one of the name (pgCreateOfExisting): what it is called, and the
+// sentence that says why deleting it and creating it anew is not the way.
+type pgNamed struct {
+	what, whatRU string
+	// itRU is the Russian pronoun of the thing, in the accusative.
+	itRU string
+	// keep, keepRU: "Do not delete it and create it again: …", with no
+	// punctuation at the end.
+	keep, keepRU string
+}
+
+// pgUser is a user of a cluster: a delete and a new create change its
+// password under the applications that use it.
+var pgUser = pgNamed{
+	what: "User", whatRU: "Пользователь", itRU: "его",
+	keep:   "Do not delete it and create it again: that changes its password, and the applications that use it stop connecting",
+	keepRU: "Не удаляйте его и не создавайте заново: это сменит пароль, и приложения, которые им пользуются, перестанут подключаться",
+}
+
+var pgDatabase = pgNamed{
+	what: "Database", whatRU: "База данных", itRU: "её",
+	keep:   "Do not delete it and create it again: a delete destroys its data",
+	keepRU: "Не удаляйте её и не создавайте заново: удаление уничтожит её данные",
+}
+
+func pgCreateOfExisting(ctx context.Context, k pgNamed, name string, list func(context.Context) ([]map[string]any, error), err error) error {
+	items, lerr := list(ctx)
+	if lerr != nil {
+		return err
+	}
+	for _, it := range items {
+		if n, _ := it["name"].(string); n != name {
+			continue
+		}
+		reason, msg, _ := errReason(err, nil)
+		q := quoteCloud(name)
+		hint := i18n.T(
+			fmt.Sprintf("%s %s is in the cluster, and this call may have created it: evo got no answer to the create. %s — ask the person what to do.", k.what, q, k.keep),
+			fmt.Sprintf("%s %s есть в кластере, и %s мог создать этот вызов: ответа на создание evo не получил. %s, — спросите человека, что делать.", k.whatRU, q, k.itRU, k.keepRU))
+		if definiteRefusal(err) {
+			hint = k.existsHint(q)
+		}
+		return clierrors.Wrap(reason, msg, hint, err)
+	}
+	return err
+}
+
+// existsHint is the hint of a create of a thing that was in the cluster
+// before the call: the call made nothing, and the way on is the person's.
+func (k pgNamed) existsHint(q string) string {
+	return i18n.T(
+		fmt.Sprintf("%s %s already exists in the cluster; nothing was created or changed. %s — ask the person what to do.", k.what, q, k.keep),
+		fmt.Sprintf("%s %s уже существует в кластере; ничего не создано и не изменено. %s, — спросите человека, что делать.", k.whatRU, q, k.keepRU))
+}
+
+// pgLister reads the databases and the users of a cluster.
+type pgLister interface {
+	ListDatabases(ctx context.Context, clusterID string) ([]map[string]any, error)
+	ListUsers(ctx context.Context, clusterID string) ([]map[string]any, error)
+}
+
+func (s *Registry) pgTakenBeforeQuestion(ctx context.Context, k pgNamed, name, cluster string, list func(pgLister) func(context.Context) ([]map[string]any, error)) *Plan {
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return nil
+	}
+	if err := pgNameTaken(ctx, k, name, cluster, list(cli)); err != nil {
+		return answered(errResult(err), true)
+	}
+	return nil
+}
+
+func pgNameTaken(ctx context.Context, k pgNamed, name, cluster string, list func(context.Context) ([]map[string]any, error)) error {
+	items, err := list(ctx)
+	if err != nil || !slices.ContainsFunc(items, func(m map[string]any) bool { return m["name"] == name }) {
+		return nil
+	}
+	q := quoteCloud(name)
+	return clierrors.New(clierrors.CodeAPIError,
+		i18n.Tf("%s %s already exists in cluster %s; evo sent no create", "%s %s уже есть в кластере %s; запрос создания evo не отправил", k.what, q, cluster),
+		k.existsHint(q))
+}
+
+const pgPasswordSpecials = `!$%&()*+-,./:;<>=?@[\]^_{|}#`
+
+// pgPasswordRule refuses, before the preview and the question, a password
+// without a character of pgPasswordSpecials: USAGE with the rule and its
+// source, never the password itself (У-4).
+func pgPasswordRule(password string) error {
+	if strings.ContainsAny(password, pgPasswordSpecials) {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("password has no special character: Managed PostgreSQL requires at least one of %s; nothing was sent",
+			"в password нет спецсимвола: Managed PostgreSQL требует хотя бы один из %s; ничего не отправлено", pgPasswordSpecials),
+		i18n.T("Add one of these characters to password. The rule is the platform's answer to pg_user_create (400), which evo checks before the question; other rules of the platform it does not know.",
+			"Добавьте в password один из этих символов. Правило — ответ платформы на pg_user_create (400), его evo проверяет до вопроса; других правил платформы evo не знает."))
+}
+
+func (s *Registry) planPgUserDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	cid := stringArg(args, "cluster_id")
+	name := stringArg(args, "name")
+	if cid == "" || name == "" {
+		return nil, usageErr("'cluster_id' and 'name' are required", "нужны 'cluster_id' и 'name'")
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := cli.GetCluster(ctx, cid); err != nil {
+		return nil, err
+	}
+	items, err := cli.ListUsers(ctx, cid)
+	if err != nil {
+		return nil, err
+	}
+	if !slices.ContainsFunc(items, func(m map[string]any) bool { return m["name"] == name }) {
+		return answered(s.deleteFailed("pg_user_delete", name, clierrors.New(clierrors.CodeNotFound,
+			i18n.Tf("no user %q in cluster %s", "пользователя %q в кластере %s нет", name, cid), ""))), nil
+	}
+	preview := map[string]any{"message": i18n.Tf("pg_user_delete PERMANENTLY deletes user %q in cluster %s.",
+		"pg_user_delete БЕЗВОЗВРАТНО удаляет пользователя %q в кластере %s.", name, cid)}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		if err := cli.DeleteUser(ctx, cid, name); err != nil {
+			return s.deleteFailed("pg_user_delete", name, fmt.Errorf(i18n.T("delete user: %w", "удаление пользователя: %w"), err))
+		}
+		return toJSON(map[string]any{"status": "deleted", "user": name}), false
+	}}, nil
+}
+
+// --- Backups ---
+
+func (s *Registry) handlePgBackups(ctx context.Context, args map[string]any) (string, bool) {
+	cid := stringArg(args, "cluster_id")
+	if cid == "" {
+		return usageT("'cluster_id' is required", "нужен 'cluster_id'"), true
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListBackups(ctx, cid)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(map[string]any{"backups": items}), false
+}
+
+func (s *Registry) planPgBackupCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	cid := stringArg(args, "cluster_id")
+	name := stringArg(args, "name")
+	if cid == "" || name == "" {
+		return answered(usageT("'cluster_id' and 'name' are required", "нужны 'cluster_id' и 'name'"), true), nil
+	}
+	cli, err := s.pgClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A backup of the name in the cluster: a repeat after a lost answer
+	// made a second one (fault matrix, process audit 1.2.1).
+	list := func(ctx context.Context) ([]map[string]any, error) { return cli.ListBackups(ctx, cid) }
+	existing, err := list(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list backups: %w", "проверка, что имя свободно: список резервных копий: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("backup", "резервная копия"), name, id, st, "pg_backups cluster_id="+cid)), nil
+	}
+	preview := map[string]any{"message": i18n.Tf("pg_backup_create starts a manual backup %q of cluster %s.",
+		"pg_backup_create запускает ручное резервное копирование %q кластера %s.", name, cid),
+		"preview": willPreview(engine.ResourcePGBackup, name, "", map[string]any{"cluster_id": cid}, []string{"cluster_id"})}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		op, err := cli.CreateBackup(ctx, cid, name)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			return lostCreate(ctx, "pg_backup_create", list, i18n.T("backup", "резервная копия"), name, nil, "pg_backups cluster_id="+cid, fmt.Errorf(i18n.T("create backup: %w", "создание резервной копии: %w"), err))
+		}
+		out := map[string]any{"status": "backing_up", "operation_id": op.ID,
+			"note": i18n.T(fmt.Sprintf("Async — poll pg_operation(operation_id). The read of the operation does not read a backup: once it is done, pg_backups cluster_id=%s names the backup and its state.", cid),
+				fmt.Sprintf("Асинхронно — ход: evo pg operation %s. Чтение операции резервную копию не читает: когда операция кончится, копию и её состояние покажет evo pg backups %s.", quoteCloud(op.ID), cid))}
+		if op.ResourceID != "" {
+			out["backup_id"] = op.ResourceID
+		}
+		// A backup has no read of its own: the cluster's list names it.
+		s.goingOn(ctx, out, "pg_operation", op.ID, op.ResourceID, listedBy(list, op.ResourceID, name))
+		return toJSON(out), false
+	}}, nil
+}
+
+// pgCreatePreview is the preview of pg_create: the cluster as resolved,
+// priced by the tariff of Managed PostgreSQL (Price) when its size is known.
+func pgCreatePreview(cfg config.Config, will map[string]any) engine.CreatePreview {
+	name, _ := will["name"].(string)
+	p := engine.CreatePreview{Resource: engine.ResourcePGCluster, Name: name,
+		ProjectID: cfg.ProjectID, ProjectFrom: cfg.ProjectOrigin}
+	// The zone evo picked with the subnet, as kafka_create and redis_create
+	// name theirs.
+	if z, _ := will["zone"].(string); z != "" {
+		p.Zone = &deployplan.RefSpec{Name: z}
+	}
+	for _, k := range []string{"version", "cpu", "memory_gb", "storage_gb", "instances", "deployment_mode",
+		"subnet_id", "subnet_name", "initial_database", "backup_enabled", "backup_schedule", "backup_retention_days"} {
+		p.Add(k, will[k])
+	}
+	p.Add("access", pgAccess())
+	if cpu, ram := pgInt(will, "cpu", 0), pgInt(will, "memory_gb", 0); cpu > 0 && ram > 0 {
+		p.PG = &pricing.PGSize{CPU: cpu, RAMGB: ram, StorageGB: pgInt(will, "storage_gb", 0), Instances: pgInt(will, "instances", 1)}
+	}
+	p.Price()
+	return p
+}

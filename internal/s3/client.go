@@ -1,0 +1,265 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+// Package s3 is a client for Cloud.ru Object Storage (S3-compatible, SigV4),
+// replacing the legacy python boto3 path in cloudru_api.py. Endpoint + keys
+// come from the env (CLOUDRU_S3_ENDPOINT / _ACCESS_KEY / _SECRET_KEY / _REGION),
+// exported by the MCP wrapper from .cloudru/credentials.json. Uses minio-go,
+// which is purpose-built for S3-compatible endpoints like s3.cloud.ru.
+package s3
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
+)
+
+// Client wraps a minio S3 client. Each method that takes a ctx is one
+// operation (httpretry.Operation): minio makes its request anew for each
+// attempt, and the attempts share one X-Request-Id.
+type Client struct {
+	mc     *minio.Client
+	region string
+}
+
+// Config holds the S3 connection parameters.
+type Config struct {
+	Endpoint  string // full URL, e.g. https://s3.cloud.ru
+	AccessKey string
+	SecretKey string
+	Region    string
+}
+
+// New builds an S3 client from config. Endpoint may include a scheme; the
+// scheme decides TLS (https → Secure).
+func New(cfg Config) (*Client, error) {
+	if cfg.AccessKey == "" || cfg.SecretKey == "" {
+		// A configuration problem, not an API error: exit 2, like a missing
+		// Cloud.ru key.
+		return nil, clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.T("S3 credentials not configured (set CLOUDRU_S3_ACCESS_KEY / CLOUDRU_S3_SECRET_KEY, or the s3 section of the profile)", "не заданы ключи S3 (CLOUDRU_S3_ACCESS_KEY / CLOUDRU_S3_SECRET_KEY или раздел s3 профиля)"),
+			// How to set them (agent run M2, Ц-10: the refusal named the
+			// variables only, and configure had no word of S3).
+			i18n.T("The person sets them from the profile's access key and the tenant ID of Object Storage (console: Object Storage, API settings) with evo configure s3; see docs/auth.md, the S3 keys.",
+				"Их задаёт человек из ключа доступа профиля и tenant ID Object Storage (консоль: Object Storage → Параметры работы с API) командой evo configure s3; подробнее — docs/auth.md, «Ключи Object Storage (S3)»."))
+	}
+	endpoint := cfg.Endpoint
+	if endpoint == "" {
+		endpoint = "https://s3.cloud.ru"
+	}
+	secure := true
+	if strings.HasPrefix(endpoint, "http://") {
+		secure = false
+		endpoint = strings.TrimPrefix(endpoint, "http://")
+	} else {
+		endpoint = strings.TrimPrefix(endpoint, "https://")
+	}
+	endpoint = strings.TrimSuffix(endpoint, "/")
+	region := cfg.Region
+	if region == "" {
+		region = "ru-central-1"
+	}
+	mc, err := minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure: secure,
+		Region: region,
+		// evo's User-Agent, and a 2xx HTML page (a gateway's) read as 502.
+		Transport: httpretry.UserAgent(nil),
+	})
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("init S3 client: %w", "инициализация клиента S3: %w"), err)
+	}
+	return &Client{mc: mc, region: region}, nil
+}
+
+// Bucket describes a bucket.
+type Bucket struct {
+	Name    string `json:"name"`
+	Created string `json:"created,omitempty"`
+}
+
+// ListBuckets lists all buckets.
+func (c *Client) ListBuckets(ctx context.Context) ([]Bucket, error) {
+	ctx = httpretry.Operation(ctx)
+	bs, err := c.mc.ListBuckets(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("list buckets: %w", "список бакетов: %w"), err)
+	}
+	out := make([]Bucket, 0, len(bs))
+	for _, b := range bs {
+		out = append(out, Bucket{Name: b.Name, Created: b.CreationDate.Format(time.RFC3339)})
+	}
+	return out, nil
+}
+
+// Object describes an object entry.
+type Object struct {
+	Key          string `json:"key"`
+	Size         int64  `json:"size"`
+	LastModified string `json:"last_modified,omitempty"`
+}
+
+// ListObjects lists up to maxKeys objects under prefix.
+func (c *Client) ListObjects(ctx context.Context, bucket, prefix string, maxKeys int) ([]Object, error) {
+	ctx = httpretry.Operation(ctx)
+	if maxKeys <= 0 {
+		maxKeys = 1000
+	}
+	opts := minio.ListObjectsOptions{Prefix: prefix, Recursive: true, MaxKeys: maxKeys}
+	var out []Object
+	for obj := range c.mc.ListObjects(ctx, bucket, opts) {
+		if obj.Err != nil {
+			return nil, notFound(fmt.Errorf(i18n.T("list objects: %w", "список объектов: %w"), obj.Err), bucket, prefix)
+		}
+		out = append(out, Object{Key: obj.Key, Size: obj.Size, LastModified: obj.LastModified.Format(time.RFC3339)})
+		if len(out) >= maxKeys {
+			break
+		}
+	}
+	return out, nil
+}
+
+// TooLargeError: the object is over the limit GetObject was given.
+type TooLargeError struct {
+	Size  int64 // the object's size; 0 when unknown
+	Limit int64
+}
+
+func (e *TooLargeError) Error() string {
+	if e.Size > 0 {
+		return fmt.Sprintf("object is %d bytes, over the %d-byte limit", e.Size, e.Limit)
+	}
+	return fmt.Sprintf("object is over the %d-byte limit", e.Limit)
+}
+
+// GetObject returns an object's bytes, at most limit of them (limit <= 0:
+// no limit). A larger object is a *TooLargeError, read no further than
+// the limit: an object can be up to 5 TB (docs, Object Storage limits).
+func (c *Client) GetObject(ctx context.Context, bucket, key string, limit int64) ([]byte, error) {
+	ctx = httpretry.Operation(ctx)
+	obj, err := c.mc.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, notFound(fmt.Errorf(i18n.T("get object: %w", "чтение объекта: %w"), err), bucket, key)
+	}
+	defer obj.Close()
+	var r io.Reader = obj
+	if limit > 0 {
+		// The size from the answer's headers, before any body is read.
+		st, serr := obj.Stat()
+		var ce *clierrors.CLIError
+		if serr != nil {
+			if e := notFound(serr, bucket, key); errors.As(e, &ce) {
+				return nil, e
+			}
+		} else if st.Size > limit {
+			return nil, &TooLargeError{Size: st.Size, Limit: limit}
+		}
+		r = io.LimitReader(obj, limit+1)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, notFound(fmt.Errorf(i18n.T("read object %s/%s: %w", "чтение объекта %s/%s: %w"), bucket, key, err), bucket, key)
+	}
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, &TooLargeError{Limit: limit}
+	}
+	return data, nil
+}
+
+func CheckBucketName(bucket string) error {
+	if s3utils.CheckValidBucketName(bucket) == nil {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.T("the bucket name is not a valid S3 bucket name", "имя бакета не подходит для S3"),
+		i18n.T("The buckets of these keys are listed by s3_buckets; a name has no '/' or '\\'.",
+			"Бакеты этих ключей — в выводе s3_buckets; в имени нет '/' и '\\'."))
+}
+
+func notFound(err error, bucket, key string) error {
+	var resp minio.ErrorResponse
+	if !errors.As(err, &resp) {
+		return err
+	}
+	switch {
+	case resp.Code == "NoSuchBucket":
+		return clierrors.Wrap(clierrors.CodeNotFound, i18n.Tf("bucket %q not found", "бакет %q не найден", bucket),
+			i18n.T("s3_buckets lists the buckets of these keys.", "Бакеты этих ключей — в выводе s3_buckets."), err)
+	case resp.Code == "NoSuchKey" || resp.StatusCode == http.StatusNotFound:
+		return clierrors.Wrap(clierrors.CodeNotFound, i18n.Tf("object %s/%s not found", "объект %s/%s не найден", bucket, key),
+			i18n.T("s3_ls lists the objects of the bucket.", "Объекты бакета — в выводе s3_ls."), err)
+	}
+	return err
+}
+
+// PutObject uploads bytes to bucket/key.
+func (c *Client) PutObject(ctx context.Context, bucket, key string, data []byte, contentType string) (int64, error) {
+	ctx = httpretry.Operation(ctx)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	info, err := c.mc.PutObject(ctx, bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: contentType})
+	if err != nil {
+		return 0, fmt.Errorf(i18n.T("put object: %w", "загрузка объекта: %w"), err)
+	}
+	return info.Size, nil
+}
+
+// RemoveObject deletes bucket/key.
+func (c *Client) RemoveObject(ctx context.Context, bucket, key string) error {
+	ctx = httpretry.Operation(ctx)
+	if err := c.mc.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		return fmt.Errorf(i18n.T("remove object: %w", "удаление объекта: %w"), err)
+	}
+	return nil
+}
+
+// AccessDenied tells an error of S3 that refuses the request to this key
+// (403 AccessDenied): the key may not do this, which says nothing of the
+// resource.
+func AccessDenied(err error) bool {
+	var resp minio.ErrorResponse
+	return errors.As(err, &resp) && (resp.Code == "AccessDenied" || resp.StatusCode == http.StatusForbidden)
+}
+
+func (c *Client) MakeBucket(ctx context.Context, bucket, region string) (existed bool, err error) {
+	ctx = httpretry.Operation(ctx)
+	if region == "" {
+		region = c.region
+	}
+	if err := c.mc.MakeBucket(ctx, bucket, minio.MakeBucketOptions{Region: region}); err != nil {
+		if minio.ToErrorResponse(err).Code == "BucketAlreadyOwnedByYou" {
+			return true, nil
+		}
+		if own, errList := c.ListBuckets(ctx); errList == nil {
+			for _, b := range own {
+				if b.Name == bucket {
+					return true, nil
+				}
+			}
+		}
+		return false, fmt.Errorf(i18n.T("create bucket: %w", "создание бакета: %w"), err)
+	}
+	return false, nil
+}
+
+// RemoveBucket deletes an EMPTY bucket.
+func (c *Client) RemoveBucket(ctx context.Context, bucket string) error {
+	ctx = httpretry.Operation(ctx)
+	if err := c.mc.RemoveBucket(ctx, bucket); err != nil {
+		return fmt.Errorf(i18n.T("remove bucket: %w", "удаление бакета: %w"), err)
+	}
+	return nil
+}

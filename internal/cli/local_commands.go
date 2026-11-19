@@ -1,0 +1,43 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+// localCommand is a command of the CLI that calls no registry tool, and why.
+type localCommand struct {
+	Path   string // as cobra's CommandPath: "evo configure list"
+	Reason string // in Russian: it goes to docs/commands.md (REQ-10)
+}
+
+var localCommands = []localCommand{
+	{"evo configure", "пишет ключ доступа в профиль на диске той машины, где стоит evo; MCP-клиент ключей не передаёт по контракту (docs/mcp.md)"},
+	{"evo login", "вход человека в браузере и страница согласия на loopback-порту его машины; ключ записывается в профиль на диске; у MCP-сервера инструмента нет — браузер и порт на машине человека"},
+	{"evo logout", "удаляет ключ, созданный evo login, его же токеном, и профиль на диске той машины, где стоит evo"},
+	{"evo configure list", "читает профили с диска"},
+	{"evo configure delete", "удаляет профиль с диска"},
+	{"evo configure s3", "пишет ключи S3 в профиль на диске той машины, где стоит evo, из его ключа доступа; MCP-клиент ключей не передаёт по контракту (docs/mcp.md)"},
+	{"evo project", "группа: project use — локальная, project list — команда org_projects"},
+	{"evo project use", "пишет проект в профиль на диске"},
+	{"evo init", "интерактивно выбирает зону и образ и пишет .evo.yaml в текущий каталог"},
+	{"evo verify", "TCP/HTTP-проверки портов развёрнутого приложения с машины оператора: с хоста сервера MCP результат был бы другим"},
+	{"evo version", "версия бинаря; MCP отдаёт её в initialize.serverInfo"},
+	{"evo completion", "скрипты автодополнения оболочки; к облаку не обращается"},
+	{"evo completion bash", "скрипт автодополнения bash"},
+	{"evo completion zsh", "скрипт автодополнения zsh"},
+	{"evo completion fish", "скрипт автодополнения fish"},
+	{"evo completion powershell", "скрипт автодополнения PowerShell"},
+	{"evo mcp", "сам сервер MCP"},
+	{"evo mcp healthcheck", "проверка живости сервера MCP (HEALTHCHECK Docker-образа)"},
+	{"evo tools", "доступ к реестру инструментов"},
+	{"evo tools list", "список инструментов реестра"},
+	{"evo tools describe", "описание и схема инструмента"},
+	{"evo tools call", "универсальный вызов любого инструмента"},
+	{"evo agent setup", "пишет настройки MCP-клиента (и правила для агента) в файлы на машине пользователя: у сервера MCP такого действия по природе нет"},
+	{"evo diag", "журнал сессии evo — файл на машине, где стоит evo; клиенту MCP-сервера до него дела нет"},
+	{"evo diag on", "включает журнал сессии в config.yaml"},
+	{"evo diag off", "выключает журнал сессии в config.yaml"},
+	{"evo diag status", "читает файл журнала сессии"},
+	{"evo diag export", "копирует файл журнала сессии для передачи"},
+	{"evo crew", "титры"},
+	{"evo help", "справка cobra"},
+}

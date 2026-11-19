@@ -1,0 +1,288 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package history
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"time"
+	"unicode/utf8"
+
+	"github.com/cloud-ru/evo-cmcp/internal/config"
+	"github.com/cloud-ru/evo-cmcp/internal/state"
+)
+
+// The outcomes of a line: a closed list.
+const (
+	// Created: the call made a resource; ResourceID names it.
+	Created = "created"
+	// Deleted: the call removed the resource.
+	Deleted        = "deleted"
+	AlreadyDeleted = "already_deleted"
+	// Changed: the call changed a resource that was there and is there
+	// after it — a reboot, a resize, a rule of a group.
+	Changed = "changed"
+	// Error: the cloud refused the call; nothing was changed. Reason is
+	// its code.
+	Error = "error"
+	// Unknown: what the call did is not known — it was cut, the cloud's
+	// answer named nothing, the operation goes on, or a person was asked
+	// about it. The line is live until a later line of the same intent.
+	Unknown = "unknown"
+	// Found: a later call read what an earlier one of the same intent did
+	// — its resource is listed, its repeat answered, its operation ended.
+	Found = "found"
+	// NotFound: a read of evo answered that the resource of the intent is
+	// not there.
+	NotFound = "not_found"
+)
+
+// outcomes is the closed list of the outcomes above.
+var outcomes = map[string]bool{
+	Created: true, Deleted: true, AlreadyDeleted: true, Changed: true,
+	Error: true, Unknown: true, Found: true, NotFound: true,
+}
+
+// Known tells an outcome of the closed list.
+func Known(outcome string) bool { return outcomes[outcome] }
+
+// Outcome is what the end of a call says of it: the part of a line the
+// caller knows and the record of the intent does not.
+type Outcome struct {
+	Result string
+	// Kind is the kind of the resource ("disk"): with ResourceID it tells
+	// one resource from another of the same id or name.
+	Kind string
+	// Parent is the resource the resource lives in, as «argument=id»
+	// ("cluster_id=…", "bucket=…"): a name is one in one parent only.
+	Parent      string
+	ResourceID  string
+	Reason      string
+	OperationID string
+	JobID       string
+}
+
+// Format is the version of the form of a line: a reader skips a line of
+// another form rather than reads it wrong (a newer evo wrote it).
+const Format = 1
+
+// Line is one line of the journal.
+type Line struct {
+	// Format is the form of the line (Format); Append sets it.
+	Format    int    `json:"format"`
+	Time      string `json:"time"`
+	Tool      string `json:"tool"`
+	Surface   string `json:"surface,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
+	Zone      string `json:"zone,omitempty"`
+	// Name and Target are how the record of the intent names the
+	// resource: a name, «argument=id». Not a value of a secret.
+	Name        string `json:"name,omitempty"`
+	Target      string `json:"target,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Parent      string `json:"parent,omitempty"`
+	ResourceID  string `json:"resource_id,omitempty"`
+	Outcome     string `json:"outcome"`
+	Reason      string `json:"reason,omitempty"`
+	OperationID string `json:"operation_id,omitempty"`
+	// IntentID is the id of the record of the intent: the lines of one
+	// call share it, and the last one says what is known of it.
+	IntentID string `json:"intent_id"`
+	JobID    string `json:"job_id,omitempty"`
+	// StateDir is the folder of the state the call went with; "" for
+	// the configuration's (evo login).
+	StateDir string       `json:"state_dir,omitempty"`
+	Key      *state.Maker `json:"key,omitempty"`
+}
+
+// DirName is the directory of the journal: beside intents/.
+const DirName = "history"
+
+// DirOf is the directory of the journal of the intents of intentsDir: the
+// journal is of the same folder of state, or of the configuration (evo
+// login), as the intents are.
+func DirOf(intentsDir string) string {
+	return filepath.Join(filepath.Dir(intentsDir), DirName)
+}
+
+// lockWait is how long a line waits for another process that writes one:
+// a line is a write of a few hundred bytes.
+const lockWait = 2 * time.Second
+
+// Append writes l as one line of the file of its day (UTC) in dir, under
+// the lock of the directory. A line whose outcome is not of the list, or
+// whose time is not a time, is not written. The directory and the file
+// are evo's own: a link in their place is refused, not followed.
+func Append(dir string, l Line) error {
+	if !Known(l.Outcome) {
+		return fmt.Errorf("outcome %q is not of the journal", l.Outcome)
+	}
+	l.Format = Format
+	for _, f := range []*string{&l.Tool, &l.Surface, &l.ProjectID, &l.Zone, &l.Name, &l.Target, &l.Kind, &l.Parent, &l.ResourceID, &l.Reason, &l.OperationID, &l.JobID, &l.StateDir} {
+		*f = fit(*f)
+	}
+	if l.Key != nil {
+		k := *l.Key
+		k.ServiceAccountID, k.KeyID = fit(k.ServiceAccountID), fit(k.KeyID)
+		l.Key = &k
+	}
+	at, err := time.Parse(time.RFC3339, l.Time)
+	if err != nil {
+		return err
+	}
+	l.Time = at.UTC().Format(time.RFC3339)
+	if fi, err := os.Lstat(dir); err == nil && !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory of evo", dir)
+	}
+	if err := config.MkdirPrivate(dir); err != nil {
+		return err
+	}
+	data, err := json.Marshal(l)
+	if err != nil {
+		return err
+	}
+	unlock, err := state.FileLock(filepath.Join(dir, DirName+".lock"), lockWait)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	f, err := config.OpenNoFollow(FileOf(dir, at), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	line := append(data, '\n')
+	if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := f.ReadAt(last, fi.Size()-1); err != nil {
+			f.Close()
+			return err
+		}
+		if last[0] != '\n' {
+			line = append([]byte{'\n'}, line...)
+		}
+	}
+	if _, err := f.Write(line); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// FileOf is the file of the day of at in dir.
+func FileOf(dir string, at time.Time) string {
+	return filepath.Join(dir, at.UTC().Format("2006-01-02")+".jsonl")
+}
+
+func Live(lines []Line) []Line {
+	live := liveMask(lines)
+	var out []Line
+	for i, l := range lines {
+		if live[i] {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// liveMask is Live by position: live[i] tells lines[i].
+func liveMask(lines []Line) []bool {
+	last := map[string]int{}
+	type mark struct {
+		i       int
+		project string
+	}
+	held := map[string][]mark{} // created or found, not gone yet
+	gone := map[string][]mark{} // deleted, already_deleted, not_found
+	key := func(l Line) string { return l.Kind + "\x00" + l.Parent + "\x00" + l.ResourceID }
+	order := make([]int, len(lines))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return lines[order[a]].Time < lines[order[b]].Time })
+	rank := make([]int, len(lines))
+	for r, i := range order {
+		rank[i] = r
+	}
+	for _, i := range order {
+		l := lines[i]
+		if l.Format != Format || !Known(l.Outcome) {
+			continue
+		}
+		last[l.IntentID] = i
+		if l.ResourceID == "" {
+			continue
+		}
+		k := key(l)
+		switch l.Outcome {
+		case Created, Found:
+			held[k] = append(held[k], mark{i, l.ProjectID})
+		case Deleted, AlreadyDeleted, NotFound:
+			gone[k] = append(gone[k], mark{i, l.ProjectID})
+			kept := held[k][:0]
+			for _, h := range held[k] {
+				if !sameProject(h.project, l.ProjectID) {
+					kept = append(kept, h)
+				}
+			}
+			held[k] = kept
+		}
+	}
+	// goneAfter tells a resource a later line says is gone: an outcome
+	// not known of a call on it is known now (311-3).
+	goneAfter := func(l Line, at int) bool {
+		for _, g := range gone[key(l)] {
+			if rank[g.i] > rank[at] && sameProject(g.project, l.ProjectID) {
+				return true
+			}
+		}
+		return false
+	}
+	live := map[int]bool{}
+	for _, i := range last {
+		l := lines[i]
+		switch {
+		case l.Outcome == Unknown && l.ResourceID != "" && goneAfter(l, i):
+		case l.Outcome == Unknown || (l.Outcome == Found && l.ResourceID == ""):
+			live[i] = true
+		}
+	}
+	for i, l := range lines {
+		if l.Format != Format || !Known(l.Outcome) {
+			live[i] = true
+		}
+	}
+	for _, hs := range held {
+		for _, h := range hs {
+			live[h.i] = true
+		}
+	}
+	mask := make([]bool, len(lines))
+	for i := range lines {
+		mask[i] = live[i]
+	}
+	return mask
+}
+
+func sameProject(a, b string) bool { return a == "" || b == "" || a == b }
+
+// cutMark ends a text cut to maxText.
+const cutMark = "…[cut]"
+
+func fit(s string) string {
+	if !utf8.ValidString(s) {
+		s = strconv.Quote(s)
+	}
+	if len(s) <= maxText {
+		return s
+	}
+	n := maxText - len(cutMark)
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + cutMark
+}

@@ -1,0 +1,163 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"sort"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+// vmTarget is the target of a call that names a VM by vm_id or by name
+// (changeRule.target): the VM's id, read as the plan of a power tool
+// reads it — an id as it is, a name through the one point names are
+// resolved at (resolveVMFor). The record names no name: the call makes
+// nothing.
+func vmTarget(tool string) func(ctx context.Context, r *Registry, args map[string]any) (name, target string, err error) {
+	return func(ctx context.Context, r *Registry, args map[string]any) (string, string, error) {
+		ref, _, err := oneOfArgs(args, vmRefNotBoth(), "vm_id", "name")
+		if err != nil || ref == "" {
+			// The plan of the tool refuses these arguments in its own words.
+			return "", "", nil
+		}
+		if looksUUID(ref) {
+			return "", "vm_id=" + ref, nil
+		}
+		eng, err := r.authedEngine(ctx, nil)
+		if err != nil {
+			return "", "", err
+		}
+		vm, err := r.resolveVMFor(ctx, tool, ref, eng.Config.ProjectID)
+		if err != nil {
+			return "", "", err
+		}
+		return "", "vm_id=" + vm.ID, nil
+	}
+}
+
+// vmSettled is what the state of the VM a call of the power tool names
+// says of a cut call of it (changeRule.settledBy): where the action leads —
+// made; in a transition — goes on; where it started, in an error, being
+// deleted — asked about. A VM that cannot be read is asked about too.
+func vmSettled(tool string) func(ctx context.Context, r *Registry, args map[string]any) (outcome, error) {
+	act, resolve := vmPowerActions[tool], vmTarget(tool)
+	return func(ctx context.Context, r *Registry, args map[string]any) (outcome, error) {
+		_, target, err := resolve(ctx, r, args)
+		_, id, found := strings.Cut(target, "=")
+		if err != nil || !found {
+			return outcomeAsk, err
+		}
+		eng, err := r.authedEngine(ctx, nil)
+		if err != nil {
+			return outcomeAsk, err
+		}
+		vm, err := eng.Cloud.GetVMDetail(ctx, id)
+		switch {
+		case err != nil:
+			return outcomeAsk, err
+		case vm.State == act.to:
+			return outcomeMade, nil
+		case vmSettling[vm.State]:
+			return outcomeGoesOn, nil
+		}
+		return outcomeAsk, nil
+	}
+}
+
+func groupTarget(arg string, valid func(args map[string]any) error) func(ctx context.Context, r *Registry, args map[string]any) (name, target string, err error) {
+	return func(ctx context.Context, r *Registry, args map[string]any) (string, string, error) {
+		ref := stringArg(args, arg)
+		if ref == "" {
+			return "", "", nil
+		}
+		if valid(args) != nil {
+			return "", arg + "=" + ref, nil
+		}
+		eng, err := r.authedEngine(ctx, nil)
+		if err != nil {
+			return "", "", err
+		}
+		group, err := securityGroupFor(ctx, eng, ref)
+		if err != nil {
+			return "", "", err
+		}
+		return "", arg + "=" + group.ID, nil
+	}
+}
+
+// securityGroupFor is securityGroupByRef once a call: the layer of intents
+// resolves the group a call names before the plan of the tool does
+// (changeRule.target).
+func securityGroupFor(ctx context.Context, eng *engine.Engine, ref string) (*provision.SecurityGroup, error) {
+	return onceACall(ctx, "sg\x00"+ref+"\x00"+eng.Config.ProjectID, func() (*provision.SecurityGroup, error) {
+		return securityGroupByRef(ctx, eng, ref)
+	})
+}
+
+// partiesOf are the parties of a call of tool (idArg.party) its handler
+// has resolved: each argument the call gives, as «argument=id», resolved
+// by the resolver of the handler without a read (resolvedOnly) — the
+// mark of the first write names what that write goes to, and asks the
+// cloud nothing the handler did not. An argument the handler has not
+// resolved is no party.
+func (r *Registry) partiesOf(ctx context.Context, tool string, args map[string]any) []string {
+	var out []string
+	ctx = resolvedOnly(ctx)
+	for _, a := range decls[tool].IDArgs {
+		ref := stringArg(args, a.name)
+		if a.party == nil || ref == "" {
+			continue
+		}
+		if id, err := a.party(ctx, r, ref); err == nil && id != "" {
+			out = append(out, a.name+"="+id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// partyVM is the VM a call names by name or id (idArg.party), as the one
+// point a reference to a VM is resolved at (resolveVM) resolved it.
+func partyVM(ctx context.Context, r *Registry, ref string) (string, error) {
+	eng, err := r.localEngine(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	vm, err := r.resolveVM(ctx, ref, eng.Config.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	return vm.ID, nil
+}
+
+// partyGroup is the security group a call names by name or id
+// (idArg.party), as securityGroupFor resolved it.
+func partyGroup(ctx context.Context, r *Registry, ref string) (string, error) {
+	eng, err := r.localEngine(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	group, err := securityGroupFor(ctx, eng, ref)
+	if err != nil {
+		return "", err
+	}
+	return group.ID, nil
+}
+
+// partyFloatingIP is the floating IP a call names by address or id
+// (idArg.party), as floatingIPFor resolved it.
+func partyFloatingIP(ctx context.Context, r *Registry, ref string) (string, error) {
+	eng, err := r.localEngine(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	fip, err := floatingIPFor(ctx, eng, ref)
+	if err != nil {
+		return "", err
+	}
+	return fip.ID, nil
+}

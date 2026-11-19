@@ -1,0 +1,775 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/cloud-ru/evo-cmcp/internal/deployplan"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+// looksUUID is a cheap check to tell a UUID from a human name.
+func looksUUID(s string) bool {
+	return len(s) == 36 && strings.Count(s, "-") == 4
+}
+
+var strictVMRef = map[string]bool{"vm_start": true, "vm_stop": true, "vm_reboot": true, "vm_resize": true, "vm_console": true}
+
+// resolveVM finds a VM by id or name, as the released tools do.
+func (s *Registry) resolveVM(ctx context.Context, ref, projectID string) (*provision.VM, error) {
+	return s.resolveVMFor(ctx, "", ref, projectID)
+}
+
+// resolveVMFor finds the VM tool names by id or name in the project's
+// list: the one point a reference to a VM is resolved at (strictVMRef).
+func (s *Registry) resolveVMFor(ctx context.Context, tool, ref, projectID string) (*provision.VM, error) {
+	// Once a call: the layer of intents resolves the VM a call names
+	// before the plan of the tool does (changeRule.target).
+	return onceACall(ctx, "vm\x00"+tool+"\x00"+ref+"\x00"+projectID, func() (*provision.VM, error) {
+		return s.listedVM(ctx, tool, ref, projectID)
+	})
+}
+
+// listedVM is resolveVMFor's read of the project's list.
+func (s *Registry) listedVM(ctx context.Context, tool, ref, projectID string) (*provision.VM, error) {
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	vms, err := eng.Cloud.ListVMsInProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var found []*provision.VM
+	for _, v := range vms {
+		if v.ID == ref || v.Name == ref {
+			found = append(found, v)
+		}
+	}
+	strict := strictVMRef[tool]
+	switch {
+	case len(found) == 0 && strict:
+		return nil, clierrors.New(clierrors.CodeVMNotFound,
+			i18n.Tf("VM %q not found", "ВМ %q не найдена", ref),
+			i18n.T("vm_list shows the VMs of the project.", "ВМ проекта показывает vm_list."))
+	case len(found) == 0:
+		return nil, fmt.Errorf(i18n.T("VM %q not found", "ВМ %q не найдена"), ref)
+	case len(found) > 1 && strict:
+		ids := make([]string, len(found))
+		for i, v := range found {
+			ids[i] = v.ID
+		}
+		return nil, clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("%d VMs of the project are named %q: %s", "в проекте %d ВМ с именем %q: %s", len(found), ref, strings.Join(ids, ", ")),
+			i18n.T("Pass vm_id of the one you mean.", "Передайте vm_id нужной ВМ."))
+	}
+	return found[0], nil
+}
+
+// handleDiskList lists disks (block storage) with a compact projection.
+func (s *Registry) handleDiskList(ctx context.Context, args map[string]any) (string, bool) {
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return errResult(err), true
+	}
+	disks, err := eng.Cloud.ListDisks(ctx, eng.Config.ProjectID)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(disks))
+	for _, d := range disks {
+		row := map[string]any{
+			"id": d["id"], "name": d["name"], "size_gb": d["size"],
+			"state": d["state"], "bootable": d["bootable"],
+		}
+		if dt, ok := d["disk_type"].(map[string]any); ok {
+			row["disk_type"] = dt["name"]
+		}
+		if az, ok := d["availability_zone"].(map[string]any); ok {
+			row["zone"] = az["name"]
+		}
+		// attached VMs
+		if vms, ok := d["vms"].([]any); ok && len(vms) > 0 {
+			names := make([]any, 0, len(vms))
+			for _, x := range vms {
+				if vm, ok := x.(map[string]any); ok {
+					names = append(names, vm["name"])
+				}
+			}
+			row["attached_to"] = names
+		}
+		out = append(out, row)
+	}
+	return toJSON(map[string]any{"disks": out}), false
+}
+
+// planDiskCreate plans the create of a disk. If attach_to (a VM) is given, the disk is
+// created in that VM's zone and (with confirmed) attached to it — the ergonomic
+// "add a disk to my VM" path. Mutation: requires confirmed=true.
+func (s *Registry) planDiskCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	sizeGB := intArg(args, "size_gb", 0)
+	if name == "" {
+		return answered(usageT("'name' is required", "нужен 'name'"), true), nil
+	}
+	if _, ok := args["size_gb"]; !ok {
+		return answered(usageT("'size_gb' is required", "нужен 'size_gb'"), true), nil
+	}
+	if sizeGB <= 0 {
+		return answered(usageT("size_gb must be greater than 0, got %d", "size_gb должен быть больше 0, передано %d", sizeGB), true), nil
+	}
+	if err := provision.ValidName(i18n.T("disk", "диска"), name); err != nil {
+		return nil, err
+	}
+	if sizeGB > provision.MaxDiskGB {
+		return answered(usageT("size_gb %d is over the disk maximum of %d GB", "size_gb %d больше предельного размера диска %d ГБ", sizeGB, provision.MaxDiskGB), true), nil
+	}
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	pid := eng.Config.ProjectID
+
+	// Resolve the zone: from the attach-target VM (zones must match), else an
+	// explicit zone, else the configured region.
+	attachTo := stringArg(args, "attach_to")
+	var zoneID, vmID string
+	if attachTo != "" {
+		vm, err := s.resolveVM(ctx, attachTo, pid)
+		if err != nil {
+			return nil, err
+		}
+		vmID, zoneID = vm.ID, vm.ZoneID()
+	} else if z := stringArg(args, "zone"); z != "" {
+		if looksUUID(z) {
+			zoneID = z
+		} else if zs, e := eng.Cloud.ListAvailabilityZones(ctx); e == nil {
+			for _, az := range zs {
+				if az.Name == z {
+					zoneID = az.ID
+					break
+				}
+			}
+		}
+		if zoneID == "" {
+			return nil, fmt.Errorf(i18n.T("zone %q not found", "зона %q не найдена"), z)
+		}
+	} else {
+		if eng.Config.Region == "" {
+			err := engine.NoZoneError("zone")
+			return answered(errAnswer(err, deployFields(err, nil)), true), nil
+		}
+		// The configured zone, by its UUID or its name (resolveVMZone, as
+		// a VM's): its name went out as availability_zone_id (P-Z1).
+		if _, _, err := resolveVMZone(ctx, eng); err != nil {
+			return nil, err
+		}
+		zoneID = eng.Config.Region
+	}
+
+	// Resolve disk type (name or id); default to the SSD type, as a VM's.
+	req := provision.CreateDiskReq{Name: name, Size: sizeGB, AvailabilityZoneID: zoneID, ProjectID: pid}
+	if dt := stringArg(args, "disk_type"); dt != "" {
+		if looksUUID(dt) {
+			req.DiskTypeID = dt
+		} else {
+			req.DiskTypeName = dt
+		}
+	} else if dts, e := eng.Cloud.ListDiskTypes(ctx, pid); e == nil {
+		if t := provision.PickDiskType(dts, ""); t != nil {
+			req.DiskTypeName = t.Name
+		}
+	}
+
+	list := func(ctx context.Context) ([]map[string]any, error) { return eng.Cloud.ListDisks(ctx, pid) }
+	if ans, refused := nameFree(ctx, list, i18n.T("disk", "диск"), name, "disk_list"); refused {
+		return answered(ans, true), nil
+	}
+	// The preview is built for the question only: its price is a request
+	// a consented call does not make.
+	preview := func(ctx context.Context) (map[string]any, error) {
+		preview, err := s.completePreview(ctx, eng, diskCreatePreview(eng, req, attachTo, vmID, stringArg(args, "zone")))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"message": i18n.T("disk_create makes a billable disk.",
+				"disk_create создаёт платный диск."),
+			"will_create": map[string]any{
+				"name": name, "size_gb": sizeGB, "disk_type": firstNonEmptyStr(req.DiskTypeName, req.DiskTypeID),
+				"zone_id": zoneID, "attach_to": attachTo, "attach_to_vm_id": vmID,
+			},
+			"preview": preview,
+		}, nil
+	}
+	return &Plan{PreviewOf: preview, Execute: func(ctx context.Context) (string, bool) {
+		disk, err := eng.Cloud.CreateDisk(ctx, req)
+		if id, _ := disk["id"].(string); err != nil || id == "" {
+			if err == nil {
+				err = noID("disk")
+			}
+			return lostCreate(ctx, "disk_create", list, i18n.T("disk", "диск"), name, nil, "disk_list", fmt.Errorf(i18n.T("create disk: %w", "создание диска: %w"), err))
+		}
+		res := map[string]any{"status": "created", "disk": disk}
+		if attachTo == "" || vmID == "" {
+			return diskCreated(ctx, eng, res, disk, pid)
+		}
+
+		diskID, _ := disk["id"].(string)
+		res["disk_id"] = diskID
+		partial := func(err error) (string, bool) {
+			res["status"] = "partial"
+			hint := "Attach it with disk_attach once disk_list shows it available; whether to delete it instead (disk_delete) — ask the person."
+			if isUUID(diskID) {
+				hint = fmt.Sprintf("Attach it with disk_attach disk_id=%s vm=%s once disk_list shows it available; whether to delete it instead (disk_delete) — ask the person.", diskID, attachTo)
+			}
+			return errAnswer(clierrors.Wrap(clierrors.CodeAPIError,
+				fmt.Sprintf("disk %s %s was created (it is billed), but not attached to VM %s: %v", name, quoteCloud(diskID), attachTo, err),
+				hint, err), res), true
+		}
+		if diskID == "" {
+			return partial(fmt.Errorf("the create response has no disk id"))
+		}
+		if err := waitDiskAvailable(ctx, eng, diskID, pid); err != nil {
+			var lim *diskAtLimit
+			if errors.As(err, &lim) {
+				answer := diskAtLimitAnswer(lim, diskID, i18n.T("it is attached once available.", "диск подключится, когда станет available."), "disk_attach", diskAttachArgs(diskID, attachTo))
+				answer["disk"] = disk
+				return toJSON(answer), false
+			}
+			return partial(err)
+		}
+		at, err := eng.Cloud.AttachDisk(ctx, diskID, vmID, pid)
+		if err != nil {
+			return partial(fmt.Errorf(i18n.T("attach: %w", "привязка: %w"), err))
+		}
+		res["attach"] = at
+		// The disk as it is after the attach, not as the create answered it
+		// (creating; C2, Ц-14).
+		if d, err := eng.Cloud.GetDisk(ctx, diskID); err == nil {
+			res["disk"] = d
+		} else {
+			delete(res, "disk")
+			res["disk_note"] = i18n.Tf("The disk is attached; its state after the attach was not read (%v): disk_list shows it.",
+				"Диск подключён; его состояние после подключения прочитать не удалось (%v): его показывает evo disk list.", err)
+		}
+		res["note"] = i18n.T("Disk created and attached. On the VM: partition/format the new device (e.g. mkfs.ext4 /dev/vdX) and mount it — attaching does NOT grow the existing filesystem.",
+			"Диск создан и подключён. На ВМ разметьте и отформатируйте новое устройство (например, mkfs.ext4 /dev/vdX) и смонтируйте его — подключение НЕ увеличивает существующую файловую систему.")
+		return toJSON(res), false
+	}}, nil
+}
+
+const diskReadyTimeout = 5 * time.Minute
+
+// waitDiskAvailable polls disk_list until the disk is "available", at the
+// VM poll interval (Engine.Timings.VMPollInterval, 5 s by default), for at
+// most diskReadyTimeout (or Timings.VMPollTimeout when shorter). A disk in
+// an error state ends the wait at once.
+func waitDiskAvailable(ctx context.Context, eng *engine.Engine, diskID, projectID string) error {
+	last, timeout, err := waitDisk(ctx, eng, diskID, projectID, diskReadyTimeout,
+		i18n.T("Disk %s: %s, waiting until it is available…", "Диск %s: %s, жду, пока он станет доступен…"),
+		func(st string) (bool, error) {
+			switch {
+			case st == "available":
+				return true, nil
+			case strings.HasPrefix(st, "error"):
+				return true, &diskFailed{state: st}
+			}
+			return false, nil
+		})
+	if timeout > 0 {
+		return fmt.Errorf("the disk did not become available within %s (state %s)", timeout, quoteCloud(last))
+	}
+	return err
+}
+
+func waitDisk(ctx context.Context, eng *engine.Engine, diskID, projectID string, limit time.Duration,
+	waiting string, done func(state string) (bool, error)) (last string, timedOut time.Duration, err error) {
+	last, timedOut, atLimit, reads, err := waitState(ctx, eng, limit,
+		func(ctx context.Context) (string, bool, error) {
+			disks, err := eng.Cloud.ListDisks(ctx, projectID)
+			if err != nil {
+				return "", false, nil
+			}
+			for _, d := range disks {
+				if id, _ := d["id"].(string); id == diskID {
+					st, _ := d["state"].(string)
+					return st, true, nil
+				}
+			}
+			return "", false, nil
+		},
+		func(st string) string { return fmt.Sprintf(waiting, diskID, st) }, done)
+	if atLimit {
+		return last, 0, &diskAtLimit{state: last, reads: reads}
+	}
+	return last, timedOut, err
+}
+
+// diskFailed ends a wait for a disk the platform put in an error state.
+type diskFailed struct{ state string }
+
+func (e *diskFailed) Error() string { return "the disk is in state " + quoteCloud(e.state) }
+
+type diskAtLimit struct {
+	state string
+	reads waitReads
+}
+
+func (e *diskAtLimit) Error() string {
+	return fmt.Sprintf("the disk is %s at the time limit of the call", e.state)
+}
+
+// diskAtLimitAnswer is the answer of tool whose wait for disk diskID the
+// limit of an MCP call ended: not an error — the disk's state, and the call
+// that goes on (next_tool with next_args).
+func diskAtLimitAnswer(lim *diskAtLimit, diskID, why, tool string, nextArgs map[string]any) map[string]any {
+	answer := map[string]any{"status": lim.state, "disk_id": diskID, "disk_state": lim.state,
+		"next": i18n.Tf("Disk %s is %s at the time limit of an MCP call; %s Call %s to go on: it waits for the disk again.",
+			"Диск %s — %s к пределу времени вызова; %s Чтобы продолжить, повторите %s: команда снова дождётся диска.", diskID, quoteCloud(lim.state), why, i18n.T(tool, cliCommand(tool)))}
+	if !slices.Contains(diskStates, lim.state) {
+		answer["status"] = "waiting"
+	}
+	lim.reads.put(answer)
+	nextStep(answer, tool, nextArgs)
+	return answer
+}
+
+func diskAttachArgs(diskID, vm string) map[string]any {
+	return map[string]any{"disk_id": diskID, "vm": vm, "confirmed": true}
+}
+
+func settlingPlan(err error, diskID, tool string, args map[string]any) (*Plan, error) {
+	var lim *diskAtLimit
+	if !errors.As(err, &lim) {
+		return nil, err
+	}
+	return answered(toJSON(diskAtLimitAnswer(lim, diskID, i18n.T("it cannot be changed until its state settles.", "менять его можно, когда состояние устоится."), tool, maps.Clone(args))), false), nil
+}
+
+var diskTransient = map[string]bool{"attaching": true, "detaching": true, "extending": true, "creating": true}
+
+const diskSettleTimeout = 30 * time.Second
+
+func settledDisk(ctx context.Context, eng *engine.Engine, diskID string) (map[string]any, error) {
+	d, err := eng.Cloud.GetDisk(ctx, diskID)
+	if err != nil {
+		return nil, err
+	}
+	if st, _ := d["state"].(string); !diskTransient[st] {
+		return d, nil
+	}
+	last, timedOut, err := waitDisk(ctx, eng, diskID, eng.Config.ProjectID, diskSettleTimeout,
+		i18n.T("Disk %s: %s, waiting until it settles…", "Диск %s: %s, жду, пока состояние устоится…"),
+		func(st string) (bool, error) { return !diskTransient[st], nil })
+	switch {
+	case err != nil:
+		return nil, err
+	case timedOut > 0:
+		return nil, clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("disk %s is in state %s: it cannot be changed until the state settles", "диск %s в состоянии %s: менять его можно, когда состояние устоится", diskID, quoteCloud(last)),
+			i18n.T("Repeat the call when disk_list shows the disk available or in_use.", "Повторите вызов, когда disk_list покажет диск в available или in_use."))
+	}
+	return eng.Cloud.GetDisk(ctx, diskID)
+}
+
+func (s *Registry) planDiskAttach(ctx context.Context, args map[string]any) (*Plan, error) {
+	diskID := stringArg(args, "disk_id")
+	vmRef := stringArg(args, "vm")
+	if diskID == "" || vmRef == "" {
+		return nil, usageErr("'disk_id' and 'vm' are required", "нужны 'disk_id' и 'vm'")
+	}
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	vm, err := s.resolveVM(ctx, vmRef, eng.Config.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	vmID := vm.ID
+	disk, err := settledDisk(ctx, eng, diskID)
+	if err != nil {
+		return settlingPlan(err, diskID, "disk_attach", args)
+	}
+	for _, v := range diskVMs(disk) {
+		if v["id"] == vmID {
+			return answered(toJSON(map[string]any{"status": "already_attached", "disk_id": diskID, "vm_id": vmID}), false), nil
+		}
+	}
+	if ans, refused := anotherVMsDisk("disk_attach", diskID, vmID, disk); refused {
+		return answered(ans, true), nil
+	}
+	return &Plan{Preview: map[string]any{
+		"message":     i18n.T("disk_attach attaches the disk to the VM.", "disk_attach подключает диск к ВМ."),
+		"will_attach": diskChangeTarget(diskID, disk, vm),
+	},
+		Execute: func(ctx context.Context) (string, bool) {
+			r, err := eng.Cloud.AttachDisk(ctx, diskID, vmID, eng.Config.ProjectID)
+			if err != nil && diskNotReady(err) {
+				if werr := waitDiskAvailable(ctx, eng, diskID, eng.Config.ProjectID); werr != nil {
+					var lim *diskAtLimit
+					if errors.As(werr, &lim) {
+						return toJSON(diskAtLimitAnswer(lim, diskID, i18n.T("it is attached once available.", "диск подключится, когда станет available."), "disk_attach", diskAttachArgs(diskID, vmRef))), false
+					}
+					return errResult(fmt.Errorf(i18n.T("attach disk: %w (waited for the new disk: %v)", "привязка диска: %w (ожидание нового диска: %v)"), err, werr)), true
+				}
+				r, err = eng.Cloud.AttachDisk(ctx, diskID, vmID, eng.Config.ProjectID)
+			}
+			if err != nil {
+				return errResult(fmt.Errorf(i18n.T("attach disk: %w", "привязка диска: %w"), err)), true
+			}
+			return toJSON(map[string]any{"status": "attached", "result": r}), false
+		}}, nil
+}
+
+func diskChangeTarget(diskID string, disk map[string]any, vm *provision.VM) map[string]any {
+	out := map[string]any{"disk_id": diskID, "vm_id": vm.ID, "vm_name": vm.Name}
+	if name, _ := disk["name"].(string); name != "" {
+		out["disk_name"] = name
+	}
+	if size, ok := numberValue(disk["size"]); ok {
+		out["size_gb"] = size
+	}
+	if vms := diskVMs(disk); len(vms) > 0 {
+		out["attached_vms"] = vms
+	}
+	return out
+}
+
+func anotherVMsDisk(tool, diskID, vmID string, disk map[string]any) (string, bool) {
+	vms := diskVMs(disk)
+	if len(vms) == 0 {
+		return "", false
+	}
+	var ids, labels []string
+	for _, v := range vms {
+		if v["id"] == vmID {
+			return "", false
+		}
+		id := v["id"].(string)
+		ids = append(ids, id)
+		labels = append(labels, quoteCloud(id))
+	}
+	on, other := strings.Join(labels, ", "), ids[0]
+	var err error
+	switch {
+	case tool == "disk_attach" && isUUID(other):
+		err = clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("disk %s is attached to VM %s: Cloud.ru attaches a disk to one VM at a time; nothing was attached", "диск %s подключён к ВМ %s: Cloud.ru подключает диск только к одной ВМ; ничего не подключено", diskID, on),
+			i18n.Tf("To move it, detach it from that VM first (disk_detach disk_id=%s vm=%s) — whether that VM can lose it, ask the person.",
+				"Чтобы перенести диск, сначала отключите его от той ВМ (disk_detach disk_id=%s vm=%s) — может ли та ВМ остаться без него, спросите человека.", diskID, other))
+	case tool == "disk_attach":
+		err = clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("disk %s is attached to VM %s: Cloud.ru attaches a disk to one VM at a time; nothing was attached", "диск %s подключён к ВМ %s: Cloud.ru подключает диск только к одной ВМ; ничего не подключено", diskID, on),
+			i18n.T("To move it, detach it from that VM first; evo vm list shows the VM — whether that VM can lose it, ask the person.",
+				"Чтобы перенести диск, сначала отключите его от той ВМ; ВМ показывает evo vm list — может ли та ВМ остаться без него, спросите человека."))
+	case isUUID(other):
+		err = clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("disk %s is attached to VM %s, not to %s; nothing was detached", "диск %s подключён к ВМ %s, а не к %s; ничего не отключено", diskID, on, quoteCloud(vmID)),
+			i18n.Tf("The disk is on another VM (disk_detach disk_id=%s vm=%s detaches it there) — whether that VM can lose it, ask the person.",
+				"Диск стоит на другой ВМ (отключить его там — disk_detach disk_id=%s vm=%s) — может ли та ВМ остаться без него, спросите человека.", diskID, other))
+	default:
+		err = clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("disk %s is attached to VM %s, not to %s; nothing was detached", "диск %s подключён к ВМ %s, а не к %s; ничего не отключено", diskID, on, quoteCloud(vmID)),
+			i18n.T("The disk is on another VM; evo vm list shows it — whether that VM can lose it, ask the person.",
+				"Диск стоит на другой ВМ; её показывает evo vm list — может ли та ВМ остаться без него, спросите человека."))
+	}
+	return errAnswer(err, map[string]any{"attached_vms": vms}), true
+}
+
+// diskVMs are the VMs disk is attached to, as its GetDisk answer names
+// them: id, name and whether it is the VM's boot disk.
+func diskVMs(disk map[string]any) []map[string]any {
+	list, _ := disk["vms"].([]any)
+	var vms []map[string]any
+	for _, v := range list {
+		vm, _ := v.(map[string]any)
+		if vm == nil {
+			continue
+		}
+		id, _ := vm["id"].(string)
+		name, _ := vm["name"].(string)
+		primary, _ := vm["primary"].(bool)
+		vms = append(vms, map[string]any{"id": id, "name": name, "primary": primary})
+	}
+	return vms
+}
+
+func diskNotReady(err error) bool {
+	var se *provision.StatusError
+	return errors.As(err, &se) && se.Status == http.StatusUnprocessableEntity && strings.Contains(strings.ToLower(se.Body), "openstack_id")
+}
+
+func (s *Registry) planDiskDetach(ctx context.Context, args map[string]any) (*Plan, error) {
+	diskID := stringArg(args, "disk_id")
+	vmRef := stringArg(args, "vm")
+	if diskID == "" || vmRef == "" {
+		return nil, usageErr("'disk_id' and 'vm' are required", "нужны 'disk_id' и 'vm'")
+	}
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	vm, err := s.resolveVM(ctx, vmRef, eng.Config.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	vmID := vm.ID
+	disk, err := settledDisk(ctx, eng, diskID)
+	if err != nil {
+		return settlingPlan(err, diskID, "disk_detach", args)
+	}
+	if st, _ := disk["state"].(string); st == "available" && len(diskVMs(disk)) == 0 {
+		return answered(toJSON(map[string]any{"status": "already_detached", "disk_id": diskID, "vm_id": vmID}), false), nil
+	}
+	if ans, refused := anotherVMsDisk("disk_detach", diskID, vmID, disk); refused {
+		return answered(ans, true), nil
+	}
+	return &Plan{Preview: map[string]any{
+		"message":     i18n.T("disk_detach detaches the disk from the VM.", "disk_detach отключает диск от ВМ."),
+		"will_detach": diskChangeTarget(diskID, disk, vm),
+	},
+		Execute: func(ctx context.Context) (string, bool) {
+			r, err := eng.Cloud.DetachDisk(ctx, diskID, vmID, eng.Config.ProjectID)
+			if err != nil {
+				return errResult(fmt.Errorf(i18n.T("detach disk: %w", "отвязка диска: %w"), err)), true
+			}
+			return toJSON(map[string]any{"status": "detached", "result": r}), false
+		}}, nil
+}
+
+// planDiskResize plans the growth of a disk in place (PUT {size}, gate.go).
+// Only grows: a smaller or the same size is refused before the question;
+// free-tier disks are rejected by the API.
+func (s *Registry) planDiskResize(ctx context.Context, args map[string]any) (*Plan, error) {
+	diskID := stringArg(args, "disk_id")
+	sizeGB := intArg(args, "size_gb", 0)
+	if diskID == "" {
+		return nil, usageErr("'disk_id' is required", "нужен 'disk_id'")
+	}
+	if _, ok := args["size_gb"]; !ok {
+		return nil, usageErr("'size_gb' is required (the new size, larger than the current one)", "нужен 'size_gb' — новый размер, больше текущего")
+	}
+	if sizeGB <= 0 {
+		return nil, usageErr("size_gb must be greater than 0, got %d", "size_gb должен быть больше 0, передано %d", sizeGB)
+	}
+	if sizeGB > provision.MaxDiskGB {
+		return nil, usageErr("size_gb %d is over the disk maximum of %d GB", "size_gb %d больше предельного размера диска %d ГБ", sizeGB, provision.MaxDiskGB)
+	}
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	d, err := settledDisk(ctx, eng, diskID)
+	if err != nil {
+		return settlingPlan(err, diskID, "disk_resize", args)
+	}
+	if cur, ok := numberValue(d["size"]); ok {
+		switch {
+		case float64(sizeGB) < cur:
+			return nil, clierrors.New(clierrors.CodeUsage,
+				i18n.Tf("disk %s has %v GB: disk_resize only grows it, %d GB is smaller", "у диска %s %v ГБ: disk_resize только увеличивает, %d ГБ меньше", diskID, cur, sizeGB),
+				i18n.T("Pass a size larger than the current one.", "Укажите размер больше текущего."))
+		case float64(sizeGB) == cur:
+			return nil, clierrors.New(clierrors.CodeUsage,
+				i18n.Tf("disk %s already has %d GB: nothing to change", "у диска %s уже %d ГБ: менять нечего", diskID, sizeGB),
+				i18n.T("Pass a size larger than the current one.", "Укажите размер больше текущего."))
+		}
+	}
+	note := resizedNote(d)
+	preview, err := s.completePreview(ctx, nil, engine.CreatePreview{Resource: engine.ResourceDiskResize, Name: diskID,
+		Disk: &deployplan.DiskSpec{SizeGB: sizeGB}})
+	if err != nil {
+		return nil, err
+	}
+	return &Plan{Preview: map[string]any{
+		"message": i18n.Tf("disk_resize grows disk %s to %d GB (grow only; billable). NB: after resize you must grow the partition+filesystem on the VM (e.g. growpart + resize2fs). Free-tier disks are rejected by the API.",
+			"disk_resize увеличит диск %s до %d ГБ (только увеличение; платно). После этого раздел и файловую систему на ВМ нужно расширить (например, growpart и resize2fs). Диски бесплатного тарифа API не увеличивает.", diskID, sizeGB),
+		"preview": preview,
+	}, Execute: func(ctx context.Context) (string, bool) {
+		d, err := eng.Cloud.ResizeDisk(ctx, diskID, sizeGB, eng.Config.ProjectID)
+		if err != nil {
+			return errResult(fmt.Errorf(i18n.T("resize disk: %w", "изменение размера диска: %w"), err)), true
+		}
+		return toJSON(map[string]any{"status": "resized", "disk": d, "note": note}), false
+	}}, nil
+}
+
+// resizedNote is the next step after disk_resize of disk (as the plan read
+// it): the boot disk's device and partition are the image's; a data disk
+// is another device, often with no partition (agent run of 1.7.0, c0, m1:
+// the note named /dev/vda for a data disk).
+func resizedNote(disk map[string]any) string {
+	if boot, _ := disk["bootable"].(bool); boot {
+		return i18n.T("Disk grown. On the VM grow the partition + filesystem to use it: e.g. `growpart /dev/vda 2 && resize2fs /dev/vda2`.",
+			"Диск увеличен. Чтобы место стало доступно, на ВМ расширьте раздел и файловую систему: например, `growpart /dev/vda 2 && resize2fs /dev/vda2`.")
+	}
+	return i18n.T("Disk grown. On the VM find its device with `lsblk`, grow its partition if it has one (`growpart <device> <n>`), then its filesystem (`resize2fs` for ext4, `xfs_growfs` for XFS).",
+		"Диск увеличен. На ВМ найдите его устройство через `lsblk`, расширьте раздел, если он есть (`growpart <device> <n>`), затем файловую систему (`resize2fs` для ext4, `xfs_growfs` для XFS).")
+}
+
+// planDiskDelete plans the delete of a disk by id (gate.go).
+func (s *Registry) planDiskDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	diskID := stringArg(args, "disk_id")
+	if diskID == "" {
+		return nil, usageErr("'disk_id' is required", "нужен 'disk_id'")
+	}
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	disk, err := eng.Cloud.GetDisk(ctx, diskID)
+	if err != nil {
+		return answered(s.deleteFailed("disk_delete", diskID, err)), nil
+	}
+	if vms, err := diskAttachedError(diskID, disk); err != nil {
+		return answered(errAnswer(err, map[string]any{"disk_id": diskID, "attached_vms": vms}), true), nil
+	}
+	preview := map[string]any{"message": i18n.Tf("disk_delete permanently destroys disk %s and its data.",
+		"disk_delete безвозвратно удаляет диск %s и его данные.", diskID)}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		if err := eng.Cloud.DeleteDisk(ctx, diskID, eng.Config.ProjectID); err != nil {
+			return s.deleteFailed("disk_delete", diskID, fmt.Errorf(i18n.T("delete disk: %w", "удаление диска: %w"), err))
+		}
+		return toJSON(map[string]any{"status": "deleted", "disk_id": diskID}), false
+	}}, nil
+}
+
+func diskAttachedError(diskID string, disk map[string]any) ([]map[string]any, error) {
+	vms := diskVMs(disk)
+	var names, ways []string
+	for _, vm := range vms {
+		id, name, primary := vm["id"].(string), vm["name"].(string), vm["primary"].(bool)
+		label := quoteCloud(firstNonEmptyStr(name, id))
+		names = append(names, label)
+		switch {
+		case !isUUID(id) && primary:
+			ways = append(ways, i18n.Tf("It is the boot disk of VM %s: it goes with the VM — whether to delete the VM, ask the person; evo vm list shows it.",
+				"Это загрузочный диск ВМ %s: он уходит вместе с ВМ — удалять ли ВМ, спросите человека; ВМ показывает evo vm list.", label))
+		case !isUUID(id):
+			ways = append(ways, i18n.Tf("Detach it from VM %s, then delete it; evo vm list shows the VM.",
+				"Отключите его от ВМ %s, затем удалите; ВМ показывает evo vm list.", label))
+		case primary:
+			ways = append(ways, i18n.Tf("It is the boot disk of VM %s: it goes with the VM (destroy vm_id=%s, 'evo vm delete %s') — whether to delete the VM, ask the person.",
+				"Это загрузочный диск ВМ %s: он уходит вместе с ВМ (destroy vm_id=%s, 'evo vm delete %s') — удалять ли ВМ, спросите человека.", label, id, id))
+		default:
+			ways = append(ways, i18n.Tf("Detach it from VM %s with disk_detach disk_id=%s vm=%s ('evo disk detach %s --vm %s'), then delete it.",
+				"Отключите его от ВМ %s — disk_detach disk_id=%s vm=%s ('evo disk detach %s --vm %s'), затем удалите.", label, diskID, id, diskID, id))
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	return vms, clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("disk %s is attached to VM %s: Cloud.ru does not delete an attached disk; nothing was deleted",
+			"диск %s подключён к ВМ %s: Cloud.ru не удаляет подключённый диск; ничего не удалено", diskID, strings.Join(names, ", ")),
+		strings.Join(ways, " "))
+}
+
+func diskCreatePreview(eng *engine.Engine, req provision.CreateDiskReq, attachTo, attachToVMID, zoneArg string) engine.CreatePreview {
+	zone := &deployplan.RefSpec{ID: req.AvailabilityZoneID}
+	if zoneArg != "" && !looksUUID(zoneArg) {
+		zone.Name = zoneArg
+	}
+	p := engine.CreatePreview{Resource: engine.ResourceDisk, Name: req.Name,
+		ProjectID: req.ProjectID, ProjectFrom: eng.Config.ProjectOrigin, Zone: zone,
+		Disk: &deployplan.DiskSpec{SizeGB: req.Size, Type: firstNonEmptyStr(req.DiskTypeName, req.DiskTypeID), TypeID: req.DiskTypeID}}
+	p.Add("attach_to", attachTo)
+	p.Add("attach_to_vm_id", attachToVMID)
+	p.Price()
+	return p
+}
+
+func diskCreated(ctx context.Context, eng *engine.Engine, res, disk map[string]any, projectID string) (string, bool) {
+	id, _ := disk["id"].(string)
+	st := diskState(disk)
+	cancelled := false
+	if !strings.EqualFold(st, "available") {
+		err := waitDiskAvailable(ctx, eng, id, projectID)
+		var lim *diskAtLimit
+		var failed *diskFailed
+		switch {
+		case errors.As(err, &lim):
+			st = lim.state
+			lim.reads.put(res)
+		case errors.As(err, &failed):
+			res["status"] = "failed"
+			res["disk_id"] = id
+			// The id in a command only in the form of an id (291-2, 314).
+			hint := i18n.T("disk_list shows it; whether to delete it (disk_delete) — ask the person.",
+				"Диск показывает disk_list; удалять ли его (disk_delete) — спросите человека.")
+			if isUUID(id) {
+				hint = i18n.Tf("disk_list ids=[%s] shows it; whether to delete it (disk_delete) — ask the person.",
+					"Диск показывает disk_list ids=[%s]; удалять ли его (disk_delete) — спросите человека.", id)
+			}
+			return errAnswer(clierrors.Wrap(clierrors.CodeAPIError,
+				i18n.Tf("Cloud.ru did not make disk %s: %v", "Cloud.ru не создал диск %s: %v", quoteCloud(id), err),
+				hint, err), res), true
+		case err != nil:
+			// Not available by the end of the wait: still being made.
+			cancelled = errors.Is(err, context.Canceled)
+		default:
+			if d, e := eng.Cloud.GetDisk(ctx, id); e == nil && d["id"] == id && strings.EqualFold(diskState(d), "available") {
+				res["disk"] = d
+			} else {
+				was := maps.Clone(disk)
+				delete(was, "status")
+				was["state"] = "available"
+				res["disk"] = was
+			}
+			return toJSON(res), false
+		}
+	}
+	if !strings.EqualFold(st, "available") {
+		known := st != ""
+		if !known {
+			st = "unknown"
+		}
+		res["status"] = "creating"
+		if st == "unknown" {
+			res["status"] = "waiting"
+		}
+		res["disk_id"] = id
+		res["disk_state"] = st
+		word := quoteCloud(st)
+		if !known {
+			word = i18n.T("in an unknown state", "в неизвестном состоянии")
+		}
+		// The id in a command only in the form of an id (291-2, 314).
+		res["next"] = i18n.Tf("Disk %s is %s: the platform has not made it available yet. disk_list shows its state.",
+			"Диск %s — %s: платформа ещё не сделала его доступным. Состояние показывает disk_list.", quoteCloud(id), word)
+		if isUUID(id) {
+			res["next"] = i18n.Tf("Disk %s is %s: the platform has not made it available yet. disk_list ids=[%s] shows its state.",
+				"Диск %s — %s: платформа ещё не сделала его доступным. Состояние показывает disk_list ids=[%s].", quoteCloud(id), word, id)
+		}
+		nextStep(res, "disk_list", map[string]any{"ids": []any{id}})
+	}
+	if cancelled {
+		return errAnswer(fmt.Errorf("%s: %w", i18n.Tf("disk %s: the wait was cancelled, the platform goes on making it",
+			"диск %s: ожидание прервано, платформа продолжает создание", quoteCloud(id)), context.Canceled), res), true
+	}
+	return toJSON(res), false
+}
+
+// diskState is the state of a disk as its card names it: state, else
+// status.
+func diskState(d map[string]any) string {
+	if st, _ := d["state"].(string); st != "" {
+		return st
+	}
+	st, _ := d["status"].(string)
+	return st
+}

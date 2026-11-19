@@ -1,0 +1,406 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/cloud-ru/evo-cmcp/internal/billing"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+)
+
+const maxBreakdown = 12
+
+func (s *Registry) billingClient(ctx context.Context, args map[string]any) (*billing.Client, error) {
+	agreement := os.Getenv("CLOUDRU_AGREEMENT_ID")
+	project := stringArg(args, "project_id")
+	// The project of the argument goes through the engine factory as the
+	// ProjectID override, as deploy's and provision's do: mcp
+	// --allow-project checks it there. Passed to the API directly, it read
+	// the consumption of any project the key sees (architecture review
+	// 20.10; docs/mcp.md names only org_quotas and iam_service_accounts as
+	// reads of other projects).
+	var overrides map[string]any
+	if project != "" {
+		overrides = map[string]any{"ProjectID": project}
+	}
+	// Bound to its project (SetProjectBound: evo mcp --allow-project), the
+	// registry reads the agreement only within the configuration's project:
+	// the whole agreement holds the rows of the other projects (Cursor
+	// review 21.10, RP-1). No project configured — CONFIG_INVALID
+	// (engineFor), not the whole agreement.
+	bound := project == "" && s.projectBound
+	if bound {
+		ctx = context.WithValue(ctx, needsProject{}, true)
+	}
+	eng, err := s.engineFor(ctx, overrides)
+	if err != nil {
+		return nil, err
+	}
+	if project == "" && (agreement == "" || bound) {
+		project = eng.Config.ProjectID
+	}
+	if agreement == "" && project == "" {
+		return nil, billing.ErrNoAgreement()
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return billing.New(tok.Value, agreement, "", "").WithProject(project), nil
+}
+
+// billingScope says which filter the consumption was read by: "agreement"
+// (the whole agreement) or "project" (the project, within the agreement if
+// one is set too), with the ids.
+func billingScope(out map[string]any, cli *billing.Client) {
+	out["scope"] = "agreement"
+	if cli.ProjectID() != "" {
+		out["scope"] = "project"
+		out["project_id"] = cli.ProjectID()
+	}
+	if cli.AgreementID() != "" {
+		out["agreement_id"] = cli.AgreementID()
+	}
+}
+
+func (s *Registry) balanceRefused() error {
+	if !s.projectBound {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeConfigInvalid,
+		i18n.T("the balance of the billing agreement is not available on a server bound to its project (--allow-project): it is the money of the whole agreement, wider than the project",
+			"баланс договора недоступен на сервере, привязанном к проекту (--allow-project): это деньги всего договора, шире проекта"),
+		i18n.T("The costs of the project: billing_consumption or billing_finops. The balance: evo billing balance with a key of the agreement, outside this server.",
+			"Расход проекта — billing_consumption или billing_finops. Баланс — evo billing balance с ключом договора, вне этого сервера."))
+}
+
+func (s *Registry) handleBillingBalance(ctx context.Context, args map[string]any) (string, bool) {
+	// First the server's policy: with no agreement set, its hint would only
+	// lead to this refusal.
+	if err := s.balanceRefused(); err != nil {
+		return errResult(err), true
+	}
+	if os.Getenv("CLOUDRU_AGREEMENT_ID") == "" {
+		return errResult(billing.ErrBalanceNoAgreement()), true
+	}
+	cli, err := s.billingClient(ctx, nil)
+	if err != nil {
+		return errResult(err), true
+	}
+	data, err := cli.Balance(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(data), false
+}
+
+// billNum pulls a numeric value from an item, trying several field names,
+// a number or a string. Consumption rows are read by the spec «Контроль
+// затрат» v2: amount — «Стоимость потребления без НДС», amount_nds — «с
+// НДС», cost — «Тариф потребления облачного сервиса без НДС», the price of a
+// unit, not of the row: never a fallback for amount (a row of zero amount
+// may omit the field, and its tariff would be summed instead).
+func billNum(item map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		v, ok := item[k]
+		if !ok {
+			continue
+		}
+		switch n := v.(type) {
+		case float64:
+			return n
+		case string:
+			if f, err := strconv.ParseFloat(n, 64); err == nil {
+				return f
+			}
+		}
+	}
+	return 0
+}
+
+func billStr(item map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := item[k].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (s *Registry) handleBillingConsumption(ctx context.Context, args map[string]any) (string, bool) {
+	start := stringArg(args, "start")
+	if start == "" {
+		return usageT("'start' is required (YYYY-MM-DD)", "нужен 'start' (ГГГГ-ММ-ДД)"), true
+	}
+	end := stringArg(args, "end")
+	if end == "" {
+		end = start
+	}
+	if _, _, err := periodArgs(start, end); err != nil {
+		return errResult(err), true
+	}
+	cli, err := s.billingClient(ctx, args)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.Consumption(ctx, start+"T00:00:00Z", end+"T23:59:59Z")
+	if err != nil {
+		return errResult(err), true
+	}
+
+	total, bySvc := aggregateConsumption(items)
+	breakdown, svcTrunc := serviceBreakdown(bySvc)
+	out := map[string]any{
+		"period":         map[string]string{"start": start, "end": end},
+		"currency":       "RUB",
+		"total":          total.cost,
+		"total_with_nds": total.withNDS,
+		"records":        len(items),
+		"by_service":     breakdown,
+		"vat":            consumptionVAT,
+	}
+	billingScope(out, cli)
+	if svcTrunc > 0 {
+		out["by_service_truncated"] = svcTrunc
+	}
+	// When totals are zero but items exist, surface a sample item's keys so the
+	// operator can see which field names the tenant actually uses (no guessing).
+	if total.cost == 0 && len(items) > 0 {
+		keys := make([]string, 0, len(items[0]))
+		for k := range items[0] {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out["note"] = "total is 0 — verify field names"
+		out["sample_item_keys"] = keys
+	}
+	return toJSON(out), false
+}
+
+// consumptionVAT says which sums of the answer include VAT.
+var consumptionVAT = map[string]string{
+	"total":                    "excluding VAT: sum of amount",
+	"total_with_nds":           "including VAT: sum of amount_nds",
+	"by_service":               "excluding VAT: amount",
+	"by_service.cost_with_nds": "including VAT: amount_nds",
+}
+
+// billSum is a sum of consumption rows: cost excluding VAT (amount) and
+// including it (amount_nds).
+type billSum struct{ cost, withNDS float64 }
+
+// aggregateConsumption sums the cost of the rows, `amount` (excluding VAT)
+// and `amount_nds` (including it), in total and grouped by
+// service+resource. It summed `cost` first, as the ported finops_report.py
+// did; the spec calls `cost` the tariff of the service, the price of a unit,
+// and `amount` the cost of the row.
+func aggregateConsumption(items []map[string]any) (billSum, map[string]billSum) {
+	var total billSum
+	bySvc := map[string]billSum{}
+	for _, it := range items {
+		row := billSum{billNum(it, "amount"), billNum(it, "amount_nds")}
+		total.cost += row.cost
+		total.withNDS += row.withNDS
+		key := billStr(it, "servname", "servicename", "service")
+		if rn := billStr(it, "resource_name", "resourcename"); rn != "" {
+			key = key + " " + rn
+		}
+		if key == "" {
+			key = "Unknown"
+		}
+		s := bySvc[key]
+		s.cost += row.cost
+		s.withNDS += row.withNDS
+		bySvc[key] = s
+	}
+	return total, bySvc
+}
+
+// svcCost is a row of by_service: the cost of a service+resource over the
+// period, excluding VAT (cost) and including it (cost_with_nds).
+type svcCost struct {
+	Service     string  `json:"service"`
+	Cost        float64 `json:"cost"`
+	CostWithNDS float64 `json:"cost_with_nds"`
+}
+
+func serviceBreakdown(bySvc map[string]billSum) ([]svcCost, int) {
+	breakdown := make([]svcCost, 0, len(bySvc))
+	for k, v := range bySvc {
+		breakdown = append(breakdown, svcCost{Service: k, Cost: v.cost, CostWithNDS: v.withNDS})
+	}
+	sort.Slice(breakdown, func(i, j int) bool { return breakdown[i].Cost > breakdown[j].Cost })
+	if len(breakdown) > maxBreakdown {
+		return breakdown[:maxBreakdown], len(breakdown) - maxBreakdown
+	}
+	return breakdown, 0
+}
+
+// handleBillingFinops ports finops_report.py: INFORM (cost allocation by service,
+// anomalies vs the previous same-length period) + QUANTIFY (daily burn-rate,
+// balance runway in days, projected zero date, optional budget check). Read-only.
+// maxFinopsDays bounds the window of billing_finops: a leap year.
+const maxFinopsDays = 366
+
+func (s *Registry) handleBillingFinops(ctx context.Context, args map[string]any) (string, bool) {
+	const layout = "2006-01-02"
+	now := time.Now().UTC()
+	today := now.Format(layout)
+	days := pgInt(args, "days", 30)
+	end := stringArg(args, "end")
+	if end == "" {
+		end = today
+	}
+	endT, err := dateArg("end", end)
+	if err != nil {
+		return errResult(err), true
+	}
+	start := stringArg(args, "start")
+	if start == "" {
+		start = endT.AddDate(0, 0, -(days - 1)).Format(layout)
+	}
+	startT, endT, err := periodArgs(start, end)
+	if err != nil {
+		return errResult(err), true
+	}
+	periodDays := int(endT.Sub(startT).Hours()/24) + 1
+
+	cli, err := s.billingClient(ctx, args)
+	if err != nil {
+		return errResult(err), true
+	}
+
+	// Current period consumption.
+	cons, err := cli.Consumption(ctx, start+"T00:00:00Z", end+"T23:59:59Z")
+	if err != nil {
+		return errResult(err), true
+	}
+	total, bySvc := aggregateConsumption(cons)
+
+	var bal map[string]any
+	balErr := s.balanceRefused()
+	if balErr == nil {
+		bal, balErr = cli.Balance(ctx)
+	}
+	balance := billNum(bal, "balance")
+	active, _ := bal["active"].(bool)
+
+	daily := total.cost / float64(periodDays)
+	// The balance is the agreement's: against the burn of one project
+	// (project_id with an agreement) the runway would be too long.
+	var runway float64
+	if daily > 0 && balErr == nil && cli.ProjectID() == "" {
+		runway = balance / daily
+	}
+
+	// Previous same-length period → anomalies.
+	prevEndT := startT.AddDate(0, 0, -1)
+	prevStartT := prevEndT.AddDate(0, 0, -(periodDays - 1))
+	prevStart := prevStartT.Format(layout)
+	prevEnd := prevEndT.Format(layout)
+	prevCons, err := cli.Consumption(ctx, prevStart+"T00:00:00Z", prevEnd+"T23:59:59Z")
+	if err != nil {
+		return errResult(err), true
+	}
+	_, bySvcPrev := aggregateConsumption(prevCons)
+
+	// The growth is found by the sums excluding VAT, as before; each row
+	// carries the sums including VAT too.
+	type anomaly struct {
+		Service     string   `json:"service"`
+		Prev        float64  `json:"prev"`
+		Now         float64  `json:"now"`
+		DeltaPct    *float64 `json:"delta_pct"`
+		PrevWithNDS float64  `json:"prev_with_nds"`
+		NowWithNDS  float64  `json:"now_with_nds"`
+	}
+	var anomalies []anomaly
+	for svc, cur := range bySvc {
+		c, p := cur.cost, bySvcPrev[svc].cost
+		if p > 0 && c > p*1.5 && (c-p) > 1 {
+			d := (c - p) / p * 100
+			anomalies = append(anomalies, anomaly{Service: svc, Prev: p, Now: c, DeltaPct: &d, PrevWithNDS: bySvcPrev[svc].withNDS, NowWithNDS: cur.withNDS})
+		} else if p == 0 && c > 1 {
+			anomalies = append(anomalies, anomaly{Service: svc, Prev: 0, Now: c, DeltaPct: nil, PrevWithNDS: bySvcPrev[svc].withNDS, NowWithNDS: cur.withNDS})
+		}
+	}
+	sort.Slice(anomalies, func(i, j int) bool { return anomalies[i].Now > anomalies[j].Now })
+
+	breakdown, svcTrunc := serviceBreakdown(bySvc)
+	// Cap the anomalies as by_service: a long list can't overflow the agent
+	// trajectory (trajectory-array-size-limit → non-deliverable turn).
+	anomTrunc := 0
+	if len(anomalies) > maxBreakdown {
+		anomTrunc = len(anomalies) - maxBreakdown
+		anomalies = anomalies[:maxBreakdown]
+	}
+
+	out := map[string]any{
+		"period":              map[string]any{"start": start, "end": end, "days": periodDays},
+		"prev_period":         map[string]any{"start": prevStart, "end": prevEnd},
+		"currency":            "RUB",
+		"balance":             balance,
+		"active":              active,
+		"total_cost":          total.cost,
+		"daily_burn":          daily,
+		"total_cost_with_nds": total.withNDS,
+		"daily_burn_with_nds": total.withNDS / float64(periodDays),
+		"by_service":          breakdown,
+		"anomalies":           anomalies,
+		"line_items":          len(cons),
+	}
+	billingScope(out, cli)
+	out["vat"] = map[string]string{
+		"total_cost":               "excluding VAT: sum of amount",
+		"by_service":               "excluding VAT: amount",
+		"total_cost_with_nds":      "including VAT: sum of amount_nds",
+		"daily_burn_with_nds":      "including VAT: total_cost_with_nds per day",
+		"by_service.cost_with_nds": "including VAT: amount_nds",
+		"anomalies.now_with_nds":   "including VAT: amount_nds; the growth is found by the sums excluding VAT",
+		"anomalies.prev_with_nds":  "including VAT: amount_nds of the previous period",
+	}
+	if balErr != nil {
+		out["balance"], out["active"] = nil, nil
+		switch {
+		case s.balanceRefused() != nil:
+			out["balance_error"] = "balance not shown: the server is bound to its project (--allow-project), the balance is the whole agreement's"
+		case cli.AgreementID() == "":
+			out["balance_error"] = "balance unavailable: it needs the billing agreement (CLOUDRU_AGREEMENT_ID), the API has no balance by project"
+		default:
+			out["balance_error"] = "balance unavailable (undocumented billing endpoint): " + balErr.Error()
+		}
+	}
+	if svcTrunc > 0 {
+		out["by_service_truncated"] = svcTrunc
+	}
+	if anomTrunc > 0 {
+		out["anomalies_truncated"] = anomTrunc
+	}
+	if runway > 0 {
+		out["runway_days"] = runway
+		out["projected_zero_date"] = now.AddDate(0, 0, int(runway)).Format(layout)
+	} else {
+		out["runway_days"] = nil
+		out["projected_zero_date"] = nil
+		if balErr == nil && cli.ProjectID() != "" {
+			out["runway_note"] = "runway not computed: the balance is the agreement's, the costs are the project's"
+		}
+	}
+	if budget := billNum(args, "budget"); budget > 0 {
+		proj := daily * 30
+		out["budget"] = map[string]any{
+			"monthly":           budget,
+			"projected_monthly": proj,
+			"over":              proj > budget,
+			"pct":               proj / budget * 100,
+		}
+	}
+	return toJSON(out), false
+}

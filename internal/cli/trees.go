@@ -1,0 +1,1213 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"io"
+	"os"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clerrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/output"
+	"github.com/cloud-ru/evo-cmcp/internal/tools"
+)
+
+// The command trees (vm, image, disk, vpc, k8s, pg, s3, dns, lb and the
+// rest) are built from the registry: each tool's CLISpec (internal/tools) names its
+// command, which of its arguments are positional, and how the answer is
+// shown. Every other argument of the tool becomes a flag with the type from
+// its schema. The cobra layer only parses flags into map[string]any, calls
+// the tool and formats the answer. The help of a command is the tool's
+// description, English or Russian (Tool.ShortRU, DescriptionRU,
+// ArgDescriptionsRU). The presentation stays here: the summary of each tree
+// (in Russian: trees_ru.go), the Russian tables and the views a CLISpec
+// names by Render.
+
+// treeGroup is one top-level command.
+type treeGroup struct {
+	Name  string
+	Short string
+	Cmds  []treeCmd
+}
+
+// treeCmd is one command of a tree: the tool's CLISpec, and what the CLI
+// adds to it.
+type treeCmd struct {
+	tools.CLISpec
+	Tool string
+	// headers are the Russian column titles of the tree (treeHeadersRU).
+	headers map[string]string
+	// render is the view CLISpec.Render names (treeRenders).
+	render renderFunc
+}
+
+// renderFunc shows a tool's answer instead of the generic table.
+type renderFunc func(p *output.Printer, w io.Writer, text string) error
+
+// treeRenders is the closed set of views a CLISpec.Render may name (vm
+// create, vm get, image list, image get, the Marketplace showcase, k8s addons, ca
+// logs, metrics scrape, org projects, the billing reports); --json still prints the tool's answer as is.
+var treeRenders = map[string]renderFunc{
+	"vm-created":       renderVMCreated,
+	"image-list":       renderImageList,
+	"image-card":       renderImageCard,
+	"vm-card":          renderVMCard,
+	"marketplace-list": renderMarketplaceList,
+	"addon-list":       renderAddonList,
+	"addon-versions":   renderAddonVersions,
+	"log-lines":        renderLogLines,
+	"exposition":       renderExposition,
+	"project-list":     renderProjectList,
+	"billing-balance":  renderBillingBalance,
+	"billing-usage":    renderBillingConsumption,
+	"billing-finops":   renderBillingFinops,
+}
+
+var treeGroupShort = map[string]string{
+	"vm":          "Virtual machines",
+	"image":       "VM images: operating systems and Marketplace products",
+	"marketplace": "Showcase: VM images and Kubernetes addons, with the command that deploys each",
+	"disk":        "Disks",
+	"backup":      "Backups of VMs and disks",
+	"vpc":         "Networks: VPCs, routes, subnets, security groups, floating IPs",
+	"k8s":         "Managed Kubernetes clusters",
+	"pg":          "Managed PostgreSQL clusters, databases, users, backups",
+	"s3":          "Object Storage: buckets and objects",
+	"secret":      "Secret Manager",
+	"dns":         "Evolution DNS: zones and records",
+	"cert":        "Certificate Manager: TLS certificates",
+	"lb":          "Network load balancers (L4)",
+	"tg":          "Target groups of the load balancers",
+	"snat":        "SNAT gateways: outbound internet for private subnets",
+	"kafka":       "Managed Kafka clusters",
+	"redis":       "Managed Redis clusters",
+	"ar":          "Artifact Registry: registries of images and packages",
+	"ca":          "Container Apps: serverless containers",
+	"billing":     "Billing: balance, consumption, FinOps report",
+	"audit":       "Audit Logging: who did what in the project",
+	"org":         "Organization: projects and quotas",
+	"iam":         "IAM: service accounts",
+	"metrics":     "Service Monitoring: metrics",
+	"stack":       "Stacks: several resources from one manifest",
+}
+
+// treeGroupsOf groups the commands of reg's tools by CLISpec.Group, sorted
+// by group and verb (cobra lists them so anyway). Tools without a command
+// (None) are left out, and so are the engine commands, which
+// internal/cli builds by hand (engineCommands). A group "" holds the
+// commands at the root.
+func treeGroupsOf(reg *tools.Registry) []treeGroup {
+	byGroup := map[string][]treeCmd{}
+	headers := map[string]map[string]string{} // treeHeadersRU, once per group
+	for _, t := range reg.Tools() {
+		if t.CLI.Verb == "" {
+			continue
+		}
+		if _, ok := engineCommandOf(t.Name); ok {
+			continue // built by hand (engine_commands.go)
+		}
+		g := t.CLI.Group
+		if _, ok := headers[g]; !ok {
+			headers[g] = treeHeadersRU(g)
+		}
+		c := treeCmd{CLISpec: t.CLI, Tool: t.Name, headers: headers[g]}
+		if t.CLI.Render != "" {
+			c.render = treeRenders[t.CLI.Render]
+			if c.render == nil {
+				panic("command tree: " + t.Name + ": no view " + t.CLI.Render)
+			}
+		}
+		byGroup[t.CLI.Group] = append(byGroup[t.CLI.Group], c)
+	}
+	out := make([]treeGroup, 0, len(byGroup))
+	for name, cmds := range byGroup {
+		sort.Slice(cmds, func(i, j int) bool { return cmds[i].Verb < cmds[j].Verb })
+		g := treeGroup{Name: name, Cmds: cmds}
+		switch {
+		case name == "":
+		case engineToolAt("evo "+name) != "":
+			// The commands of an engine command (evo deploy plan): its
+			// help is its own.
+		default:
+			short, ok := treeGroupShort[name]
+			if !ok {
+				panic("command tree: no summary for group " + name)
+			}
+			g.Short = short
+			if ru, ok := treeGroupShortRU[name]; ok {
+				g.Short = i18n.T(short, ru)
+			}
+		}
+		out = append(out, g)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+const toolAnnotation = "evo.tool"
+
+// filterExampleAnnotation holds the arguments of a list command's example
+// with its filters; applyExamples puts it under the command's examples.
+const filterExampleAnnotation = "evo.filter-example"
+
+// filterFlagAnnotation marks a flag that is a filter of a list: the help
+// shows such flags as a block of their own (flagUsages).
+const filterFlagAnnotation = "evo.filter"
+
+// flagUsages are the usages of the local flags of c that are filters of a
+// list, or of the ones that are not: the two blocks of the help.
+func flagUsages(c *cobra.Command, filters bool) string {
+	fs := pflag.NewFlagSet(c.Name(), pflag.ContinueOnError)
+	c.LocalFlags().VisitAll(func(f *pflag.Flag) {
+		if _, is := f.Annotations[filterFlagAnnotation]; is == filters {
+			fs.AddFlag(f)
+		}
+	})
+	return fs.FlagUsages()
+}
+
+func filterFlagUsages(c *cobra.Command) string { return flagUsages(c, true) }
+func otherFlagUsages(c *cobra.Command) string  { return flagUsages(c, false) }
+
+// flagsBlockEN is the block of local flags in cobra's usage template, and
+// flagBlocksEN the two blocks evo shows instead: the filters of a list,
+// then the rest.
+const (
+	flagsBlockEN = `{{if .HasAvailableLocalFlags}}
+
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}`
+	flagBlocksEN = `{{if filterFlags .}}
+
+Filters:
+{{filterFlags . | trimTrailingWhitespaces}}{{end}}{{if otherFlags .}}
+
+Flags:
+{{otherFlags . | trimTrailingWhitespaces}}{{end}}`
+)
+
+// rootArgs are tool arguments served by root flags (--project-id,
+// --region) through the engine configuration, and confirmed, which is
+// given with --yes or at the prompt.
+var rootArgs = map[string]bool{"project_id": true, "region": true, "confirmed": true}
+
+func newTreeCmds(root *cobra.Command, reg *tools.Registry) []*cobra.Command {
+	var out []*cobra.Command
+	for _, g := range treeGroupsOf(reg) {
+		var parent *cobra.Command
+		if g.Name != "" {
+			if engine := engineCommandIn(root, g.Name); engine != nil {
+				parent = engine
+			} else {
+				parent = asGroup(&cobra.Command{Use: g.Name, Short: g.Short})
+				out = append(out, parent)
+			}
+		}
+		for _, c := range g.Cmds {
+			t, _ := reg.Lookup(c.Tool)
+			leaf := newTreeLeaf(reg, c, t)
+			if parent == nil {
+				out = append(out, leaf)
+				continue
+			}
+			parent.AddCommand(leaf)
+		}
+	}
+	return out
+}
+
+// engineCommandIn is the engine command of root named name, nil if none.
+func engineCommandIn(root *cobra.Command, name string) *cobra.Command {
+	if root == nil {
+		return nil
+	}
+	for _, c := range root.Commands() {
+		if c.Name() == name && c.Annotations[toolAnnotation] != "" {
+			if _, ok := engineCommandOf(c.Annotations[toolAnnotation]); ok {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+// positional is one parsed entry of treeCmd.Args.
+type positional struct {
+	names    []string // one name, or two for "id|name"
+	optional bool
+	rest     bool
+}
+
+func parsePositionals(specs []string) []positional {
+	out := make([]positional, 0, len(specs))
+	for _, s := range specs {
+		p := positional{}
+		switch {
+		case strings.HasSuffix(s, "..."):
+			p.rest, s = true, strings.TrimSuffix(s, "...")
+		case strings.HasSuffix(s, "?"):
+			p.optional, s = true, strings.TrimSuffix(s, "?")
+		}
+		p.names = strings.Split(s, "|")
+		out = append(out, p)
+	}
+	return out
+}
+
+// flagName is the flag for a tool argument: snake_case → kebab-case.
+func (c treeCmd) flagName(arg string) string {
+	if n, ok := c.Rename[arg]; ok {
+		return n
+	}
+	return strings.ReplaceAll(arg, "_", "-")
+}
+
+// flagArgs are the tool arguments that become flags: everything in the
+// schema that is not positional and not served by the root.
+func (c treeCmd) flagArgs(t tools.Tool) []param {
+	pos := map[string]bool{}
+	for _, p := range parsePositionals(c.Args) {
+		for _, n := range p.names {
+			pos[n] = true
+		}
+	}
+	var out []param
+	for _, p := range schemaParams(t) {
+		if pos[p.Name] || c.Omit[p.Name] || (rootArgs[p.Name] && c.Rename[p.Name] == "") {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
+	pos := parsePositionals(c.Args)
+	use := []string{c.Verb}
+	minArgs, maxArgs := 0, 0
+	for _, p := range pos {
+		label := strings.ReplaceAll(strings.Join(p.names, "|"), "_", "-")
+		switch {
+		case p.rest:
+			use = append(use, "<"+label+">...")
+			maxArgs = -1
+		case p.optional:
+			use = append(use, "["+label+"]")
+			maxArgs++
+		default:
+			use = append(use, "<"+label+">")
+			minArgs++
+			maxArgs++
+		}
+	}
+	if len(pos) > 0 && pos[len(pos)-1].rest {
+		minArgs++
+	}
+
+	short := summary(t.Description, 100)
+	long := t.Description + "\n\nRuns the " + t.Name + " tool (see 'evo tools describe " + t.Name + "')."
+	if t.Mutating {
+		long += "\nAsks for confirmation: a prompt on a terminal, --yes to confirm in advance, --dry-run to see the preview only."
+	} else if tools.IsSensitive(t) {
+		long += "\nReveals a secret, so it asks for confirmation: a prompt on a terminal, --yes to confirm in advance."
+	}
+	if i18n.Lang() == i18n.RU {
+		if t.ShortRU != "" {
+			short = t.ShortRU
+		}
+		runs := "Вызывает инструмент " + t.Name + " (подробнее: 'evo tools describe " + t.Name + "')."
+		if t.DescriptionRU != "" {
+			long = short + ".\n\n" + t.DescriptionRU + "\n\n" + runs
+		} else {
+			long = short + ".\n\n" + runs + "\n" +
+				"Описание инструмента и его флагов — на английском, как в MCP:\n\n" + t.Description
+		}
+		if t.Mutating {
+			long += "\n\nСпрашивает подтверждение: вопрос на терминале, --yes — согласие заранее, --dry-run — только превью."
+		} else if tools.IsSensitive(t) {
+			long += "\n\nПоказывает секрет, поэтому спрашивает подтверждение: вопрос на терминале, --yes — согласие заранее."
+		}
+	}
+
+	cmd := &cobra.Command{
+		Use:         strings.Join(use, " "),
+		Short:       short,
+		Long:        long,
+		Annotations: map[string]string{toolAnnotation: t.Name},
+		Args: func(cmd *cobra.Command, args []string) error {
+			if maxArgs == 0 {
+				return noArgs(cmd, args)
+			}
+			if len(args) < minArgs || (maxArgs >= 0 && len(args) > maxArgs) {
+				msg := fmt.Sprintf(i18n.T("%s: want %s, got %d argument(s)", "%s: нужно %s, передано аргументов: %d"),
+					cmd.CommandPath(), strings.Join(use[1:], " "), len(args))
+				if maxArgs >= 0 && len(args) > maxArgs {
+					msg += i18n.Tf("; extra arguments: %d — a flag left out?", "; лишних аргументов: %d — пропущен флаг?",
+						len(args)-maxArgs)
+				}
+				return stderrors.New(msg)
+			}
+			return nil
+		},
+	}
+
+	if maxArgs < 0 {
+		// Everything after the fixed arguments belongs to the tool
+		// (kubectl get pods -n x): stop parsing flags at the first argument.
+		// evo's own flags go before it.
+		cmd.Flags().SetInterspersed(false)
+		long += i18n.T("\nevo flags (--json, --yes, --dry-run, --profile) go before the arguments: everything after the first one is passed to the tool as is.",
+			"\nФлаги evo (--json, --yes, --dry-run, --profile) ставятся перед аргументами: всё после первого аргумента передаётся инструменту как есть.")
+		cmd.Long = long
+	}
+
+	flagArgs := c.flagArgs(t)
+	for _, p := range flagArgs {
+		name := c.flagName(p.Name)
+		desc, ru := flagDesc(t, p)
+		// The notes follow the language of the description they extend.
+		note := func(en, ruNote string) string {
+			if ru {
+				return ruNote
+			}
+			return en
+		}
+		if c.Pairs[p.Name] {
+			cmd.Flags().StringArray(name, nil, desc+note(" (key=value, repeatable; the value may contain '='. "+
+				"key=- reads the value from stdin (one field at most), key=@file from a file, its trailing newline trimmed: "+
+				"use these for passwords, so the value stays out of the command line and the shell history)",
+				" (поле=значение, флаг повторяется; значение может содержать '='. "+
+					"поле=- читает значение из stdin (не больше одного поля), поле=@файл — из файла без завершающего перевода строки: "+
+					"так пароль не попадает в командную строку и историю оболочки)"))
+			continue
+		}
+		if c.SecretFiles[p.Name] {
+			file := secretFileFlag(name)
+			// The pair is one argument: the file flag points at the value
+			// flag instead of repeating its description (and its
+			// "required"), and the value flag names the safer way.
+			cmd.Flags().String(file, "", note("--"+name+" from a file, its trailing newline trimmed ('-' reads stdin: until EOF, or one line without echo on a terminal), instead of --"+name,
+				"--"+name+" из файла без завершающего перевода строки ('-' — из stdin: до EOF, на терминале — строка без эха), вместо --"+name))
+			desc = strings.TrimSuffix(desc, ".") + note(". Or --"+file+", safer: the value stays out of the command line and the shell history",
+				". Или --"+file+" — безопаснее: значение не попадёт в командную строку и историю оболочки")
+		}
+		if c.Files[p.Name] {
+			cmd.Flags().String(name, "", note("A file with the value ('-' reads stdin until EOF: Ctrl-D on a terminal). ", "Файл со значением ('-' — из stdin до EOF: на терминале — Ctrl-D). ")+desc)
+			continue
+		}
+		switch p.Type {
+		case "integer":
+			cmd.Flags().Int(name, 0, desc)
+		case "number":
+			cmd.Flags().Float64(name, 0, desc)
+		case "boolean":
+			// An argument the tool takes as true when absent defaults to
+			// true here too: the help says "(default true)" and
+			// --x=false turns it off. An unset flag still goes to the
+			// tool as nothing (treeArgs takes changed flags only).
+			on, _ := p.Default.(bool)
+			switch {
+			case on:
+				desc = defaultTrueRE.ReplaceAllString(desc, "") + note(" To turn off: --"+name+"=false", " Выключить: --"+name+"=false")
+			case slices.Contains(tools.ListFilters(t), p.Name):
+				desc += note(" (false is given as --"+name+"=false)", " (false задаётся так: --"+name+"=false)")
+			}
+			cmd.Flags().Bool(name, on, desc)
+		case "array":
+			cmd.Flags().StringArray(name, nil, desc+note(" (repeatable, or comma-separated)", " (флаг повторяется или значения через запятую)"))
+		default:
+			cmd.Flags().String(name, "", desc)
+		}
+	}
+	noEmptyScope(cmd.Flags())
+	if filters := tools.ListFilters(t); filters != nil {
+		grouped := false
+		for _, a := range filters {
+			if cmd.Flags().Lookup(c.flagName(a)) != nil {
+				_ = cmd.Flags().SetAnnotation(c.flagName(a), filterFlagAnnotation, []string{"true"})
+				grouped = true
+			}
+		}
+		if grouped {
+			cmd.Long += "\n\n" + i18n.T("The filters are a block of flags below. Several are «and»; an empty selection is not «none in the project».",
+				"Фильтры — отдельным блоком флагов ниже. Несколько фильтров — «и»; пустая выборка — не «в проекте нет».")
+		}
+		if samples := tools.ListFilterSamples(t); len(samples) > 0 {
+			var ex []string
+			for _, u := range use[1:] {
+				if strings.HasPrefix(u, "<") {
+					ex = append(ex, u)
+				}
+			}
+			for _, sm := range samples {
+				ex = append(ex, "--"+c.flagName(sm.Arg), sm.Value)
+			}
+			cmd.Annotations[filterExampleAnnotation] = strings.Join(ex, " ")
+		}
+	}
+
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		callArgs, err := treeArgs(cmd, c, t, pos, flagArgs, args)
+		if err != nil {
+			return err
+		}
+		hints := treeCommandHints(cmd, c)
+		if err := tools.CheckArgs(t, callArgs); err != nil {
+			return toolError(tools.ErrResult(err), hints)
+		}
+		text, err := invokeTool(cmd.Context(), cmd, t, callArgs, true, hints)
+		if flagJSON {
+			// On a tool error the text is the tool's error body: the error
+			// itself goes to stderr as {"error":…}, so stdout stays empty
+			// for jq. The confirmation_required and dry_run envelopes are
+			// written by confirm.Ask, not returned here.
+			if text != "" && err == nil {
+				fmt.Fprintln(cmd.OutOrStdout(), text)
+			}
+			return err
+		}
+		if c.Raw && printRaw(cmd.OutOrStdout(), cmd.ErrOrStderr(), text, err) {
+			return err
+		}
+		if err != nil || text == "" {
+			return err
+		}
+		return c.show(cmdPrinter(cmd), cmd.OutOrStdout(), text)
+	}
+	flags := make(map[string]string, len(flagArgs))
+	for _, p := range flagArgs {
+		flags[c.flagName(p.Name)] = p.Name
+	}
+	registerFlagCompletions(reg, cmd, t.Name, flags)
+	markTabRequired(cmd, t, flags)
+	registerFlagHints(reg, cmd, t, flags)
+	cmd.ValidArgsFunction = treeCompletion(reg, t, pos, flags)
+	return cmd
+}
+
+// show prints the command's answer for a human: the view CLISpec.Render
+// names, or the generic table.
+func (c treeCmd) show(p *output.Printer, w io.Writer, text string) error {
+	if c.render != nil {
+		// A view of its own names the selection as the table does.
+		var v any
+		if json.Unmarshal([]byte(text), &v) == nil {
+			if line, _ := selectionLine(v); line != "" {
+				fmt.Fprintln(w, line)
+			}
+		}
+		return c.render(p, w, text)
+	}
+	return renderAnswer(p, w, text, tableView{Columns: c.Columns, Headers: c.headers})
+}
+
+// defaultTrueRE is the "(default: true)" of a schema description: pflag
+// adds its own "(default true)" to the help of a flag that defaults to true.
+var defaultTrueRE = regexp.MustCompile(` ?\(default:? true\)`)
+
+// flagDesc is the help of the flag for argument p: the tool's Russian text
+// of the argument when the CLI speaks Russian and there is one (ru is then
+// true), the schema's English description otherwise.
+func flagDesc(t tools.Tool, p param) (desc string, ru bool) {
+	desc = p.Description
+	if i18n.Lang() == i18n.RU {
+		if s := t.ArgDescriptionsRU[p.Name]; s != "" {
+			desc, ru = s, true
+		}
+	}
+	// A filter by a closed list names its values: the schema has them as
+	// an enum, the help has no schema.
+	if values := tools.ListFilterValues(t, p.Name); len(values) > 0 {
+		desc = strings.TrimSuffix(desc, ".") + ": " + strings.Join(values, ", ")
+	}
+	return desc, ru
+}
+
+// printRaw prints the "output" of a kubectl, apply or helm answer as the
+// tool printed it: to stdout, or to stderr when the tool failed (kubectl's
+// own message, which the error alone does not carry). False when the answer
+// has no output (a refusal before kubectl ran): it is shown as usual.
+func printRaw(stdout, stderr io.Writer, text string, err error) bool {
+	out, ok := parseObject(text)["output"].(string)
+	if !ok {
+		return false
+	}
+	w := stdout
+	if err != nil {
+		w = stderr
+	}
+	fmt.Fprint(w, out)
+	if out != "" && !strings.HasSuffix(out, "\n") {
+		fmt.Fprintln(w)
+	}
+	return true
+}
+
+// evoFlagsKubectlLacks are evo's global flags that kubectl does not have.
+// After the first argument they would reach kubectl ("unknown flag"), so they
+// are refused with the right order instead. --dry-run and --profile are
+// kubectl flags too and pass through.
+var evoFlagsKubectlLacks = map[string]bool{"--json": true, "--yes": true, "-y": true}
+
+// evoFlagInRest refuses an evo flag placed in the pass-through tail, up to a
+// "--" (what follows it is a command inside the container).
+func evoFlagInRest(cmd *cobra.Command, rest []string, firstArg string) error {
+	for _, a := range rest {
+		if a == "--" {
+			return nil
+		}
+		if evoFlagsKubectlLacks[a] || strings.HasPrefix(a, "--json=") || strings.HasPrefix(a, "--yes=") {
+			return clerrors.New(clerrors.CodeUsage,
+				i18n.Tf("%s: %s after the arguments would go to the tool", "%s: %s после аргументов достался бы инструменту", cmd.CommandPath(), a),
+				i18n.Tf("Put evo flags first: '%s %s <%s> …'.", "Флаги evo ставьте первыми: '%s %s <%s> …'.",
+					cmd.CommandPath(), strings.SplitN(a, "=", 2)[0], firstArg))
+		}
+	}
+	return nil
+}
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// treeArgs turns positionals and changed flags into the tool's arguments.
+func treeArgs(cmd *cobra.Command, c treeCmd, t tools.Tool, pos []positional, flagArgs []param, args []string) (map[string]any, error) {
+	out := map[string]any{}
+	i := 0
+	for _, p := range pos {
+		if i >= len(args) {
+			break
+		}
+		if args[i] == "" && !p.optional {
+			label := strings.ReplaceAll(strings.Join(p.names, "|"), "_", "-")
+			return nil, clerrors.New(clerrors.CodeUsage,
+				i18n.Tf("%s: <%s> is empty", "%s: <%s> пустой", cmd.CommandPath(), label),
+				helpHint(cmd))
+		}
+		switch {
+		case p.rest:
+			if err := evoFlagInRest(cmd, args[i:], strings.ReplaceAll(strings.Join(pos[0].names, "|"), "_", "-")); err != nil {
+				return nil, err
+			}
+			out[p.names[0]] = strings.Join(args[i:], " ")
+			i = len(args)
+		case len(p.names) == 2:
+			if uuidPattern.MatchString(args[i]) {
+				out[p.names[0]] = args[i]
+			} else {
+				out[p.names[1]] = args[i]
+			}
+			i++
+		default:
+			out[p.names[0]] = args[i]
+			i++
+		}
+	}
+	for _, p := range flagArgs {
+		name := c.flagName(p.Name)
+		if c.SecretFiles[p.Name] && cmd.Flags().Changed(secretFileFlag(name)) {
+			v, err := secretFileArg(cmd, name)
+			if err != nil {
+				return nil, err
+			}
+			out[p.Name] = v
+			continue
+		}
+		if !cmd.Flags().Changed(name) {
+			continue
+		}
+		if c.Pairs[p.Name] {
+			vals, _ := cmd.Flags().GetStringArray(name)
+			m, err := pairsArg(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), name, vals)
+			if err != nil {
+				return nil, err
+			}
+			out[p.Name] = m
+			continue
+		}
+		var raw string
+		if c.Files[p.Name] {
+			path := cmd.Flags().Lookup(name).Value.String()
+			data, err := readArgFile(cmd, path)
+			if err != nil {
+				return nil, clerrors.Wrap(clerrors.CodeUsage, fmt.Sprintf("--%s %s: %v", name, path, err), "", err)
+			}
+			v, err := coerceArg(p, string(data))
+			if err != nil {
+				return nil, clerrors.New(clerrors.CodeUsage, fmt.Sprintf("--%s %s: %v", name, path, err), "")
+			}
+			out[p.Name] = v
+			continue
+		}
+		if p.Type == "array" {
+			vals, _ := cmd.Flags().GetStringArray(name)
+			raw = strings.Join(vals, ",")
+		} else {
+			raw = cmd.Flags().Lookup(name).Value.String()
+		}
+		v, err := coerceArg(p, raw)
+		if err != nil {
+			return nil, clerrors.New(clerrors.CodeUsage, fmt.Sprintf("--%s: %v", name, err), "")
+		}
+		out[p.Name] = v
+	}
+	var missing []string
+	for _, p := range schemaParams(t) {
+		if _, ok := out[p.Name]; p.Required && !ok {
+			flag := "--" + c.flagName(p.Name)
+			if c.SecretFiles[p.Name] {
+				flag = i18n.Tf("%s or --%s", "%s или --%s", flag, secretFileFlag(c.flagName(p.Name)))
+			}
+			missing = append(missing, flag)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, clerrors.New(clerrors.CodeUsage,
+			i18n.Tf("%s: missing required flag(s): %s", "%s: не заданы обязательные флаги: %s", cmd.CommandPath(), strings.Join(missing, ", ")),
+			helpHint(cmd))
+	}
+	return out, nil
+}
+
+// pairsArg turns repeated key=value flags into an object. The value is
+// everything after the first "=", so it may contain "=" itself. A value
+// that is "-" is read from stdin (one key at most), "@path" from a file
+// (secretRef). A secret given so stays out of argv and the shell history;
+// a literal value that starts with "@" (or is "-") goes through a file.
+func pairsArg(ctx context.Context, stdin io.Reader, prompt io.Writer, flag string, vals []string) (map[string]any, error) {
+	out := make(map[string]any, len(vals))
+	fromStdin := ""
+	for i, v := range vals {
+		k, val, ok := strings.Cut(v, "=")
+		k = strings.TrimSpace(k)
+		if !ok || k == "" {
+			return nil, clerrors.New(clerrors.CodeUsage,
+				i18n.Tf("--%s number %d: want key=value", "--%s номер %d: нужно поле=значение", flag, i+1),
+				i18n.Tf("Example: --%[1]s hostname=web-01; a password from a file or stdin: --%[1]s admin_password=@./admin.pass or --%[1]s admin_password=-; the fields of an image: evo image get <image>.",
+					"Пример: --%[1]s hostname=web-01; пароль — из файла или stdin: --%[1]s admin_password=@./admin.pass или --%[1]s admin_password=-; поля образа — evo image get <образ>.", flag))
+		}
+		if _, dup := out[k]; dup {
+			return nil, clerrors.New(clerrors.CodeUsage,
+				i18n.Tf("--%s %s is given twice", "--%s %s задан дважды", flag, k), "")
+		}
+		var ref secretRef
+		switch {
+		case val == "-":
+			if fromStdin != "" {
+				return nil, clerrors.New(clerrors.CodeUsage,
+					i18n.Tf("--%s: %s and %s both read stdin", "--%s: %s и %s оба читают stdin", flag, fromStdin, k),
+					i18n.Tf("Only one field may read stdin; give the others from files: --%s %s=@<file>.",
+						"stdin читает только одно поле; остальные — из файлов: --%s %s=@<файл>.", flag, k))
+			}
+			fromStdin = k
+			ref = secretRef{stdin: true, given: fmt.Sprintf("--%s %s=-", flag, k),
+				prompt: i18n.Tf("Value of %s (not echoed): ", "Значение поля %s (не отображается): ", k)}
+		case strings.HasPrefix(val, "@"):
+			ref = secretRef{path: val[1:], given: fmt.Sprintf("--%s %s=%s", flag, k, val),
+				hint: i18n.T("A value that starts with @ is a file name; a literal one goes through a file too.",
+					"Значение, которое начинается с @, — имя файла; такое значение буквально тоже передаётся через файл.")}
+		default:
+			out[k] = val
+			continue
+		}
+		val, err := ref.read(ctx, stdin, prompt)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = val
+	}
+	return out, nil
+}
+
+// secretFileFlag is the flag that names the file of a SecretFiles
+// argument whose value flag is flag: --password-file beside --password.
+func secretFileFlag(flag string) string { return flag + "-file" }
+
+// secretFileArg is the value of a SecretFiles argument given by
+// --<flag>-file: the file it names, or stdin for "-". The value flag
+// beside it is refused: one value, from one place.
+func secretFileArg(cmd *cobra.Command, flag string) (string, error) {
+	file := secretFileFlag(flag)
+	if cmd.Flags().Changed(flag) {
+		return "", clerrors.New(clerrors.CodeUsage,
+			i18n.Tf("--%s and --%s are both given", "заданы оба флага: --%s и --%s", flag, file),
+			i18n.Tf("Give the value once: --%s reads it from a file or stdin ('-'), out of the command line.",
+				"Значение задаётся один раз: --%s читает его из файла или stdin ('-'), вне командной строки.", file))
+	}
+	path := cmd.Flags().Lookup(file).Value.String()
+	ref := secretRef{stdin: path == "-", path: path, given: "--" + file + " " + path,
+		prompt: i18n.Tf("Value of --%s (not echoed): ", "Значение --%s (не отображается): ", flag)}
+	return ref.read(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr())
+}
+
+// secretRef is a value given out of the command line, so that a secret
+// stays out of argv and the shell history: stdin, or a file.
+type secretRef struct {
+	stdin  bool   // read stdin; the file path otherwise
+	path   string // the file
+	prompt string // asked when stdin is a terminal
+	given  string // how the command line named the value, for the errors
+	hint   string // the hint when the file was not read
+}
+
+func (r secretRef) read(ctx context.Context, stdin io.Reader, prompt io.Writer) (string, error) {
+	text, err := r.readRaw(ctx, stdin, prompt)
+	if err != nil {
+		return "", err
+	}
+	if v := secretText(text); v != "" {
+		return v, nil
+	}
+	if r.stdin {
+		return "", clerrors.New(clerrors.CodeUsage, i18n.Tf("%s: stdin is empty", "%s: stdin пуст", r.given), "")
+	}
+	return "", clerrors.New(clerrors.CodeUsage, i18n.Tf("%s: the file is empty", "%s: файл пуст", r.given), "")
+}
+
+// readRaw is the text as the file, the pipe or the terminal gave it, not
+// yet normalised: the one normalisation of all three is secretText, in read.
+func (r secretRef) readRaw(ctx context.Context, stdin io.Reader, prompt io.Writer) (string, error) {
+	if !r.stdin {
+		b, err := os.ReadFile(r.path)
+		if err != nil {
+			return "", clerrors.New(clerrors.CodeUsage,
+				i18n.Tf("%s: the file was not read: %v", "%s: файл не прочитан: %v", r.given, err), r.hint)
+		}
+		return string(b), nil
+	}
+	if f, ok := stdin.(*os.File); ok && f == os.Stdin && stdinIsTerminal() {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return newConsole(os.Stdin, prompt, true).askSecret(ctx, r.prompt)
+	}
+	b, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", clerrors.New(clerrors.CodeUsage,
+			i18n.Tf("%s: stdin was not read: %v", "%s: stdin не прочитан: %v", r.given, err), "")
+	}
+	return string(b), nil
+}
+
+// utf8BOM is the byte order mark some Windows editors and PowerShell 5
+// (Out-File -Encoding utf8) put at the start of a UTF-8 file. It marks the
+// encoding, it is not text: no secret starts with it.
+const utf8BOM = "\uFEFF"
+
+// secretText is the value a secretRef gives for its text, the same from a
+// file, a pipe or a terminal: a leading UTF-8 BOM and one trailing newline
+// dropped (B12-7), nothing else — spaces around a password are part of it,
+// as in the literal flag (B12-6). On a terminal the newline is already
+// gone: ReadPassword stops at it.
+func secretText(s string) string {
+	return trimNewline(strings.TrimPrefix(s, utf8BOM))
+}
+
+// trimNewline drops one trailing newline ("\n" or "\r\n"): the one an
+// editor or echo adds.
+func trimNewline(s string) string {
+	if t, ok := strings.CutSuffix(s, "\r\n"); ok {
+		return t
+	}
+	return strings.TrimSuffix(s, "\n")
+}
+
+// readArgFile reads the file of a Files flag; "-" is stdin.
+func readArgFile(cmd *cobra.Command, path string) ([]byte, error) {
+	if path == "-" {
+		return io.ReadAll(cmd.InOrStdin())
+	}
+	return os.ReadFile(path)
+}
+
+// extraArgs lists the arguments a command does not take, quoted, a long
+// one cut short.
+func helpHint(cmd *cobra.Command) string {
+	return i18n.Tf("Run '%s --help'.", "Справка: '%s --help'.", cmd.CommandPath())
+}
+
+// --- answer formatting ---
+
+// tableView is how renderAnswer lays out a list: its columns and the
+// Russian titles of the columns. A table speaks the CLI's language: in
+// Russian its titles, да/нет and the notes under a list are Russian; --json
+// and MCP keep the tool's answer.
+type tableView struct {
+	Columns []string
+	// Headers are the Russian column titles by key (treeHeadersRU).
+	Headers map[string]string
+}
+
+// ru: the CLI speaks Russian.
+func (v tableView) ru() bool { return i18n.Lang() == i18n.RU }
+
+// header is the title of a column: its Russian title when the CLI speaks
+// Russian and Headers has one, the key in capitals otherwise.
+func (v tableView) header(col string) string {
+	if i18n.Lang() == i18n.RU {
+		if h, ok := v.Headers[col]; ok {
+			return h
+		}
+	}
+	return strings.ToUpper(col)
+}
+
+// cell is a table cell: a Russian table says да/нет, not true/false.
+func (v tableView) cell(x any, max int) string {
+	if b, ok := x.(bool); ok && v.ru() {
+		return yesNo(b)
+	}
+	return cell(x, max)
+}
+
+// note is a line under a list.
+func (v tableView) note(k string, x any) string {
+	if v.ru() {
+		if s, ok := x.(string); ok {
+			if ru, ok := listNoteRU[s]; ok {
+				return ru
+			}
+		}
+		if label, ok := noteLabelRU[k]; ok {
+			return fmt.Sprintf("%s: %v", label, x)
+		}
+	}
+	return fmt.Sprintf("%s: %v", k, x)
+}
+
+// renderAnswer shows a tool's JSON answer: a list as a table, an object as
+// FIELD/VALUE rows. Anything else is printed as is.
+func renderAnswer(p *output.Printer, w io.Writer, text string, view tableView) error {
+	var v any
+	if err := json.Unmarshal([]byte(text), &v); err != nil {
+		fmt.Fprintln(w, text)
+		return nil
+	}
+	if i18n.Lang() == i18n.RU {
+		valuesRU(v)
+	}
+	// The marker of the fields with text of the cloud is for a client of
+	// the JSON (--json, MCP); a person reads the table, whose cells are
+	// sanitized (output.SanitizeCell).
+	if m, ok := v.(map[string]any); ok {
+		delete(m, "_untrusted")
+	}
+	selection, empty := selectionLine(v)
+	if selection != "" {
+		fmt.Fprintln(w, selection)
+	}
+	if rows, notes, ok := findList(v); ok {
+		if !empty {
+			renderList(p, w, rows, view)
+		}
+		for _, k := range sortedKeys(notes) {
+			fmt.Fprintln(w, view.note(k, notes[k]))
+		}
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		fmt.Fprintln(w, text)
+		return nil
+	}
+	// A resource (it has an id or a name) is one FIELD/VALUE table. A
+	// composite answer without one (k8s_options: versions, flavors, zones)
+	// shows each list of objects as its own table under the fields.
+	_, hasID := m["id"]
+	_, hasName := m["name"]
+	sections := map[string][]any{}
+	if !hasID && !hasName {
+		for k, x := range m {
+			if a, ok := x.([]any); ok && len(a) > 0 {
+				if _, obj := a[0].(map[string]any); obj {
+					sections[k] = a
+				}
+			}
+		}
+	}
+	keys := sortedKeys(m)
+	rows := make([][]string, 0, len(keys))
+	for _, k := range keys {
+		if _, sec := sections[k]; !sec && !namedRef(m, k) {
+			rows = append(rows, []string{k, view.cell(refValue(m, k), 0)})
+		}
+	}
+	if len(rows) > 0 {
+		p.Table([]string{i18n.T("FIELD", "ПОЛЕ"), i18n.T("VALUE", "ЗНАЧЕНИЕ")}, rows)
+	}
+	printed := len(rows) > 0
+	for _, k := range keys {
+		if a, sec := sections[k]; sec {
+			if printed {
+				fmt.Fprintln(w)
+			}
+			fmt.Fprintf(w, "%s:\n", strings.ToUpper(k))
+			renderList(p, w, a, tableView{Headers: view.Headers})
+			printed = true
+		}
+	}
+	return nil
+}
+
+func renderVMCard(p *output.Printer, w io.Writer, text string) error {
+	var a struct {
+		Result string `json:"result"`
+	}
+	if json.Unmarshal([]byte(text), &a) == nil && a.Result != "" {
+		line := map[string]string{
+			"ok":         i18n.T("Result: ok — every check passed", "Итог: ok — все проверки прошли"),
+			"problem":    i18n.T("Result: problem — see the checks with result problem", "Итог: problem — см. проверки с результатом problem"),
+			"incomplete": i18n.T("Result: incomplete — not everything was checked (not_checked, unknown)", "Итог: incomplete — проверено не всё (not_checked, unknown)"),
+		}[a.Result]
+		if line == "" {
+			line = i18n.Tf("Result: %s", "Итог: %s", output.SanitizeCell(a.Result))
+		}
+		fmt.Fprintln(w, line)
+	}
+	return renderAnswer(p, w, text, tableView{})
+}
+
+// filterLabelRU names a filter for a person; a filter not here goes by
+// its argument.
+var filterLabelRU = map[string]string{"zone": "зона", "state": "состояние", "status": "состояние", "name": "имя", "type": "тип", "domain": "домен",
+	"states": "состояния", "statuses": "состояния"}
+
+// selectionLine is the line over a list answered under filters (the
+// answer's filters, count and total — tools.filtered): «Selection: zone
+// ru.AZ-2 (id), state running — 3 of 12», and whether nothing passed; ""
+// for an answer without filters. It takes the fields of the selection out
+// of v: the rest is the list as it is shown without filters.
+func selectionLine(v any) (line string, empty bool) {
+	m, _ := v.(map[string]any)
+	filters, ok := m["filters"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	parts := make([]string, 0, len(filters))
+	for _, k := range sortedKeys(filters) {
+		label := k
+		if ru, ok := filterLabelRU[k]; ok && i18n.Lang() == i18n.RU {
+			label = ru
+		}
+		parts = append(parts, label+" "+cell(filters[k], 0))
+	}
+	count, _ := m["count"].(float64)
+	of := ""
+	if total, ok := m["total"].(float64); ok {
+		of = i18n.Tf(" of %d", " из %d", int(total))
+	}
+	delete(m, "filters")
+	delete(m, "filtered_by")
+	if count == 0 {
+		return i18n.Tf("Nothing passed the filters: %s — 0%s.", "Под отбор ничего не подошло: %s — 0%s.", strings.Join(parts, ", "), of), true
+	}
+	return i18n.Tf("Selection: %s — %d%s", "Отбор: %s — %d%s", strings.Join(parts, ", "), int(count), of), false
+}
+
+func refValue(m map[string]any, k string) any {
+	id, _ := m[k].(string)
+	if id == "" {
+		return m[k]
+	}
+	if base, ok := strings.CutSuffix(k, "_id"); ok {
+		if name := engine.RefName(m, base); name != "" && name != id {
+			return name + " (" + id + ")"
+		}
+	} else if name, _ := m[k+"_name"].(string); name != "" && name != id {
+		// A key that holds the id itself (provision: flavor, region).
+		return name + " (" + id + ")"
+	}
+	return m[k]
+}
+
+// namedRef reports whether key k of m is the name of a reference refValue
+// shows with its id: its own row would repeat it.
+func namedRef(m map[string]any, k string) bool {
+	name, _ := m[k].(string)
+	if name == "" {
+		return false
+	}
+	base := strings.TrimSuffix(k, "_name")
+	if id, _ := m[base+"_id"].(string); id != "" && name != id && engine.RefName(m, base) == name &&
+		(k == base+"_name" || k == base) {
+		return true
+	}
+	// The name of a key that holds the id itself (refValue).
+	id, _ := m[base].(string)
+	return k == base+"_name" && id != "" && id != name && m[base+"_id"] == nil
+}
+
+// listNoteFields are the text fields a list answer may carry next to its
+// list (list_flavors: a note on prices and the tariff); they are printed
+// under the table.
+var listNoteFields = map[string]bool{"note": true, "warning": true, "hint": true, "tariff_url": true}
+
+// findList returns the rows of a list answer: a top-level array, or the
+// only array field of an object whose other fields are numbers (count,
+// total) or notes. An object with other fields (vm_get: name, private_ip
+// and an interfaces array) is a single resource, not a list.
+func findList(v any) ([]any, map[string]any, bool) {
+	if a, ok := v.([]any); ok {
+		return a, nil, true
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, nil, false
+	}
+	var list []any
+	notes := map[string]any{}
+	found := 0
+	for k, x := range m {
+		switch x := x.(type) {
+		case []any:
+			list = x
+			found++
+		case float64:
+		case string:
+			if !listNoteFields[k] {
+				return nil, nil, false
+			}
+			notes[k] = x
+		default:
+			return nil, nil, false
+		}
+	}
+	return list, notes, found == 1
+}
+
+// preferredColumns come first when the columns are picked from the rows.
+var preferredColumns = []string{"id", "name", "path", "key", "status", "state", "phase", "version", "size", "zone"}
+
+const maxAutoColumns = 7
+
+func renderList(p *output.Printer, w io.Writer, rows []any, view tableView) {
+	if len(rows) == 0 {
+		fmt.Fprintln(w, i18n.T("No items.", "Пусто."))
+		return
+	}
+	if _, isObj := rows[0].(map[string]any); !isObj {
+		out := make([][]string, len(rows))
+		for i, r := range rows {
+			out[i] = []string{view.cell(r, 0)}
+		}
+		p.Table([]string{i18n.T("VALUE", "ЗНАЧЕНИЕ")}, out)
+		return
+	}
+	columns := view.Columns
+	if len(columns) == 0 {
+		columns = autoColumns(rows)
+	}
+	headers := make([]string, len(columns))
+	for i, c := range columns {
+		headers[i] = view.header(c)
+	}
+	out := make([][]string, 0, len(rows))
+	for _, r := range rows {
+		m, _ := r.(map[string]any)
+		line := make([]string, len(columns))
+		for i, c := range columns {
+			line[i] = view.cell(refValue(m, c), 40)
+		}
+		out = append(out, line)
+	}
+	p.Table(headers, out)
+}
+
+// autoColumns picks up to maxAutoColumns keys with scalar values from the
+// first row: the preferred ones first, then the rest by name.
+func autoColumns(rows []any) []string {
+	first, _ := rows[0].(map[string]any)
+	scalar := map[string]bool{}
+	for k, v := range first {
+		switch v.(type) {
+		case map[string]any, []any:
+			if named, ok := v.(map[string]any); ok && named["name"] != nil {
+				scalar[k] = true // shown by its name
+			}
+		default:
+			scalar[k] = true
+		}
+	}
+	var cols []string
+	for _, k := range preferredColumns {
+		if scalar[k] {
+			cols = append(cols, k)
+			delete(scalar, k)
+		}
+	}
+	rest := make([]string, 0, len(scalar))
+	for k := range scalar {
+		rest = append(rest, k)
+	}
+	sort.Strings(rest)
+	cols = append(cols, rest...)
+	if len(cols) > maxAutoColumns {
+		cols = cols[:maxAutoColumns]
+	}
+	return cols
+}
+
+// cell renders a value for a table; max > 0 cuts it to that many runes.
+func cell(v any, max int) string {
+	var s string
+	switch x := v.(type) {
+	case nil:
+		s = ""
+	case string:
+		s = x
+	case bool, float64:
+		b, _ := json.Marshal(x)
+		s = string(b)
+	case map[string]any:
+		if n, ok := x["name"].(string); ok && max > 0 {
+			s = n
+		} else {
+			b, _ := json.Marshal(x)
+			s = string(b)
+		}
+	case []any:
+		parts := make([]string, 0, len(x))
+		simple := true
+		for _, e := range x {
+			switch e.(type) {
+			case map[string]any, []any:
+				simple = false
+			}
+			parts = append(parts, cell(e, 0))
+		}
+		if simple {
+			s = strings.Join(parts, ",")
+		} else {
+			b, _ := json.Marshal(x)
+			s = string(b)
+		}
+	default:
+		b, _ := json.Marshal(x)
+		s = string(b)
+	}
+	s = strings.ReplaceAll(s, "\n", " ")
+	if r := []rune(s); max > 0 && len(r) > max {
+		s = string(r[:max-1]) + "…"
+	}
+	return s
+}
+
+func sortedKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

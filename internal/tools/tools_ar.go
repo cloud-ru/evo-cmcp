@@ -1,0 +1,158 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/artifact"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+)
+
+// arClient builds an authenticated Artifact Registry client.
+func (s *Registry) arClient(ctx context.Context) (*artifact.Client, error) {
+	eng, err := s.engineFor(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return artifact.New(tok.Value, eng.Config.ProjectID, ""), nil
+}
+
+func (s *Registry) handleArList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.arClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListRegistries(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{
+			"id": m["id"], "name": m["name"], "type": m["registryType"],
+			"status": m["status"], "public": m["isPublic"], "tariff": m["tariff"],
+		})
+	}
+	return toJSON(map[string]any{"registries": out}), false
+}
+
+func (s *Registry) handleArGet(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return usageT("'id' is required (from ar_list)", "нужен 'id' (из ar_list)"), true
+	}
+	cli, err := s.arClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.GetRegistry(ctx, id)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(m), false
+}
+
+func (s *Registry) planArCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	if name == "" {
+		return answered(usageT("'name' is required", "нужен 'name'"), true), nil
+	}
+	regType := strings.ToUpper(stringArg(args, "registry_type"))
+	if regType == "" {
+		regType = "DOCKER"
+	}
+	public, _ := args["public"].(bool)
+	cli, err := s.arClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := cli.ListRegistries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list registries: %w", "проверка, что имя свободно: список реестров: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("registry", "реестр"), name, id, st, "ar_list")), nil
+	}
+	preview := map[string]any{
+		"message": i18n.Tf("ar_create makes a BILLABLE %s registry %q (public=%v).",
+			"ar_create создаёт ПЛАТНЫЙ реестр %s %q (public=%v).", regType, name, public),
+		"preview": willPreview(engine.ResourceARRegistry, name, "",
+			map[string]any{"registry_type": regType, "public": public, "tariff": strings.ToUpper(stringArg(args, "tariff"))},
+			[]string{"registry_type", "public", "tariff"}),
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		body := map[string]any{
+			"projectId":    cli.ProjectID(),
+			"name":         name,
+			"registryType": regType,
+			"isPublic":     public,
+		}
+		if t := strings.ToUpper(stringArg(args, "tariff")); t != "" {
+			body["tariff"] = t
+		}
+		op, err := cli.CreateRegistry(ctx, body)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			return lostCreate(ctx, "ar_create", cli.ListRegistries, i18n.T("registry", "реестр"), name, nil, "ar_get id", fmt.Errorf(i18n.T("create registry: %w", "создание реестра: %w"), err))
+		}
+		out := map[string]any{
+			"status": "creating", "operation_id": op.ID,
+			"note": i18n.T("Async — poll ar_operation(operation_id) until done=true; then ar_get for the status ACTIVE. Push images to <registry>.cr.cloud.ru (docker login with the SA key).",
+				"Асинхронно — опрашивайте evo ar operation <operation_id> до done=true; затем статус ACTIVE покажет evo ar get. Образы отправляйте в <registry>.cr.cloud.ru (docker login с ключом сервисного аккаунта)."),
+		}
+		// The registry's id is in the create's answer: named at once, not left
+		// to ar_list (fault matrix, process audit 1.2.1; as pg_create, N-07).
+		if op.ResourceID != "" {
+			out["registry_id"] = op.ResourceID
+		} else {
+			out["note"] = i18n.T("Async — poll ar_operation(operation_id) until done=true; then ar_list for the id/status ACTIVE. Push images to <registry>.cr.cloud.ru (docker login with the SA key).",
+				"Асинхронно — опрашивайте evo ar operation <operation_id> до done=true; затем id и статус ACTIVE покажет evo ar list. Образы отправляйте в <registry>.cr.cloud.ru (docker login с ключом сервисного аккаунта).")
+		}
+		s.goingOn(ctx, out, "ar_operation", op.ID, op.ResourceID, nil)
+		return toJSON(out), false
+	}}, nil
+}
+
+func (s *Registry) planArDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return nil, usageErr("'id' is required (from ar_list)", "нужен 'id' (из ar_list)")
+	}
+	cli, err := s.arClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deletePlan("ar_delete", "ar_delete PERMANENTLY deletes registry %s and its artifacts.",
+		"ar_delete БЕЗВОЗВРАТНО удаляет реестр %s и его артефакты.",
+		id, func() (map[string]any, error) { return cli.GetRegistry(ctx, id) },
+		func(ctx context.Context) (string, bool) {
+			op, err := cli.DeleteRegistry(ctx, id)
+			if err != nil {
+				return s.deleteFailed("ar_delete", id, fmt.Errorf(i18n.T("delete registry: %w", "удаление реестра: %w"), err))
+			}
+			return deleteOutcome(ctx, args, opWatch("ar_delete", id, map[string]any{"id": id}, op.ID, "ar_operation", cli.GetOperation))
+		}), nil
+}
+
+func (s *Registry) handleArOperation(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "operation_id")
+	if id == "" {
+		return usageT("'operation_id' is required", "нужен 'operation_id'"), true
+	}
+	cli, err := s.arClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return s.operation(ctx, "ar_operation", args, func(ctx context.Context) (any, error) { return cli.GetOperation(ctx, id) })
+}

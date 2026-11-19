@@ -1,0 +1,315 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package output
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"text/tabwriter"
+	"unicode"
+
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+)
+
+// Mode determines the output format.
+type Mode int
+
+const (
+	ModeText  Mode = iota // default TTY
+	ModePlain             // no TTY / piped
+	ModeJSON              // --json flag
+)
+
+// Printer handles all output formatting.
+type Printer struct {
+	out    io.Writer
+	errOut io.Writer
+	mode   Mode
+	color  bool // ANSI colors on out
+	// errColor is decided by errOut: "2>err.log" on a terminal must not
+	// write escape codes into the file.
+	errColor bool
+	// errLive: errOut is a terminal and the mode is not --json, so a
+	// printer onto it (OnStderr) can redraw a progress line.
+	errLive bool
+	// progressLen is the width of the progress line on the terminal
+	// (Progress), 0 when there is none.
+	progressLen int
+}
+
+// New creates a Printer. Detects mode from flags and TTY state.
+func New(jsonMode bool, noColor bool) *Printer {
+	mode := ModeText
+	if jsonMode {
+		mode = ModeJSON
+	} else if !IsTTY(int(os.Stdout.Fd())) {
+		mode = ModePlain
+	}
+	errLive := mode != ModeJSON && IsTTY(int(os.Stderr.Fd()))
+	return &Printer{
+		out:      os.Stdout,
+		errOut:   os.Stderr,
+		mode:     mode,
+		color:    ColorEnabled(noColor) && mode == ModeText,
+		errColor: colorAllowed(noColor) && errLive,
+		errLive:  errLive,
+	}
+}
+
+// OnStderr is a printer with p's settings that writes everything — steps,
+// progress, results — to p's error writer: the progress of a call whose
+// stdout carries only its answer (evo vm create). Its progress line is
+// redrawn when that writer is a terminal (on Windows too), and line mode
+// is used otherwise, whatever stdout is; --json keeps it as quiet as p.
+func (p *Printer) OnStderr() *Printer {
+	mode := p.mode
+	if mode != ModeJSON {
+		mode = ModePlain
+		if p.errLive {
+			mode = ModeText
+		}
+	}
+	return &Printer{
+		out:      p.errOut,
+		errOut:   p.errOut,
+		mode:     mode,
+		color:    p.errColor && mode == ModeText,
+		errColor: p.errColor,
+		errLive:  p.errLive,
+	}
+}
+
+// NewWithWriter creates a Printer writing to a specific writer (for testing).
+func NewWithWriter(w io.Writer, mode Mode, color bool) *Printer {
+	return &Printer{
+		out:      w,
+		errOut:   w,
+		mode:     mode,
+		color:    color,
+		errColor: color,
+	}
+}
+
+// NewWithWriters creates a Printer with separate result and diagnostic
+// writers (for testing what goes to stdout vs stderr).
+func NewWithWriters(out, errOut io.Writer, mode Mode, color bool) *Printer {
+	return &Printer{
+		out:      out,
+		errOut:   errOut,
+		mode:     mode,
+		color:    color,
+		errColor: color,
+	}
+}
+
+// Step prints a step indicator: "==> [1/5] Message...". A command of one
+// step (total 0) has no counter: "==> Message...". The message may carry
+// what the cloud sent (a state, a name): it is printed cleaned, as
+// StepDone and Progress print theirs — the step lines go to the terminal,
+// to the "log" of an MCP answer and to the progress of an MCP call alike.
+func (p *Printer) Step(n, total int, msg string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		return
+	}
+	msg = sanitizeCell(msg)
+	prefix := fmt.Sprintf("==> [%d/%d] %s", n, total, msg)
+	if total == 0 {
+		prefix = "==> " + msg
+	}
+	if p.color {
+		fmt.Fprintf(p.out, "%s%s%s%s\n", colorBold, colorBlue, prefix, colorReset)
+	} else {
+		fmt.Fprintln(p.out, prefix)
+	}
+}
+
+// StepDone prints step completion: "    detail". The detail is one line
+// that may name what the cloud sent (a VM's name): it is printed cleaned
+// (sanitizeCell), as Step and Progress print theirs.
+func (p *Printer) StepDone(detail string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		return
+	}
+	detail = sanitizeCell(detail)
+	if p.color {
+		fmt.Fprintf(p.out, "    %s%s%s\n", colorDim, detail, colorReset)
+	} else {
+		fmt.Fprintf(p.out, "    %s\n", detail)
+	}
+}
+
+func (p *Printer) Success(msg string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		return
+	}
+	msg = sanitizeCell(msg)
+	if p.color {
+		fmt.Fprintf(p.out, "%s%s%s\n", colorGreen, msg, colorReset)
+	} else {
+		fmt.Fprintln(p.out, msg)
+	}
+}
+
+func (p *Printer) Warning(msg string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		_ = json.NewEncoder(p.errOut).Encode(map[string]string{"warning": msg})
+		return
+	}
+	msg = sanitizeCell(msg)
+	if p.errColor {
+		fmt.Fprintf(p.errOut, "%s%s%s%s%s\n", colorBold, colorYellow, warningPrefix(), msg, colorReset)
+	} else {
+		fmt.Fprintf(p.errOut, "%s%s\n", warningPrefix(), msg)
+	}
+}
+
+func (p *Printer) Errorf(msg string, args ...any) {
+	p.ProgressDone()
+	formatted := sanitizeLines(fmt.Sprintf(msg, args...))
+	if p.errColor {
+		fmt.Fprintf(p.errOut, "%s%s%s%s%s\n", colorBold, colorRed, errorPrefix(), formatted, colorReset)
+	} else {
+		fmt.Fprintf(p.errOut, "%s%s\n", errorPrefix(), formatted)
+	}
+}
+
+func (p *Printer) Hint(msg string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		return
+	}
+	msg = sanitizeCell(msg)
+	if p.errColor {
+		fmt.Fprintf(p.errOut, "%s%s%s\n", colorDim, msg, colorReset)
+	} else {
+		fmt.Fprintln(p.errOut, msg)
+	}
+}
+
+// Table prints data as an aligned table. The columns are laid out on the
+// plain text and the bold goes on the finished header line: tabwriter
+// counts escape bytes as width, so a bold header cell pushed its column
+// off the rows on a color terminal.
+func (p *Printer) Table(headers []string, rows [][]string) {
+	p.ProgressDone()
+	if p.mode == ModeJSON {
+		return
+	}
+	var buf bytes.Buffer
+	tw := tabwriter.NewWriter(&buf, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, strings.Join(sanitizeRow(headers), "\t"))
+	for _, row := range rows {
+		fmt.Fprintln(tw, strings.Join(sanitizeRow(row), "\t"))
+	}
+	tw.Flush()
+	out := buf.String()
+	if p.color {
+		head, rest, _ := strings.Cut(out, "\n")
+		out = colorBold + head + colorReset + "\n" + rest
+	}
+	fmt.Fprint(p.out, out)
+}
+
+func sanitizeRow(row []string) []string {
+	out := make([]string, len(row))
+	for i, c := range row {
+		out[i] = sanitizeCell(c)
+	}
+	return out
+}
+
+// SanitizeCell is sanitizeCell for text printed outside a table (a card
+// line with a name from the cloud).
+func SanitizeCell(s string) string { return sanitizeCell(s) }
+
+func sanitizeLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		l = sanitizeCell(l)
+		if i > 0 && l != "" && !strings.HasPrefix(l, " ") {
+			l = "  " + l
+		}
+		lines[i] = l
+	}
+	return strings.Join(lines, "\n")
+}
+
+func sanitizeCell(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r' || unicode.In(r, unicode.Zl, unicode.Zp):
+			return ' '
+		case unicode.IsControl(r) || unicode.Is(unicode.Cf, r):
+			return '?'
+		}
+		return r
+	}, s)
+}
+
+// JSON outputs v as JSON to stdout.
+func (p *Printer) JSON(v any) error {
+	enc := json.NewEncoder(p.out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
+}
+
+// NDJSON outputs v as a single NDJSON line.
+func (p *Printer) NDJSON(v any) error {
+	enc := json.NewEncoder(p.out)
+	return enc.Encode(v)
+}
+
+// IsJSON returns true if in JSON output mode.
+func (p *Printer) IsJSON() bool {
+	return p.mode == ModeJSON
+}
+
+// Writer returns the underlying output writer.
+func (p *Printer) Writer() io.Writer {
+	return p.out
+}
+
+// ErrWriter returns the writer for diagnostics and prompts (stderr), so that
+// stdout carries only the command's result.
+func (p *Printer) ErrWriter() io.Writer {
+	return p.errOut
+}
+
+// ErrorBody is the payload of a JSON-mode error.
+type ErrorBody struct {
+	// Code is the process exit code.
+	Code int `json:"code"`
+	// Reason is the symbolic code ("AUTH_FAILED"), the same in every
+	// language of the CLI: scripts match on it, not on Message.
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+	// Hint is left out when the error has none, not printed as "".
+	Hint string `json:"hint,omitempty"`
+	// Details are the fields of a tool's error answer beyond the error
+	// (clerrors.CLIError.Details); left out when there are none.
+	Details map[string]any `json:"details,omitempty"`
+}
+
+// JSONError writes
+// {"error": {"code": N, "reason": "...", "message": "...", "hint": "...", "details": {...}}}
+// to the error writer. code is the process exit code, reason the symbolic
+// code of the error; without a hint or details their keys are left out.
+func (p *Printer) JSONError(code int, reason, message, hint string, details map[string]any) error {
+	enc := json.NewEncoder(p.errOut)
+	return enc.Encode(struct {
+		Error ErrorBody `json:"error"`
+	}{ErrorBody{Code: code, Reason: reason, Message: message, Hint: hint, Details: details}})
+}
+
+func warningPrefix() string { return i18n.T("Warning: ", "Предупреждение: ") }
+
+func errorPrefix() string { return i18n.T("Error: ", "Ошибка: ") }

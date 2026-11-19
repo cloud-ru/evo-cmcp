@@ -1,0 +1,415 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package login
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/cloud-ru/evo-cmcp/internal/auth"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+)
+
+func Login(ctx context.Context, cfg Config, choice Choice, store Store) (Result, error) {
+	s := &session{cfg: cfg, choice: choice, store: store,
+		state: random(16), nonce: random(16), verifier: random(32)}
+	if cfg.LockPath != "" {
+		lk, err := lockLogin(cfg.LockPath)
+		if err != nil {
+			return Result{}, err
+		}
+		defer lk.release()
+		s.lock = lk
+	}
+	d, err := cfg.discover(ctx)
+	if err != nil {
+		return Result{}, at(stepDiscovery, err)
+	}
+	s.disc = d
+	ln, port, err := listen(cfg.Ports)
+	if err != nil {
+		return Result{}, at(stepListen, err)
+	}
+	s.redirect = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	if s.lock != nil {
+		s.lock.note(port)
+	}
+	authURL := d.AuthorizationEndpoint + "?" + url.Values{
+		"response_type": {"code"}, "client_id": {auth.LoginClientID}, "redirect_uri": {s.redirect},
+		"scope": {auth.LoginScope}, "state": {s.state}, "nonce": {s.nonce},
+		"code_challenge": {challenge(s.verifier)}, "code_challenge_method": {"S256"},
+	}.Encode()
+
+	s.until = s.cfg.Now().Add(cfg.Wait)
+	lb := &loopback{s: s, host: "127.0.0.1:" + strconv.Itoa(port), done: make(chan outcome, 1)}
+	srv := &http.Server{Handler: lb, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+
+	if s.choice.For == ForAgent {
+		var term time.Time
+		if s.choice.Days > 0 {
+			term = s.cfg.Now().Add(time.Duration(s.choice.Days) * 24 * time.Hour)
+		}
+		s.warnAgent(term)
+	}
+	if cfg.Remote {
+		s.tell(tOverSSH(port))
+	}
+	s.tell(tOpenPage())
+	cfg.Say(tOpen(), authURL)
+	if cfg.Open != nil {
+		_ = cfg.Open(authURL) // the address is printed: a browser that did not open is no failure
+	} else {
+		s.tell(tNoBrowser())
+	}
+	s.tell(tWaiting(cfg.Wait))
+	s.tell(tCannotReach())
+
+	timer := time.NewTimer(cfg.Wait)
+	defer timer.Stop()
+	select {
+	case o := <-lb.done:
+		return s.answer(o)
+	case <-timer.C:
+		// As for Ctrl-C below: a grant under way ends, and its result is
+		// the answer, not «nothing was made» (audit of 1.8, A18-13).
+		lb.close()
+		select {
+		case o := <-lb.done:
+			return s.answer(o)
+		default:
+		}
+		return Result{}, at(stepWait, clierrors.New(clierrors.CodeLoginTimeout, eTimeout(cfg.Wait), eTimeoutHint(cfg.Wait)))
+	case <-ctx.Done():
+		lb.close()
+		select {
+		case o := <-lb.done:
+			return s.answer(o)
+		default:
+		}
+		return Result{}, ctx.Err()
+	}
+}
+
+// warnAgent says in the terminal, once, what a key for an agent can do
+// and the role's term, when it is known (zero: not chosen yet).
+func (s *session) warnAgent(term time.Time) {
+	if !s.agentWarned {
+		s.agentWarned = true
+		until := ""
+		if !term.IsZero() {
+			until = day(term)
+		}
+		s.tell(tAgentWarnLine(until))
+		s.tell(tAgentRevokeLine())
+	}
+}
+
+// tell writes a line in the terminal, when there is one to write to.
+// The steps of the grant come from the loopback's goroutine while Login
+// may still be writing: one line at a time.
+func (s *session) tell(line string) {
+	if s.cfg.Tell != nil {
+		s.tellMu.Lock()
+		defer s.tellMu.Unlock()
+		s.cfg.Tell(line)
+	}
+}
+
+// listen takes the first free port of ports on 127.0.0.1 only.
+func listen(ports []int) (net.Listener, int, error) {
+	for _, p := range ports {
+		if ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(p))); err == nil {
+			// Port 0 (the tests) is the one the system chose.
+			return ln, ln.Addr().(*net.TCPAddr).Port, nil
+		}
+	}
+	return nil, 0, clierrors.New(clierrors.CodeConfigInvalid, ePorts(ports), ePortsHint())
+}
+
+// outcome is how the login ended.
+type outcome struct {
+	res Result
+	err error
+}
+
+type loopback struct {
+	s    *session
+	host string
+	done chan outcome
+
+	mu    sync.Mutex
+	phase int // 0: waiting for the code; 1: the consent; 2: ended
+	last  *page
+}
+
+const (
+	phaseCode = iota
+	phaseConsent
+	phaseEnded
+)
+
+func (l *loopback) close() {
+	l.mu.Lock()
+	l.phase = phaseEnded
+	l.mu.Unlock()
+}
+
+// show writes the page that ends the consent and keeps it for a repeat.
+func (l *loopback) show(w http.ResponseWriter, p page) {
+	p = p.signed(l.s.user())
+	l.last = &p
+	writePage(w, http.StatusOK, p)
+}
+
+func (l *loopback) end(o outcome) {
+	l.phase = phaseEnded
+	l.done <- o
+}
+
+// refuse answers a request that is not of this login: no page, no secret.
+func refuse(w http.ResponseWriter, code int) { refuseWith(w, code, tForeign()) }
+
+// refuseWith is a refusal with no page: its text, as plain text.
+func refuseWith(w http.ResponseWriter, code int, text string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(code)
+	fmt.Fprintln(w, text)
+}
+
+func (l *loopback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// A page of another site cannot drive the loopback by a name that
+	// resolves to it (DNS rebinding): the Host is ours or nothing.
+	if r.Host != l.host {
+		refuse(w, http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Referrer-Policy", "same-origin")
+	w.Header().Set("Cache-Control", "no-store")
+	// The fonts of the pages: static, without the lock a grant may hold.
+	if serveFont(w, r) {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/callback":
+		l.callback(w, r)
+	case r.Method == http.MethodPost && (r.URL.Path == "/grant" || r.URL.Path == "/cancel"):
+		l.consent(w, r)
+	default:
+		refuse(w, http.StatusNotFound)
+	}
+}
+
+func (l *loopback) ownState(got string) bool {
+	return subtle.ConstantTimeCompare([]byte(got), []byte(l.s.state)) == 1
+}
+
+// ownConsent is the token of the consent page; there is none before the
+// page is served.
+func (l *loopback) ownConsent(got string) bool {
+	return l.s.consent != "" && subtle.ConstantTimeCompare([]byte(got), []byte(l.s.consent)) == 1
+}
+
+// callback takes the provider's redirect once, with this login's state
+// (steps 5–11).
+func (l *loopback) callback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	own := l.ownState(q.Get("state"))
+	if l.phase != phaseCode || !own {
+		switch {
+		case own:
+			writePage(w, http.StatusForbidden, refusedPage(tAlreadyOpenTitle(), tAlreadyOpen()).signed(l.s.user()))
+		case q.Get("state") != "":
+			writePage(w, http.StatusForbidden, refusedPage(tForeignTitle(), tForeignLink()))
+		default:
+			refuse(w, http.StatusForbidden)
+		}
+		return
+	}
+	ctx := r.Context()
+	if e := q.Get("error"); e != "" {
+		if e == "access_denied" {
+			writePage(w, http.StatusOK, cancelledPage())
+			l.end(outcome{err: cancelled()})
+			return
+		}
+		err := at(stepCallback, clierrors.New(clierrors.CodeAuthFailed, eProvider(e, q.Get("error_description")),
+			eProviderHint(e)))
+		writePage(w, http.StatusOK, errorPage(err))
+		l.end(outcome{err: err})
+		return
+	}
+	// This login's state with neither a code nor an error is no answer of
+	// the provider (a reload cut short, a probe that read the state): it
+	// is refused, and the login waits on for the redirect (№ 10, R3-F5).
+	code := q.Get("code")
+	if code == "" {
+		writePage(w, http.StatusForbidden, refusedPage("", tNoProviderAnswer()))
+		return
+	}
+	if err := l.s.exchange(ctx, code); err != nil {
+		writePage(w, http.StatusOK, errorPage(err))
+		l.end(outcome{err: err})
+		return
+	}
+	if err := l.s.prepare(ctx); err != nil {
+		writePage(w, http.StatusOK, errorPage(err).signed(l.s.user()))
+		l.end(outcome{err: err})
+		return
+	}
+	l.s.consent = random(16)
+	l.s.tellPreselect()
+	l.phase = phaseConsent
+	writePage(w, http.StatusOK, consentPage(l.s))
+}
+
+func (l *loopback) fromPage(r *http.Request) bool {
+	if o := r.Header.Values("Origin"); len(o) > 0 && (len(o) != 1 || o[0] != "http://"+l.host) {
+		return false
+	}
+	if s := r.Header.Get("Sec-Fetch-Site"); s != "" && s != "same-origin" {
+		return false
+	}
+	return true
+}
+
+func (l *loopback) consent(w http.ResponseWriter, r *http.Request) {
+	if !l.fromPage(r) {
+		refuse(w, http.StatusForbidden)
+		return
+	}
+	if err := r.ParseForm(); err != nil || !l.ownState(r.PostForm.Get("state")) || !l.ownConsent(r.PostForm.Get("consent")) {
+		refuse(w, http.StatusForbidden)
+		return
+	}
+	if l.phase == phaseEnded && l.last != nil {
+		writePage(w, http.StatusOK, *l.last)
+		return
+	}
+	if l.phase != phaseConsent {
+		refuse(w, http.StatusForbidden)
+		return
+	}
+	if r.URL.Path == "/cancel" {
+		l.show(w, cancelledPage())
+		l.end(outcome{err: cancelled()})
+		return
+	}
+	ctx := context.WithoutCancel(r.Context())
+	p, aud, days, err := l.s.chosen(r.PostForm)
+	if err != nil {
+		err = at(stepChoice, err)
+		l.show(w, errorPage(err))
+		l.end(outcome{err: err})
+		return
+	}
+	pl, err := l.s.planFor(ctx, p, aud, days)
+	if err != nil {
+		l.show(w, errorPage(err))
+		l.end(outcome{err: err})
+		return
+	}
+	res, err := l.s.grant(ctx, pl, l.s.tell)
+	if err != nil {
+		l.show(w, errorPage(err))
+		l.end(outcome{res: res, err: err})
+		return
+	}
+	l.show(w, donePage(res))
+	l.end(outcome{res: res})
+}
+
+// chosen is the choice of the form, held to what the page offered.
+func (s *session) chosen(f url.Values) (project, Audience, int, error) {
+	bad := func(what string) (project, Audience, int, error) {
+		return project{}, "", 0, clierrors.New(clierrors.CodeUsage, eChoice(what), eRetry())
+	}
+	var p *project
+	for i := range s.projects {
+		if s.projects[i].ID == f.Get("project") {
+			p = &s.projects[i]
+		}
+	}
+	if p == nil {
+		return bad("project")
+	}
+	if !p.Allowed {
+		return project{}, "", 0, noRight(p.Name)
+	}
+	aud := Audience(f.Get("audience"))
+	if aud != ForMe && aud != ForAgent {
+		return bad("audience")
+	}
+	// A store may refuse an audience its profile does not take (C24): before
+	// any write.
+	if r, ok := s.store.(interface{ Refuses(Audience) error }); ok {
+		if err := r.Refuses(aud); err != nil {
+			return project{}, "", 0, err
+		}
+	}
+	days, err := strconv.Atoi(f.Get("ttl"))
+	if err != nil || !containsInt(Terms, days) {
+		return bad("ttl")
+	}
+	return *p, aud, days, nil
+}
+
+func containsInt(xs []int, x int) bool {
+	for _, y := range xs {
+		if y == x {
+			return true
+		}
+	}
+	return false
+}
+
+// cancelled is the end of a sign-in the person cancelled: USAGE, nothing
+// made.
+func cancelled() error {
+	return clierrors.New(clierrors.CodeUsage, eCancelled(), eCancelledHint())
+}
+
+// oneLine is a provider's text as evo's own text quotes it: on one line,
+// at most 200 characters (process audit 1.2.1, П9).
+func oneLine(s string) string {
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return strconv.Quote(s)
+}
+
+// answer is the login's answer of an outcome of the loopback.
+func (s *session) answer(o outcome) (Result, error) {
+	if o.err == nil {
+		o.res.Unchecked = s.unchecked
+	}
+	return o.res, s.withUnchecked(o.err)
+}
+
+func (s *session) withUnchecked(err error) error {
+	var ce *clierrors.CLIError
+	if s.unchecked == "" || !errors.As(err, &ce) {
+		return err
+	}
+	if ce.Details == nil {
+		ce.Details = map[string]any{}
+	}
+	ce.Details["unchecked"] = s.unchecked
+	return err
+}

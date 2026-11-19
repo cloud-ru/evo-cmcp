@@ -1,0 +1,220 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"encoding/json"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+	"github.com/cloud-ru/evo-cmcp/internal/s3"
+)
+
+// Checks of arguments the handlers make before the preview and before the
+// cloud (QA 20.10): a value the API would refuse, or worse take, is USAGE
+// with the argument named.
+
+func aliasArg(args map[string]any, name, alias string) (string, error) {
+	if err := blankArgs(args, name, alias); err != nil {
+		return "", err
+	}
+	rv, ra := stringArg(args, name), stringArg(args, alias)
+	v, a := strings.TrimSpace(rv), strings.TrimSpace(ra)
+	if rv != "" && ra != "" && v != a {
+		return "", clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("%s and %s disagree (%q, %q)", "%s и %s расходятся (%q, %q)", name, alias, rv, ra),
+			i18n.Tf("Pass one of them: %s is an alias of %s.", "Укажите один из них: %s — другое имя %s.", alias, name))
+	}
+	return firstNonEmptyStr(v, a), nil
+}
+
+// oneOfArgs reads the arguments of which a call passes one (vm_get vm_id
+// or name, image_get image or image_id, release_floating_ip id or
+// ip_address): the value of the one given, trimmed, and its key. An
+// argument is given when its key holds a string that is not empty; an
+// absent key, null and "" are not given. Two given is notBoth, whatever
+// they hold; a given value of only spaces is USAGE "empty value <arg>".
+// " " was trimmed away and the other argument taken without a word
+// (break r4, R4-11). None given is "", "", nil: the caller says what is
+// required.
+func oneOfArgs(args map[string]any, notBoth error, keys ...string) (value, key string, err error) {
+	for _, k := range keys {
+		if stringArg(args, k) == "" {
+			continue
+		}
+		if key != "" {
+			return "", "", notBoth
+		}
+		key = k
+	}
+	if err := blankArgs(args, keys...); err != nil {
+		return "", "", err
+	}
+	if key == "" {
+		return "", "", nil
+	}
+	return strings.TrimSpace(stringArg(args, key)), key, nil
+}
+
+// blankArgs refuses a given argument of only spaces: "empty value <arg>".
+func blankArgs(args map[string]any, keys ...string) error {
+	for _, k := range keys {
+		if v := stringArg(args, k); v != "" && strings.TrimSpace(v) == "" {
+			return clierrors.New(clierrors.CodeUsage,
+				i18n.Tf("empty value of %s: it is only spaces", "пустое значение %s: в нём только пробелы", k),
+				i18n.Tf("Pass a value or leave %s out.", "Передайте значение или не передавайте %s вовсе.", k))
+		}
+	}
+	return nil
+}
+
+func portsArg(arg string, v any) ([]int, error) {
+	var elems []any
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case []any:
+		elems = t
+	case []int:
+		for _, n := range t {
+			elems = append(elems, n)
+		}
+	case string:
+		for _, part := range strings.Split(t, ",") {
+			if strings.TrimSpace(part) != "" {
+				elems = append(elems, part)
+			}
+		}
+	default:
+		return nil, badPortsArg(arg, v)
+	}
+	out := make([]int, 0, len(elems))
+	seen := map[int]bool{}
+	for _, e := range elems {
+		n, ok := 0, false
+		switch x := e.(type) {
+		case float64:
+			n, ok = int(x), x == math.Trunc(x) && math.Abs(x) < 1e9
+		case int:
+			n, ok = x, true
+		case json.Number:
+			i, err := x.Int64()
+			n, ok = int(i), err == nil
+		case string:
+			i, err := strconv.Atoi(strings.TrimSpace(x))
+			n, ok = i, err == nil
+		}
+		if !ok {
+			return nil, badPortsArg(arg, e)
+		}
+		if n < 1 || n > 65535 {
+			return nil, clierrors.New(clierrors.CodeUsage,
+				i18n.Tf("%s: port %d is out of range 1-65535", "%s: порт %d вне диапазона 1–65535", arg, n),
+				i18n.T("A port is a whole number 1-65535, e.g. [80, 443].", "Порт — целое число 1–65535, например [80, 443]."))
+		}
+		// A port listed twice is one port: [22, 22] made two rules
+		// (break r4, R4-19). The order of the first mention stays.
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// badPortsArg refuses an item of a list of ports. It names the item: a port
+// is no secret, and the caller needs to see which one is wrong — unlike a
+// refusal of a type, which names the type alone (ValueKind).
+func badPortsArg(arg string, e any) error {
+	b, _ := json.Marshal(e)
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("%s: %s %s is not a port number", "%s: %s %s — не номер порта", arg, ValueKind(e), b),
+		i18n.T("A port is a whole number 1-65535, e.g. [80, 443]; ranges (8000-8010) are not taken: list the ports.",
+			"Порт — целое число 1–65535, например [80, 443]; диапазоны (8000-8010) не принимаются: перечислите порты."))
+}
+
+func dateArg(key, v string) (time.Time, error) {
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return time.Time{}, clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("%s: the value is not a date YYYY-MM-DD", "%s: значение — не дата ГГГГ-ММ-ДД", key),
+			i18n.T("Pass a calendar date, e.g. 2026-07-01.", "Передайте календарную дату, например 2026-07-01."))
+	}
+	return t, nil
+}
+
+// periodArgs checks a period: both dates YYYY-MM-DD, end not before start.
+func periodArgs(start, end string) (time.Time, time.Time, error) {
+	st, err := dateArg("start", start)
+	if err != nil {
+		return st, st, err
+	}
+	et, err := dateArg("end", end)
+	if err != nil {
+		return st, et, err
+	}
+	if et.Before(st) {
+		return st, et, clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("end %s is before start %s", "end %s раньше start %s", end, start),
+			i18n.T("Swap the dates: start is the first day of the period, end the last.",
+				"Поменяйте даты местами: start — первый день периода, end — последний."))
+	}
+	return st, et, nil
+}
+
+// maxPlainNameLen bounds a name no documented rule covers.
+const maxPlainNameLen = 255
+
+func plainName(kind, arg, name string) error {
+	why, bad := provision.NameDefect(name, maxPlainNameLen)
+	if !bad {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("%s %s: %s", "%s %s: %s", kind, arg, why),
+		i18n.T("Pass a name without leading or trailing spaces and control characters.",
+			"Передайте имя без пробелов по краям и управляющих символов."))
+}
+
+// k8sNameRe is the rule of the mk8s specification for a cluster name:
+// «Может содержать буквы, цифры, дефис, подчеркивание. Допустимое
+// количество символов от 3 до 60» (openapi-v3, CreateClusterRequest).
+var k8sNameRe = regexp.MustCompile(`^[\p{L}\p{N}_-]{3,60}$`)
+
+// k8sClusterName checks the name a new cluster gets (the argument, or the
+// default k8s-<product>).
+func k8sClusterName(name string) error {
+	if k8sNameRe.MatchString(name) {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("the cluster name is not accepted by Managed Kubernetes: %s", "имя кластера Managed Kubernetes не примет: %s", provision.NameFault(name, 60)),
+		i18n.T("3-60 characters: letters, digits, '-' and '_'.", "3–60 символов: буквы, цифры, '-' и '_'."))
+}
+
+// bucketNameRe is the rule s3_bucket_create states for a new bucket:
+// 3-63 lowercase letters, digits, dots and hyphens.
+var bucketNameRe = regexp.MustCompile(`^[a-z0-9.-]{3,63}$`)
+
+// bucketName checks the name of a new bucket: the rule the schema states,
+// and the client's own (s3.CheckBucketName), which refuses names the
+// pattern lets through — "a..b", an IP address — so that no consent is
+// asked for a create the client would refuse (Cursor review of 1.2.2,
+// CUR122-2).
+func bucketName(name string) error {
+	if bucketNameRe.MatchString(name) && s3.CheckBucketName(name) == nil {
+		return nil
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("the bucket name is not accepted: %s", "имя бакета не подходит: %s", provision.NameFault(name, 63)),
+		i18n.T("3-63 characters: lowercase Latin letters, digits, '.' and '-'; no '..', not an IP address.",
+			"3–63 символа: строчные латинские буквы, цифры, '.' и '-'; без '..', не IP-адрес."))
+}

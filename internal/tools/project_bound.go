@@ -1,0 +1,701 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/images"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+// ownerKind is a kind of resource addressed by id, and how to tell the
+// project that owns one.
+type ownerKind struct {
+	// what names the kind in messages ("PostgreSQL cluster").
+	what   string
+	byName bool
+	// listTool lists the resources of the project (the hint of a refusal).
+	listTool string
+	// check refuses id unless it names a resource of an allowed project.
+	check func(ctx context.Context, c *ownerCall, k *ownerKind, id string) error
+	// project is the project that owns id, read without a write; "" when
+	// the kind cannot tell: its answer by id names none and the call's
+	// project does not hold the resource. The preview of a change
+	// addressed by id names it (namedProject).
+	project func(ctx context.Context, c *ownerCall, id string) (string, error)
+	// card reads the resource by id, whatever its project; nil when the
+	// kind is told by a list of the call's project. doctor checks a cut
+	// delete with it (checkByID).
+	card func(ctx context.Context, c *ownerCall, id string) (map[string]any, error)
+}
+
+// idArg is an argument that names a resource by id: the kind whose owner a
+// bound registry checks, or, with no kind, why it needs no check.
+type idArg struct {
+	name string
+	kind *ownerKind
+	why  string
+	// target: the call changes this resource or creates inside it, and its
+	// request names no project of its own, so the write lands in the
+	// project of this resource (namedProject).
+	target bool
+	// ids reads the argument; nil reads it as one string.
+	ids   func(args map[string]any) []string
+	party func(ctx context.Context, r *Registry, ref string) (id string, err error)
+}
+
+// Reasons of the arguments that need no check.
+const (
+	whyProjectArg = "the project itself: the server's engine factory admits only the projects of --allow-project (checkAllowedProject); " +
+		"org_quotas and iam_service_accounts are the documented reads of other projects"
+	whyCatalogue = "an entry of a catalogue shared by every project (zone, specification, version), not a project's resource"
+	whyLocal     = "a local object of this host (plan, stack job), not a cloud resource; a stack job runs only in the server's project (checkJobProject)"
+	whyListed    = "the handler resolves it through the project's own list (vm_list, list_floating_ips, list_security_groups, " +
+		"list_subnets) and refuses one that is not there"
+	whyFilter = "a filter of a list of the call's project (listSpecs): evo resolves it through the project's own list and only compares it with " +
+		"the items that list read; it reaches no API as an id"
+	whyInProject = "the request carries the project (projectId in the query), and the API looks the resource up in that project"
+	whyInParent  = "a part of the resource the call's other id argument names (checked): the API addresses it inside that resource"
+	whyContinued = "the VM the next step of a call goes on with (continuedVM): the call only reads it by id, to refuse when it is gone; " +
+		"what the call writes lands in its own project, as without the argument"
+	whyContainerImage = "a container image reference (registry/name:tag) the app pulls, not a Cloud.ru resource id"
+	whyReference      = "a reference inside a request on a checked resource or a create in the call's project, which the service resolves within that project; " +
+		"evo has no lookup of its project"
+)
+
+// targetIDs are the VM ids of tg_create's targets ([{id, interface_id}]).
+func targetIDs(args map[string]any) []string {
+	raw, _ := args["targets"].([]any)
+	var out []string
+	for _, t := range raw {
+		if m, ok := t.(map[string]any); ok {
+			if id, _ := m["id"].(string); id != "" {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
+}
+
+// targetArgs are the arguments of the tool that name the resource its
+// write lands in (idArg.target).
+func targetArgs(tool string) []idArg {
+	var out []idArg
+	for _, a := range decls[tool].IDArgs {
+		if a.target {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// values reads the ids of the argument in args.
+func (a idArg) values(args map[string]any) []string {
+	if a.ids != nil {
+		return a.ids(args)
+	}
+	if v := stringArg(args, a.name); strings.TrimSpace(v) != "" {
+		return []string{v}
+	}
+	return nil
+}
+
+// checkedIDArgs are the arguments of the tool a bound registry checks.
+func checkedIDArgs(tool string) []idArg {
+	var out []idArg
+	for _, a := range decls[tool].IDArgs {
+		if a.kind != nil {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// boundToProjects wraps the handler of t for a registry bound to its projects
+// (SetProjectBound): before the handler, every id argument of the call
+// must name a resource of an allowed project; after a mutating call, the
+// operation it started is remembered for the group's *_operation tool. Not
+// bound, the handler runs as it is. A tool with nothing to check or
+// remember keeps its handler.
+func (r *Registry) boundToProjects(t Tool, next Handler) Handler {
+	checks := checkedIDArgs(t.Name)
+	if len(checks) == 0 && !t.Mutating {
+		return next
+	}
+	return func(ctx context.Context, args map[string]any) (string, bool) {
+		if !r.projectBound {
+			return next(ctx, args)
+		}
+		c := &ownerCall{r: r, args: args, group: t.Group}
+		for _, a := range checks {
+			for _, id := range a.values(args) {
+				if err := a.kind.check(ctx, c, a.kind, id); err != nil {
+					return errResult(err), true
+				}
+			}
+		}
+		text, isErr := next(ctx, args)
+		if t.Mutating && !isErr {
+			r.ops.remember(t.Group, answerOperationID(text))
+		}
+		return text, isErr
+	}
+}
+
+// ownerCall is one call being checked: the registry, the arguments and the
+// engine of the call's project, built once.
+type ownerCall struct {
+	r     *Registry
+	args  map[string]any
+	group string
+	eng   *engine.Engine
+}
+
+// engine is the authenticated engine of the call's project: project_id of
+// the call when it has one (deploy, provision), else the server's.
+func (c *ownerCall) engine(ctx context.Context) (*engine.Engine, error) {
+	if c.eng != nil {
+		return c.eng, nil
+	}
+	var overrides map[string]any
+	if p := stringArg(c.args, "project_id"); p != "" {
+		overrides = map[string]any{"ProjectID": p}
+	}
+	eng, err := c.r.authedEngine(ctx, overrides)
+	if err != nil {
+		return nil, err
+	}
+	c.eng = eng
+	return eng, nil
+}
+
+// project is the project of the call (engine).
+func (c *ownerCall) project(ctx context.Context) (string, error) {
+	eng, err := c.engine(ctx)
+	if err != nil {
+		return "", err
+	}
+	return eng.Config.ProjectID, nil
+}
+
+// ErrProjectNotAllowed marks the factory's refusal of a project outside
+// the server's (evo mcp --allow-project, checkAllowedProject): admit
+// answers it as notInProject, and any other error of the factory as it is.
+var ErrProjectNotAllowed = stderrors.New("project not allowed on this server")
+
+// admit refuses a resource whose project is not allowed: the factory
+// decides, as for project_id (checkAllowedProject). Its refusal is answered
+// as notInProject — NOT_FOUND, naming no project — so that a resource of
+// another project reads as one that is gone: a client probing ids learns
+// neither that it exists nor whose it is, and an agent that takes
+// NOT_FOUND for "already deleted" stays right. A resource whose answer
+// names no project is refused too, as CONFIG_INVALID: unknown is not
+// allowed, and not absent either.
+func (c *ownerCall) admit(k *ownerKind, id, project string) error {
+	if project == "" {
+		return clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.Tf("the answer for %s %s names no project, so this --allow-project server cannot tell whose it is; nothing was done",
+				"в ответе о ресурсе «%s» %s нет проекта: сервер с --allow-project не может определить, чей он; ничего не сделано", k.what, id),
+			i18n.T("Ask the server's operator to check the resource in the Cloud.ru console.",
+				"Попросите оператора сервера проверить ресурс в консоли Cloud.ru."))
+	}
+	if _, err := c.r.newEngine(map[string]any{"ProjectID": project}); err != nil {
+		if stderrors.Is(err, ErrProjectNotAllowed) {
+			return notInProject(k, id)
+		}
+		return err
+	}
+	return nil
+}
+
+// notInProject is the refusal of a resource outside the server's projects:
+// of another project, or gone — one answer for both, NOT_FOUND as the API
+// gives for one that is gone, naming no project.
+func notInProject(k *ownerKind, id string) error {
+	return clierrors.New(clierrors.CodeNotFound,
+		i18n.Tf("%s %s is deleted or not in the projects of this server (--allow-project); nothing was done",
+			"%s %s удалён или не в проектах этого сервера (--allow-project); ничего не сделано", k.what, id),
+		i18n.Tf("Take the id from %s.", "id — в выводе %s.", k.listTool))
+}
+
+// gone is the error of a read by id in a check: a resource the API does
+// not have is notInProject, the answer of one of another project, so the
+// two read alike; any other error is as it is.
+func gone(k *ownerKind, id string, err error) error {
+	if notThere(err) {
+		return notInProject(k, id)
+	}
+	return err
+}
+
+// notThere tells the error of a read by id that says the API has no such
+// resource: its code, or a 404.
+func notThere(err error) bool {
+	var ce *clierrors.CLIError
+	return stderrors.As(err, &ce) && (ce.Code == clierrors.CodeNotFound || ce.Code == clierrors.CodeVMNotFound) ||
+		apiStatus(err) == http.StatusNotFound
+}
+
+// projectField is the project of a resource as the API gives it:
+// project_id (the snake_case services) or projectId (grpc-gateway JSON).
+func projectField(m map[string]any) string {
+	for _, k := range []string{"project_id", "projectId"} {
+		if v, _ := m[k].(string); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// byProjectField is a kind whose answer by id names its project.
+func byProjectField(what, listTool string, get func(ctx context.Context, c *ownerCall, id string) (map[string]any, error)) *ownerKind {
+	project := func(ctx context.Context, c *ownerCall, id string) (string, error) {
+		m, err := get(ctx, c, id)
+		return projectField(m), err
+	}
+	return &ownerKind{what: what, listTool: listTool, project: project, card: get, check: func(ctx context.Context, c *ownerCall, k *ownerKind, id string) error {
+		p, err := project(ctx, c, id)
+		if err != nil {
+			return gone(k, id, err)
+		}
+		return c.admit(k, id, p)
+	}}
+}
+
+// inProjectList is a kind whose answer by id names no project: the list of
+// the call's project (admitted by the factory when its engine was built)
+// must hold the id.
+func inProjectList(what, listTool string, list func(ctx context.Context, c *ownerCall) ([]string, error)) *ownerKind {
+	k := &ownerKind{what: what, listTool: listTool}
+	// held: the call's project holds id (a name is the handler's to find
+	// there, byName).
+	held := func(ctx context.Context, c *ownerCall, id string) (bool, error) {
+		if k.byName && !looksUUID(id) {
+			return true, nil
+		}
+		ids, err := list(ctx, c)
+		return slices.Contains(ids, id), err
+	}
+	k.check = func(ctx context.Context, c *ownerCall, k *ownerKind, id string) error {
+		if ok, err := held(ctx, c, id); err != nil || ok {
+			return err
+		}
+		return notInProject(k, id)
+	}
+	k.project = func(ctx context.Context, c *ownerCall, id string) (string, error) {
+		if ok, err := held(ctx, c, id); err != nil || !ok {
+			return "", err
+		}
+		return c.project(ctx)
+	}
+	return k
+}
+
+// byName marks k as taking a name where a UUID is not given (byName).
+func byName(k *ownerKind) *ownerKind {
+	k.byName = true
+	return k
+}
+
+// computeList is the list of a Compute resource in the call's project:
+// the Compute API's answer by id names no project the code reads
+// (GET /vms/{id}, /floating-ips/{id}), and DELETE, PUT and POST by id take
+// no project_id (the one evo sends is not in compute/openapi-v3.yaml).
+func computeList(list func(ctx context.Context, eng *engine.Engine) ([]string, error)) func(context.Context, *ownerCall) ([]string, error) {
+	return func(ctx context.Context, c *ownerCall) ([]string, error) {
+		eng, err := c.engine(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return list(ctx, eng)
+	}
+}
+
+// mapIDs are the "id" fields of a raw list.
+func mapIDs(items []map[string]any) []string {
+	out := make([]string, 0, len(items))
+	for _, m := range items {
+		if id, _ := m["id"].(string); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+var (
+	kindVM = byName(inProjectList("VM", "vm_list", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		vms, err := eng.Cloud.ListVMsInProject(ctx, eng.Config.ProjectID)
+		ids := make([]string, 0, len(vms))
+		for _, v := range vms {
+			ids = append(ids, v.ID)
+		}
+		return ids, err
+	})))
+	kindBackup = byProjectField("backup", "backup_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		eng, err := c.engine(ctx)
+		if err != nil {
+			return nil, err
+		}
+		api, err := backupAPI(eng)
+		if err != nil {
+			return nil, err
+		}
+		return api.GetBackup(ctx, id)
+	})
+	kindDisk = inProjectList("disk", "disk_list", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		disks, err := eng.Cloud.ListDisks(ctx, eng.Config.ProjectID)
+		return mapIDs(disks), err
+	}))
+	kindFIP = inProjectList("floating IP", "list_floating_ips", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		fips, err := eng.Cloud.ListFloatingIPs(ctx, eng.Config.ProjectID)
+		ids := make([]string, 0, len(fips))
+		for _, f := range fips {
+			ids = append(ids, f.ID)
+		}
+		return ids, err
+	}))
+	kindNAT = inProjectList("SNAT gateway", "snat_list", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		gws, err := eng.Cloud.ListNATGateways(ctx, eng.Config.ProjectID)
+		return mapIDs(gws), err
+	}))
+	kindSG = inProjectList("security group", "list_security_groups", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		sgs, err := eng.Cloud.ListSecurityGroups(ctx, eng.Config.ProjectID)
+		ids := make([]string, 0, len(sgs))
+		for _, sg := range sgs {
+			ids = append(ids, sg.ID)
+		}
+		return ids, err
+	}))
+	kindSubnet = inProjectList("subnet", "list_subnets", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
+		subs, err := eng.Cloud.ListSubnets(ctx, eng.Config.ProjectID)
+		ids := make([]string, 0, len(subs))
+		for _, sn := range subs {
+			ids = append(ids, sn.ID)
+		}
+		return ids, err
+	}))
+
+	// Kafka and Redis answer a cluster without its project
+	// (openapi-kafka.yaml, openapi-redis.yaml): the list of the project.
+	kindKafka = inProjectList("Kafka cluster", "kafka_list", func(ctx context.Context, c *ownerCall) ([]string, error) {
+		cli, _, err := c.r.kafkaClientEng(ctx)
+		if err != nil {
+			return nil, err
+		}
+		items, err := cli.ListClusters(ctx, kafkaQuery())
+		return mapIDs(items), err
+	})
+	kindRedis = inProjectList("Redis cluster", "redis_list", func(ctx context.Context, c *ownerCall) ([]string, error) {
+		cli, _, err := c.r.redisClientEng(ctx)
+		if err != nil {
+			return nil, err
+		}
+		items, err := cli.ListClusters(ctx, url.Values{})
+		return mapIDs(items), err
+	})
+
+	// A DNS zone: the project's public and private zones, as
+	// dnsZoneVisibility looks a zone up.
+	kindDNSZone = inProjectList("DNS zone", "dns_zones", dnsZoneIDs)
+	// A DNS record names its zone (publicZoneId, privateZoneId in
+	// dns/openapi.yaml), not its project: the zone must be the project's.
+	// The refusal names the record, not the zone of another project.
+	kindDNSRecord = &ownerKind{what: "DNS record", listTool: "dns_records",
+		check: func(ctx context.Context, c *ownerCall, k *ownerKind, id string) error {
+			zone, setup, err := dnsRecordZone(ctx, c, id)
+			if err != nil {
+				if setup {
+					return err
+				}
+				return gone(k, id, err)
+			}
+			if zone == "" {
+				return c.admit(k, id, "")
+			}
+			zones, err := dnsZoneIDs(ctx, c)
+			if err != nil {
+				return err
+			}
+			if !slices.Contains(zones, zone) {
+				return notInProject(k, id)
+			}
+			return nil
+		},
+		project: func(ctx context.Context, c *ownerCall, id string) (string, error) {
+			zone, _, err := dnsRecordZone(ctx, c, id)
+			if err != nil || zone == "" {
+				return "", err
+			}
+			zones, err := dnsZoneIDs(ctx, c)
+			if err != nil || !slices.Contains(zones, zone) {
+				return "", err
+			}
+			return c.project(ctx)
+		}}
+
+	kindPG = byProjectField("PostgreSQL cluster", "pg_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, err := c.r.pgClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.GetCluster(ctx, id)
+	})
+	kindNLB = byProjectField("load balancer", "lb_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, err := c.r.nlbClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.GetNLB(ctx, id)
+	})
+	kindTG = byProjectField("target group", "tg_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, err := c.r.nlbClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.GetTargetGroup(ctx, id)
+	})
+	kindVPC = byProjectField("VPC", "vpc_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, err := c.r.vpcClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.GetVPC(ctx, id)
+	})
+	kindK8s = byProjectField("Kubernetes cluster", "k8s_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, _, _, err := c.r.k8sClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.GetCluster(ctx, id)
+	})
+	// A node pool names its cluster, not a project: it is of the project
+	// of the cluster. A pool that names no cluster, or whose cluster is
+	// not read, is refused — never passed unchecked.
+	kindK8sNodePool = &ownerKind{what: "node pool", listTool: "k8s_nodepools", project: nodePoolProject,
+		card: func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+			cli, _, _, err := c.r.k8sClient(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return cli.GetNodePool(ctx, id)
+		},
+		check: func(ctx context.Context, c *ownerCall, k *ownerKind, id string) error {
+			p, err := nodePoolProject(ctx, c, id)
+			if err != nil {
+				return gone(k, id, err)
+			}
+			return c.admit(k, id, p)
+		}}
+	kindCert = byProjectField("certificate", "cert_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
+		cli, err := c.r.certClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return cli.Get(ctx, id)
+	})
+
+	// An image by UUID: a public or Marketplace image is everyone's; another
+	// names its project (project_id); one that says neither must be in the
+	// catalogue as the call's project sees it. A name is resolved within
+	// that catalogue and the project's own images, where another project's
+	// image is not.
+	kindImage = &ownerKind{what: "image", listTool: "image_list", project: imageProject, check: func(ctx context.Context, c *ownerCall, k *ownerKind, ref string) error {
+		if !images.IsUUID(strings.TrimSpace(ref)) {
+			return nil
+		}
+		eng, err := c.engine(ctx)
+		if err != nil {
+			return err
+		}
+		id := strings.TrimSpace(ref)
+		d, err := eng.Cloud.GetImage(ctx, id)
+		if err != nil {
+			return gone(k, id, err)
+		}
+		switch {
+		case d.Public || d.Type == provision.ImageTypePublic || d.Type == provision.ImageTypeMarketplace:
+			return nil
+		case d.ProjectID != "":
+			return c.admit(k, id, d.ProjectID)
+		}
+		list, err := eng.Cloud.ListImagesInProject(ctx, eng.Config.ProjectID)
+		if err != nil {
+			return err
+		}
+		for _, img := range list {
+			if img.ID == id {
+				return nil
+			}
+		}
+		return notInProject(k, id)
+	}}
+
+	// An operation names no project, and once its resource is deleted
+	// nothing does: a bound registry polls only the operations it started
+	// (a mutating call in an allowed project), or a stack job of the
+	// server's project did (crankJob).
+	kindOperation = &ownerKind{what: "operation", check: func(_ context.Context, c *ownerCall, _ *ownerKind, id string) error {
+		if c.r.ops.known(c.group, id) {
+			return nil
+		}
+		return clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.Tf("operation %s was not started by this server: with --allow-project an operation is read only when this server started it",
+				"операцию %s запустил не этот сервер: с --allow-project операция читается, только если её запустил он", id),
+			i18n.T("Read the resource itself (its *_get or *_list tool), or poll the operation where it was started.",
+				"Прочитайте сам ресурс (инструмент *_get или *_list) или опрашивайте операцию там, где её запустили."))
+	}}
+)
+
+// imageProject is the project of image ref (kindImage.project): the one
+// its card names, else the call's when the call's project lists it. A
+// name is resolved within the call's project; a public or Marketplace
+// image is no project's.
+func imageProject(ctx context.Context, c *ownerCall, ref string) (string, error) {
+	id := strings.TrimSpace(ref)
+	if !images.IsUUID(id) {
+		return c.project(ctx)
+	}
+	eng, err := c.engine(ctx)
+	if err != nil {
+		return "", err
+	}
+	d, err := eng.Cloud.GetImage(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if d.ProjectID != "" {
+		return d.ProjectID, nil
+	}
+	if d.Public || d.Type == provision.ImageTypePublic || d.Type == provision.ImageTypeMarketplace {
+		return "", nil
+	}
+	list, err := eng.Cloud.ListImagesInProject(ctx, eng.Config.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	for _, img := range list {
+		if img.ID == id {
+			return eng.Config.ProjectID, nil
+		}
+	}
+	return "", nil
+}
+
+// dnsRecordZone is the zone of DNS record id. setup marks an error of the
+// client's setup, not of the read of the record.
+func dnsRecordZone(ctx context.Context, c *ownerCall, id string) (zone string, setup bool, _ error) {
+	cli, err := c.r.dnsClient(ctx)
+	if err != nil {
+		return "", true, err
+	}
+	vis, err := dnsRecordVisibility(ctx, cli, c.args, id)
+	if err != nil {
+		return "", false, err
+	}
+	m, err := dnsGetRecord(ctx, cli, vis, id)
+	if err != nil {
+		return "", false, err
+	}
+	for _, f := range []string{"publicZoneId", "public_zone_id", "privateZoneId", "private_zone_id"} {
+		if v, _ := m[f].(string); v != "" {
+			return v, false, nil
+		}
+	}
+	return "", false, nil
+}
+
+// nodePoolProject is the project of a node pool: of its cluster (the pool
+// names the cluster, the cluster the project). "" for a pool that names no
+// cluster; an error when the pool or its cluster is not read. The one read
+// the check of --allow-project and the preview's project stand on.
+func nodePoolProject(ctx context.Context, c *ownerCall, id string) (string, error) {
+	cli, _, _, err := c.r.k8sClient(ctx)
+	if err != nil {
+		return "", err
+	}
+	np, err := cli.GetNodePool(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	cluster, _ := np["clusterId"].(string)
+	if cluster == "" {
+		return "", nil
+	}
+	m, err := cli.GetCluster(ctx, cluster)
+	if err != nil {
+		return "", err
+	}
+	return projectField(m), nil
+}
+
+// dnsZoneIDs are the project's public and private DNS zones, as
+// dnsZoneVisibility looks a zone up.
+func dnsZoneIDs(ctx context.Context, c *ownerCall) ([]string, error) {
+	cli, err := c.r.dnsClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, vis := range []string{"public", "private"} {
+		zones, err := cli.ListZones(ctx, vis)
+		if err != nil {
+			return nil, err
+		}
+		for _, z := range zones {
+			ids = append(ids, fmt.Sprint(z["id"]))
+		}
+	}
+	return ids, nil
+}
+
+// operationSet is the operations a bound registry started, by group.
+type operationSet struct {
+	mu  sync.Mutex
+	ids map[string]bool
+}
+
+func (o *operationSet) remember(group, id string) {
+	if id == "" {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.ids == nil {
+		o.ids = map[string]bool{}
+	}
+	o.ids[group+"/"+id] = true
+}
+
+func (o *operationSet) known(group, id string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.ids[group+"/"+id]
+}
+
+// answerOperationID is the operation a tool's answer names: operation_id,
+// or the id of operation (cert_issue_le, cert_renew).
+func answerOperationID(text string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(text), &m) != nil {
+		return ""
+	}
+	if id, _ := m["operation_id"].(string); id != "" {
+		return id
+	}
+	op, _ := m["operation"].(map[string]any)
+	id, _ := op["id"].(string)
+	return id
+}

@@ -1,0 +1,579 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/nlb"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+// pickVMInterface returns a VM's network interface to use as an NLB
+// target — the primary one if flagged, else the first with a non-empty ID;
+// nil when there is none.
+func pickVMInterface(det *provision.VMDetail) *provision.VMInterface {
+	if det == nil {
+		return nil
+	}
+	for i, ni := range det.Interfaces {
+		if ni.Primary && ni.ID != "" {
+			return &det.Interfaces[i]
+		}
+	}
+	for i, ni := range det.Interfaces {
+		if ni.ID != "" {
+			return &det.Interfaces[i]
+		}
+	}
+	return nil
+}
+
+// tgPreview is the preview of tg_create: the targets, each VM by id and
+// name, and the types of the interfaces it resolved, by VM.
+func tgPreview(name string, targets []map[string]any, ifaceTypes map[string]any) engine.CreatePreview {
+	will := map[string]any{"targets": targets}
+	keys := []string{"targets"}
+	if len(ifaceTypes) > 0 {
+		will["interface_types"], keys = ifaceTypes, append(keys, "interface_types")
+	}
+	return willPreview(engine.ResourceTargetGroup, name, "", will, keys)
+}
+
+func (s *Registry) nlbClient(ctx context.Context) (*nlb.Client, error) {
+	cli, _, err := s.nlbClientEng(ctx)
+	return cli, err
+}
+
+// nlbClientEng also returns the engine (subnet resolution). Uses authedEngine so
+// eng.Cloud carries a bearer (newEngine would 403 "RBAC: access denied").
+func (s *Registry) nlbClientEng(ctx context.Context) (*nlb.Client, *engine.Engine, error) {
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nlb.New(tok.Value, eng.Config.ProjectID, ""), eng, nil
+}
+
+// --- Load balancers: read ---
+
+func (s *Registry) handleLbList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListNLB(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		row := map[string]any{"id": m["id"], "name": m["name"], "status": m["status"], "vpc_id": m["vpc_id"]}
+		if ext, ok := m["external_address"].(map[string]any); ok {
+			row["external_ip"] = ext["ipv4"]
+		}
+		out = append(out, row)
+	}
+	return toJSON(map[string]any{"load_balancers": out}), false
+}
+
+func (s *Registry) handleLbGet(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return usageT("'id' is required (from lb_list)", "нужен 'id' (из lb_list)"), true
+	}
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.GetNLB(ctx, id)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(m), false
+}
+
+func (s *Registry) handleLbOperation(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "operation_id")
+	if id == "" {
+		return usageT("'operation_id' is required", "нужен 'operation_id'"), true
+	}
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return s.operation(ctx, "lb_operation", args, func(ctx context.Context) (any, error) { return cli.GetOperation(ctx, id) })
+}
+
+// --- Target groups ---
+
+func (s *Registry) handleTgList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListTargetGroups(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{"id": m["id"], "name": m["name"], "status": m["status"], "vpc_id": m["vpc_id"]})
+	}
+	return toJSON(map[string]any{"target_groups": out}), false
+}
+
+func (s *Registry) handleTgGet(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return usageT("'id' is required (from tg_list)", "нужен 'id' (из tg_list)"), true
+	}
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.GetTargetGroup(ctx, id)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(m), false
+}
+
+// targetSpecs builds target_vm_specs from a `targets` array and/or vm_id+interface_id.
+func targetSpecs(args map[string]any) []map[string]any {
+	var specs []map[string]any
+	if raw, ok := args["targets"].([]any); ok {
+		for _, t := range raw {
+			if m, ok := t.(map[string]any); ok {
+				if id, _ := m["id"].(string); id != "" {
+					specs = append(specs, map[string]any{"id": id, "interface_id": m["interface_id"]})
+				}
+			}
+		}
+	}
+	if vm := stringArg(args, "vm_id"); vm != "" {
+		specs = append(specs, map[string]any{"id": vm, "interface_id": stringArg(args, "interface_id")})
+	}
+	return specs
+}
+
+func tgTargetArgs(args map[string]any) error {
+	if err := blankArgs(args, "vm_id", "interface_id"); err != nil {
+		return err
+	}
+	raw, _ := args["targets"].([]any)
+	if len(raw) > 0 && stringArg(args, "vm_id") != "" {
+		return clierrors.New(clierrors.CodeUsage,
+			i18n.T("pass vm_id or targets, not both", "укажите vm_id или targets, не оба"),
+			i18n.T("vm_id is one target; targets is an array of {id[, interface_id]} for several.",
+				"vm_id — одна цель; targets — массив {id[, interface_id]} для нескольких."))
+	}
+	for i, t := range raw {
+		m, _ := t.(map[string]any)
+		for _, k := range []string{"id", "interface_id"} {
+			if v, _ := m[k].(string); v != "" && strings.TrimSpace(v) == "" {
+				return clierrors.New(clierrors.CodeUsage,
+					i18n.Tf("empty value of targets[%d].%s: it is only spaces", "пустое значение targets[%d].%s: в нём только пробелы", i, k),
+					i18n.T("Pass the VM UUID in id (from vm_list).", "Передайте в id UUID ВМ (из vm_list)."))
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Registry) planTgCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	if name == "" {
+		return answered(usageT("'name' is required", "нужен 'name'"), true), nil
+	}
+	if err := tgTargetArgs(args); err != nil {
+		return nil, err
+	}
+	specs := targetSpecs(args)
+	if len(specs) == 0 {
+		return answered(usageT("provide targets (array of {id[, interface_id]}) or vm_id", "укажите targets (массив {id[, interface_id]}) или vm_id"), true), nil
+	}
+	cli, eng, err := s.nlbClientEng(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A group of the name: a repeat after a lost answer made a second one
+	// (fault matrix, process audit 1.2.1).
+	existing, err := cli.ListTargetGroups(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list target groups: %w", "проверка, что имя свободно: список целевых групп: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("target group", "целевая группа"), name, id, st, "tg_list")), nil
+	}
+	named := make([]map[string]any, 0, len(specs))
+	ifaceTypes := map[string]any{}
+	for i, sp := range specs {
+		vmid, _ := sp["id"].(string)
+		det, e := eng.Cloud.GetVMDetail(ctx, vmid)
+		if e != nil {
+			return nil, fmt.Errorf(i18n.T("resolve interface for vm %s: %w", "разрешение интерфейса ВМ %s: %w"), quoteCloud(vmid), e)
+		}
+		if ifid, _ := sp["interface_id"].(string); ifid == "" {
+			ni := pickVMInterface(det)
+			if ni == nil {
+				return nil, fmt.Errorf(i18n.T("vm %s has no usable network interface (NLB targets need a private VPC-subnet VM — provision with no_public_ip)", "у ВМ %s нет подходящего сетевого интерфейса (цель балансировщика — ВМ в подсети VPC без публичного IP: provision с no_public_ip)"), quoteCloud(vmid))
+			}
+			specs[i]["interface_id"] = ni.ID
+			if ni.Type != "" {
+				ifaceTypes[vmid] = ni.Type
+			}
+		}
+		target := map[string]any{"id": vmid, "name": det.Name, "interface_id": specs[i]["interface_id"]}
+		// The interface's name, read with the VM (Линия CLI); the body of
+		// the create (specs) takes none.
+		for _, itf := range det.Interfaces {
+			if itf.ID == specs[i]["interface_id"] && itf.Name != "" {
+				target["interface_name"] = itf.Name
+			}
+		}
+		named = append(named, target)
+	}
+	preview := map[string]any{
+		"message": i18n.Tf("tg_create creates target group %q with %d target(s).",
+			"tg_create создаёт группу целей %q (целей: %d).", name, len(specs)),
+		"targets": specs,
+		"preview": tgPreview(name, named, ifaceTypes),
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		body := map[string]any{"project_id": cli.ProjectID(), "name": name, "target_vm_specs": specs}
+		op, err := cli.CreateTargetGroup(ctx, body)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			return lostCreate(ctx, "tg_create", cli.ListTargetGroups, i18n.T("target group", "целевая группа"), name, nil, "tg_list", fmt.Errorf(i18n.T("create target group: %w", "создание целевой группы: %w"), err))
+		}
+		out := map[string]any{"status": "creating", "operation_id": op.ID, "note": i18n.T("Async — poll lb_operation(operation_id) until done=true; then tg_list for the id.",
+			"Асинхронно — опрашивайте evo lb operation <operation_id> до done=true; затем id покажет evo tg list.")}
+		if op.ResourceID != "" {
+			out["tg_id"] = op.ResourceID
+		}
+		s.goingOn(ctx, out, "lb_operation", op.ID, op.ResourceID, nil)
+		return toJSON(out), false
+	}}, nil
+}
+
+func (s *Registry) planTgDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return nil, usageErr("'id' is required (from tg_list)", "нужен 'id' (из tg_list)")
+	}
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deletePlan("tg_delete", "tg_delete deletes target group %s.",
+		"tg_delete удаляет группу целей %s.",
+		id, func() (map[string]any, error) { return cli.GetTargetGroup(ctx, id) },
+		func(ctx context.Context) (string, bool) {
+			op, err := cli.DeleteTargetGroup(ctx, id)
+			if err != nil {
+				return s.deleteFailed("tg_delete", id, fmt.Errorf(i18n.T("delete target group: %w", "удаление целевой группы: %w"), err))
+			}
+			return deleteOutcome(ctx, args, opWatch("tg_delete", id, map[string]any{"id": id}, op.ID, "lb_operation", cli.GetOperation))
+		}), nil
+}
+
+// --- Load balancer create/delete ---
+
+func (s *Registry) planLbCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	tgID := stringArg(args, "target_group_id")
+	port := pgInt(args, "port", 0)
+	if name == "" || tgID == "" || port == 0 {
+		return nil, usageErr("'name', 'target_group_id' and 'port' are required", "нужны 'name', 'target_group_id' и 'port'")
+	}
+	targetPort := pgInt(args, "target_port", port)
+	hcPort := pgInt(args, "hc_port", targetPort)
+	// The check evo sets on the target: the preview names it (С4), the
+	// rule sends it.
+	healthCheck := map[string]any{"interval": "10s", "timeout": "5s", "healthy_threshold": 3, "unhealthy_threshold": 3}
+	external := true
+	if v, ok := args["external"].(bool); ok {
+		external = v
+	}
+
+	cli, eng, err := s.nlbClientEng(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := cli.ListNLB(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list load balancers: %w", "проверка, что имя свободно: список балансировщиков: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("load balancer", "балансировщик"), name, id, st, "lb_list")), nil
+	}
+
+	// VPC: explicit, else inherit from the target group (LB must share its
+	// VPC). The group's VMs also name the zone the balancer serves.
+	tg, e := cli.GetTargetGroup(ctx, tgID)
+	if e != nil {
+		return nil, fmt.Errorf(i18n.T("read target group %s: %w", "чтение целевой группы %s: %w"), tgID, e)
+	}
+	tgVPC, _ := tg["vpc_id"].(string)
+	vpcID := stringArg(args, "vpc_id")
+	if vpcID != "" && tgVPC != "" && vpcID != tgVPC {
+		return nil, clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.Tf("target group %s is in VPC %s, not in vpc_id %s; nothing was created", "целевая группа %s в VPC %s, а не в vpc_id %s; ничего не создано", tgID, quoteCloud(tgVPC), vpcID),
+			i18n.T("Omit vpc_id (the balancer takes its target group's VPC) or pass a target group of that VPC.", "Не указывайте vpc_id (балансировщик возьмёт VPC целевой группы) или передайте целевую группу этой VPC."))
+	}
+	if vpcID == "" {
+		vpcID = tgVPC
+	}
+	if vpcID == "" {
+		return nil, errors.New(i18n.T("could not resolve vpc_id — pass it explicitly", "не удалось определить vpc_id — передайте его"))
+	}
+	zone, subnetID, subnetName, warnings, err := lbZoneAndSubnet(ctx, eng, args, tg, vpcID)
+	if err != nil {
+		return nil, err
+	}
+
+	// AZ spec requires exactly one of {id, name} (nlb API 400 otherwise);
+	// zone NAMES are the canonical cross-service identifier, the id when
+	// the name is unknown.
+	azSpec := map[string]any{"subnet_ids": []string{subnetID}}
+	if zone.Name != "" {
+		azSpec["name"] = zone.Name
+	} else {
+		azSpec["id"] = zone.ID
+	}
+
+	rule := map[string]any{
+		"name":            "rule-" + name,
+		"target_group_id": tgID,
+		"listeners":       []map[string]any{{"name": fmt.Sprintf("lst-%d", port), "port": port, "target_port": targetPort}},
+		"health_check": map[string]any{
+			"port": hcPort, "timeout": healthCheck["timeout"], "interval": healthCheck["interval"],
+			"unhealthy_threshold": healthCheck["unhealthy_threshold"], "healthy_threshold": healthCheck["healthy_threshold"], "tcp": map[string]any{},
+		},
+	}
+	body := map[string]any{
+		"project_id":              cli.ProjectID(),
+		"name":                    name,
+		"vpc_id":                  vpcID,
+		"rules":                   []map[string]any{rule},
+		"availability_zone_specs": []map[string]any{azSpec},
+	}
+	if external {
+		body["external_address_spec"] = map[string]any{"allocate": true}
+	} else {
+		body["internal_address_spec"] = map[string]any{"allocate": true, "subnet_id": subnetID}
+	}
+
+	willCreate := map[string]any{
+		"name": name, "vpc_id": vpcID, "target_group_id": tgID,
+		"listener": fmt.Sprintf("%d→%d", port, targetPort), "health_check_port": hcPort,
+		"subnet_id": subnetID, "zone": firstNonEmptyStr(zone.Name, zone.ID), "external": external,
+		"health_check": healthCheck,
+	}
+	if subnetName != "" {
+		willCreate["subnet_name"] = subnetName
+	}
+	tgName, _ := tg["name"].(string)
+	preview := willPreview(engine.ResourceLB, name, firstNonEmptyStr(zone.Name, zone.ID), willCreate,
+		[]string{"listener", "health_check_port", "health_check", "external", "subnet_id", "subnet_name"}, warnings...)
+	preview.Add("target_group_id", tgID)
+	preview.Add("target_group_name", tgName)
+	preview.Add("vpc_id", vpcID)
+	preview.Add("vpc_name", s.vpcName(ctx, vpcID))
+	out := map[string]any{
+		"message": i18n.T("lb_create provisions a BILLABLE L4 load balancer (async).",
+			"lb_create создаёт ПЛАТНЫЙ балансировщик L4 (асинхронно)."),
+		"will_create": willCreate,
+		"preview":     preview,
+	}
+	if len(warnings) > 0 {
+		out["warnings"] = warnings
+	}
+	return &Plan{Preview: out, Execute: func(ctx context.Context) (string, bool) {
+		op, err := cli.CreateNLB(ctx, body)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			return lostCreate(ctx, "lb_create", cli.ListNLB, i18n.T("load balancer", "балансировщик"), name, willCreate, "lb_get id", fmt.Errorf(i18n.T("create load balancer: %w", "создание балансировщика: %w"), err))
+		}
+		out := map[string]any{"status": "creating", "operation_id": op.ID, "created": willCreate, "note": i18n.T("Async — poll lb_operation(operation_id) until done=true; then lb_get for the external IP + status RUNNING.",
+			"Асинхронно — опрашивайте evo lb operation <operation_id> до done=true; затем внешний IP и статус RUNNING покажет evo lb get.")}
+		// The balancer's id is in the create's answer: named at once (fault
+		// matrix, process audit 1.2.1; as pg_create, N-07).
+		if op.ResourceID != "" {
+			out["lb_id"] = op.ResourceID
+		}
+		s.goingOn(ctx, out, "lb_operation", op.ID, op.ResourceID, nil)
+		return toJSON(out), false
+	}}, nil
+}
+
+// vpcName is the name of VPC id for a preview, "" when it cannot be read
+// within engine.PreviewLookupTimeout: the id stays named either way.
+func (s *Registry) vpcName(ctx context.Context, id string) string {
+	ctx, cancel := context.WithTimeout(ctx, engine.PreviewLookupTimeout)
+	defer cancel()
+	cli, err := s.vpcClient(ctx)
+	if err != nil {
+		return ""
+	}
+	m, err := cli.GetVPC(ctx, id)
+	if err != nil {
+		return ""
+	}
+	name, _ := m["name"].(string)
+	return name
+}
+
+func lbZoneAndSubnet(ctx context.Context, eng *engine.Engine, args, tg map[string]any, vpcID string) (provision.AvailabilityZone, string, string, []string, error) {
+	var none provision.AvailabilityZone
+	zones, err := eng.Cloud.ListAvailabilityZones(ctx)
+	if err != nil {
+		return none, "", "", nil, fmt.Errorf(i18n.T("list availability zones: %w", "список зон доступности: %w"), err)
+	}
+	subs, err := eng.Cloud.ListSubnets(ctx, eng.Config.ProjectID)
+	if err != nil {
+		return none, "", "", nil, fmt.Errorf(i18n.T("resolve subnet: %w", "выбор подсети: %w"), err)
+	}
+	find := func(ref string) *provision.AvailabilityZone {
+		for _, z := range zones {
+			if ref != "" && (z.ID == ref || strings.EqualFold(z.Name, ref)) {
+				return z
+			}
+		}
+		return nil
+	}
+	subnetID := stringArg(args, "subnet_id")
+	var subnet *provision.Subnet
+	if subnetID != "" {
+		for _, sn := range subs {
+			if sn.ID == subnetID {
+				subnet = sn
+			}
+		}
+		if subnet == nil {
+			return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid, i18n.Tf("subnet %s is not in the project", "подсети %s нет в проекте", subnetID),
+				i18n.T("Take a subnet ID from list_subnets, or omit subnet_id: the zone's main subnet of the balancer's VPC is taken.", "Возьмите ID подсети из list_subnets или не указывайте subnet_id: возьмётся основная подсеть зоны в VPC балансировщика."))
+		}
+	}
+
+	var warnings []string
+	var zone *provision.AvailabilityZone
+	from := ""
+	if ref := stringArg(args, "zone"); ref != "" {
+		if zone = find(ref); zone == nil {
+			return none, "", "", nil, clierrors.New(clierrors.CodeUsage, i18n.Tf("availability zone %q not found", "зона доступности %q не найдена", ref),
+				i18n.T("See list_zones (evo list-zones) for the zone names.", "Имена зон — в выводе list_zones (evo list-zones)."))
+		}
+		from = "zone"
+	}
+	if zone == nil && subnet != nil && subnet.AvailabilityZoneID != "" {
+		zone, from = find(subnet.AvailabilityZoneID), "subnet_id"
+		if zone == nil {
+			zone = &provision.AvailabilityZone{ID: subnet.AvailabilityZoneID}
+		}
+	}
+	if zone == nil {
+		// The zones of the group's VMs (target_vms[].zone_name/zone_id).
+		var tzones []string
+		vms, _ := tg["target_vms"].([]any)
+		for _, v := range vms {
+			m, _ := v.(map[string]any)
+			ref := firstNonEmptyStr(stringArg(m, "zone_id"), stringArg(m, "zone_name"))
+			if ref == "" {
+				continue
+			}
+			z := find(ref)
+			if z == nil {
+				z = &provision.AvailabilityZone{ID: stringArg(m, "zone_id"), Name: stringArg(m, "zone_name")}
+			}
+			if zone == nil {
+				zone, from = z, "target group"
+			}
+			if n := quoteCloud(firstNonEmptyStr(z.Name, z.ID)); !slices.Contains(tzones, n) {
+				tzones = append(tzones, n)
+			}
+		}
+		if len(tzones) > 1 {
+			warnings = append(warnings, fmt.Sprintf("the target group's VMs are in zones %s; the balancer serves %s only (pass zone for another)",
+				strings.Join(tzones, ", "), tzones[0]))
+		}
+	}
+	if zone == nil && eng.Config.Region != "" {
+		zone, from = find(eng.Config.Region), "region"
+		if zone == nil {
+			zone = &provision.AvailabilityZone{ID: eng.Config.Region}
+		}
+	}
+	if zone == nil {
+		return none, "", "", nil, clierrors.New(clierrors.CodeUsage,
+			i18n.T("cannot tell the balancer's availability zone: the target group names no zone of its VMs and no region is configured", "зона доступности балансировщика неизвестна: в целевой группе нет зоны её ВМ, и region не задан"),
+			i18n.T("Pass zone (name or UUID, see list_zones) or subnet_id.", "Передайте zone (имя или UUID, см. list_zones) или subnet_id."))
+	}
+
+	if subnet != nil {
+		if subnet.VPCID != "" && vpcID != "" && subnet.VPCID != vpcID {
+			return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid,
+				i18n.Tf("subnet %s is not in VPC %s of the balancer; nothing was created", "подсеть %s не в VPC %s балансировщика; ничего не создано", subnetID, quoteCloud(vpcID)),
+				i18n.T("Pass a subnet of that VPC (list_subnets), or omit subnet_id.", "Передайте подсеть этой VPC (list_subnets) или не указывайте subnet_id."))
+		}
+		if from != "subnet_id" && !provision.SubnetInZone(subnet, zone.ID, zone.Name) {
+			return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid,
+				i18n.Tf("subnet %s is not in zone %s; nothing was created", "подсеть %s не в зоне %s; ничего не создано", subnetID, quoteCloud(firstNonEmptyStr(zone.Name, zone.ID))),
+				i18n.T("Pass a subnet of that zone (list_subnets), or omit subnet_id.", "Передайте подсеть этой зоны (list_subnets) или не указывайте subnet_id."))
+		}
+		return *zone, subnetID, subnet.Name, warnings, nil
+	}
+	var inVPC []*provision.Subnet
+	for _, sn := range subs {
+		if sn.VPCID == "" || sn.VPCID == vpcID {
+			inVPC = append(inVPC, sn)
+		}
+	}
+	i := provision.PickSubnet(inVPC, zone.ID, zone.Name)
+	if i < 0 {
+		return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.Tf("no subnet of VPC %[1]s in zone %[2]s for the balancer; nothing was created", "в зоне %[2]s нет подсети VPC %[1]s для балансировщика; ничего не создано",
+				quoteCloud(vpcID), quoteCloud(firstNonEmptyStr(zone.Name, zone.ID))),
+			i18n.T("Pass subnet_id (list: list_subnets) of a subnet in that zone and VPC, or another zone; ",
+				"Передайте subnet_id (список: list_subnets) подсети этой зоны и VPC или другую зону; ")+engine.NoSubnetAnywhere())
+	}
+	return *zone, inVPC[i].ID, inVPC[i].Name, warnings, nil
+}
+
+func (s *Registry) planLbDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	id := stringArg(args, "id")
+	if id == "" {
+		return nil, usageErr("'id' is required (from lb_list)", "нужен 'id' (из lb_list)")
+	}
+	cli, err := s.nlbClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deletePlan("lb_delete", "lb_delete deletes load balancer %s.",
+		"lb_delete удаляет балансировщик %s.",
+		id, func() (map[string]any, error) { return cli.GetNLB(ctx, id) },
+		func(ctx context.Context) (string, bool) {
+			op, err := cli.DeleteNLB(ctx, id)
+			if err != nil {
+				return s.deleteFailed("lb_delete", id, fmt.Errorf(i18n.T("delete load balancer: %w", "удаление балансировщика: %w"), err))
+			}
+			return deleteOutcome(ctx, args, opWatch("lb_delete", id, map[string]any{"id": id}, op.ID, "lb_operation", cli.GetOperation))
+		}), nil
+}

@@ -1,0 +1,134 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+// refKind is what a reference argument names: its kind in both languages
+// and the list tool that shows the project's ones.
+type refKind struct{ en, ru, list string }
+
+var (
+	refSubnet        = refKind{"subnet", "подсеть", "list_subnets"}
+	refSecurityGroup = refKind{"security group", "группа безопасности", "list_security_groups"}
+)
+
+func refByName[T any](items []T, ref string, id, name func(T) string, kind refKind) (string, error) {
+	if ref == "" || looksUUID(ref) {
+		return ref, nil
+	}
+	var ids []string
+	for _, it := range items {
+		if id(it) == ref {
+			return ref, nil
+		}
+	}
+	for _, it := range items {
+		if strings.EqualFold(name(it), ref) {
+			ids = append(ids, id(it))
+		}
+	}
+	switch len(ids) {
+	case 0:
+		return ref, nil
+	case 1:
+		return ids[0], nil
+	}
+	return "", clierrors.New(clierrors.CodeUsage,
+		i18n.Tf("%d of %s named %s: %s; nothing was done", "%d объекта (%s) с именем %s: %s; ничего не сделано",
+			len(ids), i18n.T(kind.en, kind.ru), quoteCloud(ref), strings.Join(ids, ", ")),
+		i18n.Tf("Name it by its id (%s).", "Укажите её по id (%s).", kind.list))
+}
+
+func subnetRef(ctx context.Context, eng *engine.Engine, ref string) (string, error) {
+	if ref == "" || looksUUID(ref) {
+		return ref, nil
+	}
+	subs, err := eng.Cloud.ListSubnets(ctx, eng.Config.ProjectID)
+	if err != nil {
+		// The handler reads the list too and says why it failed.
+		return ref, nil
+	}
+	return refByName(subs, ref, func(s *provision.Subnet) string { return s.ID }, func(s *provision.Subnet) string { return s.Name }, refSubnet)
+}
+
+func securityGroupRef(ctx context.Context, eng *engine.Engine, ref string) (string, error) {
+	if ref == "" || looksUUID(ref) {
+		return ref, nil
+	}
+	sgs, err := eng.Cloud.ListSecurityGroups(ctx, eng.Config.ProjectID)
+	if err != nil {
+		return ref, nil
+	}
+	return refByName(sgs, ref, func(g *provision.SecurityGroup) string { return g.ID }, func(g *provision.SecurityGroup) string { return g.Name }, refSecurityGroup)
+}
+
+type nameRef struct {
+	arg  string
+	kind refKind
+}
+
+// takesName: the argument of the tool is in Decl.RefArgs.
+func takesName(tool, arg string) bool {
+	for _, ra := range decls[tool].RefArgs {
+		if ra.arg == arg {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveRefs is the handler with the names of refs swapped for their ids
+// (Decl.RefArgs); a call that passes ids reads nothing more, and what is not a
+// name of the list reaches the handler as it is.
+func (r *Registry) resolveRefs(refs []nameRef, next Handler) Handler {
+	return func(ctx context.Context, args map[string]any) (string, bool) {
+		var eng *engine.Engine
+		var out map[string]any
+		for _, ra := range refs {
+			v := stringArg(args, ra.arg)
+			if v == "" || looksUUID(v) {
+				continue
+			}
+			if eng == nil {
+				var overrides map[string]any
+				if p := stringArg(args, "project_id"); p != "" {
+					overrides = map[string]any{"ProjectID": p}
+				}
+				var err error
+				if eng, err = r.authedEngine(ctx, overrides); err != nil {
+					// The handler builds the engine too and refuses alike.
+					return next(ctx, args)
+				}
+			}
+			resolve := subnetRef
+			if ra.kind == refSecurityGroup {
+				resolve = securityGroupRef
+			}
+			id, err := resolve(ctx, eng, v)
+			if err != nil {
+				return errResult(err), true
+			}
+			if out == nil {
+				out = make(map[string]any, len(args))
+				for k, a := range args {
+					out[k] = a
+				}
+			}
+			out[ra.arg] = id
+		}
+		if out == nil {
+			return next(ctx, args)
+		}
+		return next(ctx, out)
+	}
+}

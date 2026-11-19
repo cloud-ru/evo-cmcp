@@ -1,0 +1,29 @@
+# evo: the `vpc` group
+
+<!-- Generated from the tool registry of evo: 'evo agent skill --group vpc' prints it. -->
+
+17 tools. Consent, exit codes and untrusted answers: the rules of the `evo` skill. The arguments of a tool: `evo tools describe <tool> --json`.
+
+| Tool | Command | Does | Ids from |
+|---|---|---|---|
+| `fip_attach` | `evo vpc fip-attach` | changes |  |
+| `list_subnets` | `evo vpc subnets` | reads |  |
+| `subnet_create` | `evo vpc subnet-create` | creates: id in `subnet_id`; found with `list_subnets`; deleted with `subnet_delete` | `vpc_id` ← `vpc_list` |
+| `subnet_delete` | `evo vpc subnet-delete` | deletes; a repeat answers `already_deleted` | `subnet_id` ← `list_subnets` |
+| `list_security_groups` | `evo vpc security-groups` | reads |  |
+| `list_floating_ips` | `evo vpc fips` | reads |  |
+| `sg_rule_create` | `evo vpc sg-rule-create` | creates: id in `rule_id`; deleted with `sg_rule_delete` |  |
+| `sg_rule_delete` | `evo vpc sg-rule-delete` | deletes; a repeat answers `already_deleted` |  |
+| `release_floating_ip` | `evo vpc fip-release` | deletes; a repeat answers `already_deleted` | `id` ← `list_floating_ips` |
+| `vpc_list` | `evo vpc list` | reads |  |
+| `vpc_get` | `evo vpc get` | reads | `id` ← `vpc_list` |
+| `vpc_create` | `evo vpc create` | creates: id in `vpc_id`; found with `vpc_list`; deleted with `vpc_delete` |  |
+| `vpc_delete` | `evo vpc delete` | deletes; a repeat answers `already_deleted` | `id` ← `vpc_list` |
+| `vpc_operation` | `evo vpc operation` | reads |  |
+| `vpc_routes` | `evo vpc routes` | reads | `vpc_id` ← `vpc_list` |
+| `vpc_route_create` | `evo vpc route-create` | creates: id in `route_id`; found with `vpc_routes`; deleted with `vpc_route_delete` | `vpc_id` ← `vpc_list`, `next_hop_vm_id` ← `vm_list` |
+| `vpc_route_delete` | `evo vpc route-delete` | deletes; a repeat answers `already_deleted` | `vpc_id` ← `vpc_list` |
+
+A change of this group that answers an `operation_id` runs on: wait for it with `vpc_operation` and its `wait_seconds`, not by polling a list.
+
+Filters of the lists (the rule of the `evo` skill): `list_subnets` — zone, state, name, vpc_id, ids, states; `list_security_groups` — zone, name, ids; `list_floating_ips` — zone, state, name, free, ids, states; `vpc_list` — name, ids; `vpc_routes` — status, ids, statuses.

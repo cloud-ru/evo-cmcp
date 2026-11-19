@@ -1,0 +1,217 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/secret"
+)
+
+// secretClient builds an authenticated Secret Management client.
+func (s *Registry) secretClient(ctx context.Context) (*secret.Client, error) {
+	eng, err := s.engineFor(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return secret.New(tok.Value, eng.Config.ProjectID, ""), nil
+}
+
+func (s *Registry) handleSecretList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, err := s.secretClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.List(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{"id": m["id"], "name": m["name"], "path": m["path"], "description": m["description"]})
+	}
+	return toJSON(map[string]any{"secrets": out}), false
+}
+
+func (s *Registry) handleSecretGet(ctx context.Context, args map[string]any) (string, bool) {
+	path := stringArg(args, "path")
+	if path == "" {
+		return usageT("'path' is required (from secret_list)", "нужен 'path' (из secret_list)"), true
+	}
+	cli, err := s.secretClient(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.Get(ctx, path)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(m), false
+}
+
+// planSecretValue plans the read of the DECRYPTED secret value. Sensitive: the value is
+// returned to the caller but must never be logged.
+func (s *Registry) planSecretValue(ctx context.Context, args map[string]any) (*Plan, error) {
+	path := stringArg(args, "path")
+	if path == "" {
+		return answered(usageT("'path' is required (from secret_list)", "нужен 'path' (из secret_list)"), true), nil
+	}
+	preview := map[string]any{
+		"message": i18n.T("secret_value returns the DECRYPTED secret in plaintext.",
+			"secret_value возвращает РАСШИФРОВАННЫЙ секрет открытым текстом."),
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		cli, err := s.secretClient(ctx)
+		if err != nil {
+			return errResult(err), true
+		}
+		payload, err := cli.AccessPayload(ctx, path, pgInt(args, "version", 0))
+		if err != nil {
+			return errResult(err), true
+		}
+		dec, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			// Not base64 — return as-is.
+			return toJSON(map[string]any{"path": path, "value": payload}), false
+		}
+		return toJSON(map[string]any{"path": path, "value": string(dec)}), false
+	}}, nil
+}
+
+func (s *Registry) planSecretCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	path := stringArg(args, "path")
+	value := stringArg(args, "value")
+	if path == "" || value == "" {
+		return answered(usageT("'path' and 'value' are required", "нужны 'path' и 'value'"), true), nil
+	}
+	if err := plainName("secret", "name", path[strings.LastIndex(path, "/")+1:]); err != nil {
+		return nil, err
+	}
+	cli, err := s.secretClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	list := func(ctx context.Context) ([]map[string]any, error) {
+		items, err := cli.List(ctx)
+		for _, it := range items {
+			it["name"] = it["path"]
+		}
+		return items, err
+	}
+	if ans, refused := nameFree(ctx, list, i18n.T("secret", "секрет"), path, "secret_get path"); refused {
+		return answered(ans, true), nil
+	}
+	will := map[string]any{"path": path}
+	if d := stringArg(args, "description"); d != "" {
+		will["description"] = d
+	}
+	if k := stringArg(args, "kms_key_id"); k != "" {
+		will["kms_key_id"] = k
+	}
+	preview := map[string]any{
+		"message": i18n.Tf("secret_create stores a new secret at %q. (The value is never echoed back.)",
+			"secret_create сохраняет новый секрет по пути %q. (Значение в ответе не возвращается.)", path),
+		"will_create": will,
+		"preview":     willPreview(engine.ResourceSecret, path, "", will, []string{"kms_key_id", "description"}),
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		body := map[string]any{
+			"projectId": cli.ProjectID(),
+			"path":      path,
+			"payload":   base64.StdEncoding.EncodeToString([]byte(value)),
+		}
+		if d, ok := will["description"]; ok {
+			body["description"] = d
+		}
+		if k, ok := will["kms_key_id"]; ok {
+			body["kmsKeyId"] = k
+		}
+		res, err := cli.Create(ctx, body)
+		if err != nil || secretID(res) == "" {
+			if err == nil {
+				err = noID("secret")
+			}
+			return lostCreate(ctx, "secret_create", list, i18n.T("secret", "секрет"), path, nil, "secret_get path", fmt.Errorf(i18n.T("create secret: %w", "создание секрета: %w"), err))
+		}
+		// Strip any payload echoed back before returning.
+		if sec, ok := res["secret"].(map[string]any); ok {
+			delete(sec, "payload")
+		}
+		return toJSON(map[string]any{"status": "created", "secret": res["secret"]}), false
+	}}, nil
+}
+
+func (s *Registry) planSecretAddVersion(ctx context.Context, args map[string]any) (*Plan, error) {
+	path := stringArg(args, "path")
+	value := stringArg(args, "value")
+	if path == "" || value == "" {
+		return answered(usageT("'path' and 'value' are required", "нужны 'path' и 'value'"), true), nil
+	}
+	preview := map[string]any{"message": i18n.Tf("secret_add_version adds a new value version to secret %q (the previous version stays until disabled).",
+		"secret_add_version добавляет новую версию значения секрета %q (предыдущая действует, пока её не отключат).", path)}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		cli, err := s.secretClient(ctx)
+		if err != nil {
+			return errResult(err), true
+		}
+		body := map[string]any{
+			"projectId": cli.ProjectID(),
+			"path":      path,
+			"payload":   base64.StdEncoding.EncodeToString([]byte(value)),
+		}
+		res, err := cli.AddVersion(ctx, body)
+		if err != nil {
+			err = noReceipt(err, i18n.Tf("A version may have been added: secret_get path=%s shows the versions — read it before any repeat, which adds one more.",
+				"Версия могла быть добавлена: версии покажет evo secret get %s — прочитайте до любого повтора, повтор добавит ещё одну.", path))
+			return errResult(fmt.Errorf(i18n.T("add version: %w", "добавление версии: %w"), err)), true
+		}
+		return toJSON(map[string]any{"status": "version_added", "version": res["version"]}), false
+	}}, nil
+}
+
+func (s *Registry) planSecretDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	path := stringArg(args, "path")
+	if path == "" {
+		return nil, usageErr("'path' is required (from secret_list)", "нужен 'path' (из secret_list)")
+	}
+	cli, err := s.secretClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := cli.Get(ctx, path); err != nil {
+		return answered(s.deleteFailed("secret_delete", path, err)), nil
+	}
+	force := true
+	if v, ok := args["force"].(bool); ok {
+		force = v
+	}
+	preview := map[string]any{"force": force, "message": i18n.Tf("secret_delete PERMANENTLY deletes secret %q and all its versions (force=true: even active ones, and even if other resources use the secret).",
+		"secret_delete БЕЗВОЗВРАТНО удаляет секрет %q и все его версии (force=true: даже активные и даже если секрет используют другие ресурсы).", path)}
+	if !force {
+		preview["message"] = i18n.Tf("secret_delete PERMANENTLY deletes secret %q if it has no active versions and no resource uses it (force=false: otherwise the service refuses the delete, by its specification).",
+			"secret_delete БЕЗВОЗВРАТНО удаляет секрет %q, если у него нет активных версий и его не использует ни один ресурс (force=false: иначе сервис откажет в удалении — по его спецификации).", path)
+	}
+	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
+		if err := cli.Delete(ctx, path, force); err != nil {
+			return s.deleteFailed("secret_delete", path, fmt.Errorf(i18n.T("delete secret: %w", "удаление секрета: %w"), err))
+		}
+		return toJSON(map[string]any{"status": "deleted", "path": path}), false
+	}}, nil
+}
+
+// secretID is the id of the secret a create answered ({"secret": {...}}).
+func secretID(res map[string]any) string {
+	sec, _ := res["secret"].(map[string]any)
+	id, _ := sec["id"].(string)
+	return id
+}

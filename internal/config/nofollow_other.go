@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build !unix
+
+package config
+
+// oNoFollow: there is no such flag here; OpenNoFollow checks the file it
+// opened against Lstat of the path instead.
+const oNoFollow = 0

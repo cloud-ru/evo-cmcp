@@ -1,0 +1,1135 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/cloud-ru/evo-cmcp/internal/clock"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/history"
+	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/intent"
+	"github.com/cloud-ru/evo-cmcp/internal/state"
+)
+
+func (r *Registry) beginIntent(ctx context.Context, name string, args map[string]any) (end func(answer string), err error) {
+	if r.newEngine == nil {
+		return func(string) {}, nil
+	}
+	// The directory is the registry's, declared at its build: a record
+	// that cannot be placed refuses the call before it goes out.
+	root, ok := r.stateDir()
+	if !ok {
+		return nil, errNoStateDir()
+	}
+	in := intent.Intent{Tool: name, Surface: "mcp", PID: os.Getpid(), StartedAt: clock.Now(), Canon: r.canonArgs(name, args)}
+	// Its writes are counted (intended): the first marks the record
+	// before it goes out, and a record of a killed call without the mark
+	// sent nothing (intent.Intent.Counts).
+	_, in.Counts = httpretry.Writes(ctx)
+	eng, noEngine := r.engineOfCall(args)
+	if eng != nil {
+		in.Zone, in.Key = eng.Config.Region, eng.Maker()
+	}
+	if callerOf(ctx) != nil {
+		in.Surface = "cli"
+	}
+	for k := range args {
+		if k != "confirmed" {
+			in.Args = append(in.Args, k)
+		}
+	}
+	// Named as the tool resolves the resource; the read that failed
+	// refuses the call before it goes out (intended), so here it has not.
+	if in.Name, in.Target, err = r.resourceOf(ctx, name, args); err != nil {
+		return nil, err
+	}
+	in.ProjectID = projectOfCall(eng, in, args)
+	if z, _ := args["zone"].(string); z != "" {
+		in.Zone = z
+	}
+	dir := intent.Dir(root)
+	rec, err := intent.Open(dir, in)
+	if err != nil {
+		// The call would be refused for its own reason — no key, a
+		// project the server does not allow: that is what the caller
+		// is told, not the directory of a record it would not need.
+		if noEngine != nil {
+			return nil, noEngine
+		}
+		return nil, err
+	}
+	if own, ok := ctx.Value(callRecordsKey{}).(*callRecords); ok {
+		own.ids = append(own.ids, rec.ID)
+		own.open, own.hasOpen = rec, true
+	}
+	forgetPending(ctx)
+	return func(answer string) {
+		// Whatever the end does to the record, the call reads the
+		// directory anew after it.
+		defer forgetPending(ctx)
+		// The journal of changes is kept in its bounds after the line is
+		// written and the record ended: not on the way of the change, once
+		// a day, with a limit of time (history.Prune).
+		defer r.pruneJournal(dir)
+		if own, ok := ctx.Value(callRecordsKey{}).(*callRecords); ok && own.hasOpen && own.open.ID == rec.ID {
+			rec.Parties = own.open.Parties
+		}
+		if rec.Parties == nil {
+			rec.Parties = r.partiesOf(ctx, name, args)
+		}
+		out := historyOutcome(name, args, answer)
+		if ctx.Err() != nil || intent.OutcomeUnknown(answerReason(answer), answerHTTPStatus(answer)) {
+			if n, counted := httpretry.Writes(ctx); counted && n == 0 {
+				out.Result = history.Error
+				if out.Reason == "" {
+					out.Reason = clierrors.ReasonInterrupted
+				}
+				intent.Close(rec, out)
+				return
+			}
+			// The call returned, the record stays: a later call of the
+			// same may settle it (intent.Settle).
+			rec.Sent = rec.Sent || callSent(ctx)
+			intent.End(rec, out)
+			return
+		}
+		if next, goesOn := sameToolNext(name, answer); goesOn && answerReason(answer) == "" {
+			// Named as a call of the step would be (the same rule of the
+			// project of a call addressed by id).
+			rec.Name, rec.Target = intentResource(name, next)
+			if _, _, byID := intentTarget(rec); byID && stringArg(next, "project_id") == "" {
+				rec.ProjectID = ""
+			}
+			intent.Hold(rec, out)
+			rec.Held = true
+			intent.Settle(dir, rec, settledOf(out))
+			return
+		}
+		// A create the platform took whose operation goes on: the same
+		// call again reads it (rememberMade, repeatOfMade); a delete that
+		// answers its resource gone ends it (forgetMadeOf).
+		r.rememberMade(rec, answer)
+		forgetMadeOf(root, name, args, answer)
+		intent.Close(rec, out)
+		intent.Settle(dir, rec, settledOf(out))
+	}, nil
+}
+
+// engineOfCall is the engine a call with args goes with: that of its own
+// project_id, when it names one. nil with the error when none is built.
+func (r *Registry) engineOfCall(args map[string]any) (*engine.Engine, error) {
+	var over map[string]any
+	if p := stringArg(args, "project_id"); p != "" {
+		over = map[string]any{"ProjectID": p}
+	}
+	eng, err := r.newEngine(over)
+	if err != nil {
+		return nil, err
+	}
+	return eng, nil
+}
+
+func projectOfCall(eng *engine.Engine, in intent.Intent, args map[string]any) string {
+	project := ""
+	if eng != nil {
+		project = eng.Config.ProjectID
+	}
+	if _, _, byID := intentTarget(in); byID {
+		project = ""
+	}
+	if p := stringArg(args, "project_id"); p != "" {
+		project = p
+	}
+	return project
+}
+
+// waitArgs are the arguments that say how long the call waits, not what
+// it does: two calls that differ in them are the same call.
+var waitArgs = map[string]bool{"wait": true, "wait_seconds": true}
+
+func (r *Registry) canonArgs(name string, args map[string]any) []byte {
+	t, _ := r.Lookup(name)
+	sig := make(map[string]any, len(args))
+	for k, v := range args {
+		if k != "confirmed" && !waitArgs[k] && !t.CLI.SecretFiles[k] {
+			sig[k] = v
+		}
+	}
+	canon, err := json.Marshal(sig)
+	if err != nil {
+		return []byte{}
+	}
+	return canon
+}
+
+// changeRule is what a tool every send of which is a change declares to
+// the layer of intents.
+type changeRule struct {
+	// read is the tool that shows the resource after a call whose outcome
+	// is not known.
+	read      string
+	target    func(ctx context.Context, r *Registry, args map[string]any) (name, target string, err error)
+	made      bool
+	notBilled bool
+	// settledBy reads the resource and says what the record of a cut call
+	// of the tool means now: the change is made (the record closes, no
+	// question), it goes on (no question, the plan waits for it), or the
+	// resource is where the change started or elsewhere (the question). nil:
+	// the question, always. An error is a question too.
+	settledBy func(ctx context.Context, r *Registry, args map[string]any) (outcome, error)
+}
+
+// outcome is what the resource of a cut call says of it (settledBy).
+type outcome int
+
+const (
+	// outcomeAsk: the resource is where the change started, or anywhere
+	// but where it leads: a person decides whether to send one more.
+	outcomeAsk outcome = iota
+	// outcomeMade: the change is made; the record closes.
+	outcomeMade
+	// outcomeGoesOn: the change goes on; the record stays, nobody is asked.
+	outcomeGoesOn
+)
+
+func paidCreate(tool, parent string, name func(args map[string]any) string) changeRule {
+	return changeRule{read: decls[tool].Created.list, made: true,
+		target: func(_ context.Context, _ *Registry, args map[string]any) (string, string, error) {
+			target := ""
+			if id := stringArg(args, parent); parent != "" && id != "" {
+				target = parent + "=" + id
+			}
+			return name(args), target, nil
+		}}
+}
+
+// unbilledCreate is paidCreate of a resource with no price of its own
+// (notBilled).
+func unbilledCreate(tool, parent string, name func(args map[string]any) string) changeRule {
+	rule := paidCreate(tool, parent, name)
+	rule.notBilled = true
+	return rule
+}
+
+// nameArg is the name of what a create makes when the call must give it.
+func nameArg(args map[string]any) string { return stringArg(args, "name") }
+
+var everySendIsAChange = map[string]changeRule{
+	"vm_reboot":        {read: "vm_get", target: vmTarget("vm_reboot")},
+	"vm_start":         {read: "vm_get", target: vmTarget("vm_start"), settledBy: vmSettled("vm_start")},
+	"vm_stop":          {read: "vm_get", target: vmTarget("vm_stop"), settledBy: vmSettled("vm_stop")},
+	"backup_create":    {read: "backup_list"},
+	"backup_restore":   {read: "disk_list"},
+	"sg_rule_create":   {read: "list_security_groups", target: groupTarget("security_group", sgRuleArgsValid)},
+	"pg_create":        paidCreate("pg_create", "", nameArg),
+	"kafka_create":     paidCreate("kafka_create", "", nameArg),
+	"redis_create":     paidCreate("redis_create", "", nameArg),
+	"k8s_create":       paidCreate("k8s_create", "", k8sClusterNameArg),
+	"k8s_add_nodepool": paidCreate("k8s_add_nodepool", "cluster_id", nodePoolName),
+	"lb_create":        paidCreate("lb_create", "", nameArg),
+	"vpc_create":       paidCreate("vpc_create", "", nameArg),
+	"tg_create":        paidCreate("tg_create", "", nameArg),
+	"ar_create":        paidCreate("ar_create", "", nameArg),
+	"cert_import":      paidCreate("cert_import", "", nameArg),
+	"pg_backup_create": paidCreate("pg_backup_create", "cluster_id", nameArg),
+	"pg_db_create":     unbilledCreate("pg_db_create", "cluster_id", nameArg),
+	"pg_user_create":   unbilledCreate("pg_user_create", "cluster_id", nameArg),
+	"secret_add_version": {read: "secret_get", target: func(_ context.Context, _ *Registry, args map[string]any) (string, string, error) {
+		if path := stringArg(args, "path"); path != "" {
+			return "", "path=" + path, nil
+		}
+		return "", "", nil
+	}},
+}
+
+// spelledArgs are the arguments that name the resource of the record in
+// as its call did: its target («argument=id») and its name, by the
+// argument the tool names a resource by (intentResource).
+func spelledArgs(in intent.Intent) map[string]any {
+	args := map[string]any{}
+	if arg, id, ok := strings.Cut(in.Target, "="); ok && id != "" {
+		args[arg] = id
+	}
+	if in.Name != "" {
+		arg := "name"
+		if c, ok := createdOf(in.Tool); ok && c.arg != "" {
+			arg = c.arg
+		}
+		args[arg] = in.Name
+	}
+	return args
+}
+
+// named is resourceOf for a layer that reads the answer of a call already
+// made: a resolver that fails leaves the resource as the call spelled it.
+func (r *Registry) named(ctx context.Context, name string, args map[string]any) (resource, target string) {
+	if resource, target, err := r.resourceOf(ctx, name, args); err == nil {
+		return resource, target
+	}
+	return intentResource(name, args)
+}
+
+// resourceOf is what the layer tells the resource of a call of tool name
+// by: as the tool resolves it (changeRule.target), else as the call names
+// it (intentResource). An error is the read of the resolver that failed.
+func (r *Registry) resourceOf(ctx context.Context, name string, args map[string]any) (resource, target string, err error) {
+	if rule := everySendIsAChange[name]; rule.target != nil {
+		return rule.target(ctx, r, args)
+	}
+	resource, target = intentResource(name, args)
+	return resource, target, nil
+}
+
+// cutCalls are the records of this caller's own cut calls of the tool name
+// on the resource the call names, for a tool of everySendIsAChange: the
+// same tool, the same resource, the same key, not held, returned. A record
+// of another key is not this caller's cut call, a held one is an
+// operation going on, and one whose call has not returned is a call going
+// on (callsGoingOn).
+func (r *Registry) cutCalls(ctx context.Context, name string, args map[string]any) []intent.Intent {
+	return r.callsOn(ctx, name, args, false)
+}
+
+func (r *Registry) callsGoingOn(ctx context.Context, name string, args map[string]any) []intent.Intent {
+	return r.callsOn(ctx, name, args, true)
+}
+
+// callsOn is cutCalls, or callsGoingOn when inFlight.
+func (r *Registry) callsOn(ctx context.Context, name string, args map[string]any, inFlight bool) []intent.Intent {
+	if everySendIsAChange[name].read == "" {
+		return nil
+	}
+	// A resource that cannot be resolved names no cut call here: the call
+	// with consent was refused for that before (intended), and a call
+	// without consent gets the same refusal from the plan of the tool,
+	// which reads through the same resolver.
+	resource, target, err := r.resourceOf(ctx, name, args)
+	root, ok := r.stateDir()
+	if err != nil || !ok || (resource == "" && target == "") {
+		return nil
+	}
+	// Records of the tool first: with none, no engine is built for the
+	// key and the project of the call — a preview stays one engine.
+	var ofTool []intent.Intent
+	for _, in := range pendingIn(ctx, root) {
+		// A held record is an operation evo goes on with, not a cut call
+		// — unless a send of it was cut (CutSend: cutSendOf, or a cut
+		// call whose change was seen going on, HoldCut).
+		if (in.Held && in.CutSend.IsZero()) || in.Tool != name || in.Key == nil {
+			continue
+		}
+		if in.InFlight() != inFlight {
+			continue
+		}
+		ofTool = append(ofTool, in)
+	}
+	if len(ofTool) == 0 {
+		return nil
+	}
+	eng, _ := r.engineOfCall(args)
+	project := projectOfCall(eng, intent.Intent{Tool: name, Name: resource, Target: target}, args)
+	var cut []intent.Intent
+	for _, in := range ofTool {
+		if in.ProjectID != project {
+			continue
+		}
+		if in.Name != resource || in.Target != target {
+			// A record written before the target was resolved names the
+			// resource as its call spelled it: it is resolved the same
+			// way. One that cannot be resolved now is not this call's.
+			was, wasTarget, err := r.resourceOf(ctx, name, spelledArgs(in))
+			if err != nil || was != resource || wasTarget != target {
+				continue
+			}
+		}
+		cut = append(cut, in)
+	}
+	if len(cut) == 0 {
+		return nil
+	}
+	// The key the call goes with — that of its own project_id on a server
+	// bound to projects, which has no engine without one.
+	var cur *state.Maker
+	if eng != nil {
+		cur = eng.Maker()
+	}
+	var mine []intent.Intent
+	for _, in := range cut {
+		if cur == nil || in.Key.Other(cur) {
+			continue
+		}
+		if inFlight {
+			mine = append(mine, in)
+			continue
+		}
+		// What the cut call made is listed: its outcome is read, the
+		// record closes, and nobody is asked about it.
+		if everySendIsAChange[name].made {
+			if _, listed, id := r.checkByList(ctx, in, in.ProjectID); listed {
+				intent.Close(in, settledOutcome(in, id))
+				forgetPending(ctx)
+				continue
+			}
+		}
+		// The resource tells the outcome (settledBy): made — the record
+		// closes; going on — nobody is asked, the plan waits for it.
+		if settled := everySendIsAChange[name].settledBy; settled != nil {
+			switch o, err := settled(ctx, r, args); {
+			case err == nil && o == outcomeMade:
+				// The change is made on a resource that was there.
+				intent.Close(in, history.Outcome{Result: history.Changed})
+				forgetPending(ctx)
+				continue
+			case err == nil && o == outcomeGoesOn:
+				if in.CutSend.IsZero() {
+					intent.HoldCut(in, in.StartedAt)
+					forgetPending(ctx)
+				}
+				continue
+			}
+		}
+		mine = append(mine, in)
+	}
+	return mine
+}
+
+func cutCallWarning(name string, mine []intent.Intent) (message string, interrupted map[string]any) {
+	last := mine[len(mine)-1]
+	what := firstNonEmptyStr(last.Name, last.Target)
+	rule := everySendIsAChange[name]
+	interrupted = map[string]any{"tool": name, "read_tool": rule.read, "started_at": last.StartedAt.UTC().Format(time.RFC3339), "calls": len(mine)}
+	if rule.made {
+		// A create: what is at stake is a second resource — billed, unless
+		// the rule says it has no price of its own (notBilled) — and the
+		// list is where the first one shows — when it shows, which evo
+		// does not say of the platform (a hypothesis, no run).
+		stake := i18n.T("A yes now makes a second billed resource of the name if the first request was taken",
+			"«Да» сейчас создаст второй платный ресурс с этим именем, если первый запрос был принят")
+		if rule.notBilled {
+			stake = i18n.T("A yes now sends the create of the name a second time, though the first may have made it",
+				"«Да» сейчас отправит создание с этим именем ещё раз, хотя первое могло его сделать")
+		}
+		return i18n.Tf("An earlier %s of %s, started %s, got no answer that names what it made — it was cut, or the cloud's answer did not name it: the request may have been accepted, and what it made may not be listed yet — %s does not show it now. Nothing was sent. %s: check %s again first, ask the person whether to send one more, and with their yes call %s with confirmed=true.",
+			"Предыдущий вызов %s для %s, начатый %s, не получил ответа, который называет созданное, — он оборван или ответ облака его не назвал: запрос мог быть принят, а созданное может ещё не быть в списке — %s сейчас его не показывает. Ничего не отправлено. %s: сначала проверьте %s ещё раз, спросите человека, отправлять ли ещё один, и с его «да» вызовите %s с confirmed=true.",
+			name, quoteCloud(what), last.StartedAt.Local().Format("02.01.2006 15:04"), rule.read, stake, rule.read, name), interrupted
+	}
+	return i18n.Tf("An earlier %s of %s, started %s, was cut, or the cloud's answer did not name what was done: its outcome is unknown, and it may have taken effect. A call now is one more change, not a repeat of that one, so nothing was sent. %s shows the resource now; ask the person whether to send one more, and with their yes call %s with confirmed=true.",
+			"Предыдущий вызов %s для %s, начатый %s, оборван или ответ облака не назвал сделанное: исход неизвестен, изменение могло произойти. Вызов сейчас — ещё одно изменение, а не повтор того, поэтому ничего не отправлено. Ресурс сейчас показывает %s; спросите человека, отправлять ли ещё одно, и с его «да» вызовите %s с confirmed=true.",
+			name, quoteCloud(what), last.StartedAt.Local().Format("02.01.2006 15:04"), rule.read, name),
+		interrupted
+}
+
+func (r *Registry) askAgainAfterACut(ctx context.Context, name string, args map[string]any, plan func(context.Context) (string, bool)) (string, bool) {
+	if going := r.callsGoingOn(ctx, name, args); len(going) > 0 {
+		return goingOnAnswer(name, going), true
+	}
+	mine := r.cutCalls(ctx, name, args)
+	if len(mine) == 0 {
+		return "", false
+	}
+	message, interrupted := cutCallWarning(name, mine)
+	out := map[string]any{"status": "confirmation_required"}
+	if text, _ := plan(ctx); answerStatus(text) == "confirmation_required" {
+		var m map[string]any
+		if json.Unmarshal([]byte(text), &m) == nil {
+			out = m
+			if was, _ := m["message"].(string); was != "" {
+				message += " " + was
+			}
+		}
+	}
+	out["message"], out["interrupted"] = message, interrupted
+	r.closeAsked(ctx, mine)
+	return toJSON(out), true
+}
+
+func goingOnAnswer(name string, going []intent.Intent) string {
+	last := going[len(going)-1]
+	what := firstNonEmptyStr(last.Name, last.Target)
+	rule := everySendIsAChange[name]
+	return toJSON(map[string]any{"status": "confirmation_required", "reason": clierrors.CodeConfirmationRequired, "going_on": map[string]any{"calls": len(going), "read": rule.read},
+		"message": i18n.Tf("An earlier %s of %s, started %s, has not returned yet: it is going on. A call now would be one more change, not a repeat of that one, so nothing was sent. Once it returns, %s shows the resource; whether to send one more is the person's decision.",
+			"Предыдущий вызов %s для %s, начатый %s, ещё не вернулся: он идёт. Вызов сейчас — ещё одно изменение, а не повтор того, поэтому ничего не отправлено. Когда он вернётся, ресурс покажет %s; отправлять ли ещё одно — решение человека.",
+			name, quoteCloud(what), last.StartedAt.Local().Format("02.01.2006 15:04"), rule.read)})
+}
+
+func (r *Registry) closeAsked(ctx context.Context, mine []intent.Intent) {
+	if callerOf(ctx) != nil {
+		return
+	}
+	for _, in := range mine {
+		// The person is asked; what the cut call did is still not
+		// known: its line stays unknown — live for the journal.
+		intent.Close(in, history.Outcome{Result: history.Unknown})
+	}
+	forgetPending(ctx)
+}
+
+// CutCallAnswered closes the records of the caller's own cut calls of the
+// tool name on the resource args name: a person read the question that
+// named them (the answer's "interrupted") and answered it at the terminal,
+// yes or no. The call with consent that follows a yes is sent as any
+// other; after a no nothing is sent, and the cut call is asked about no
+// more. A question that named a floating IP whose create got no answer
+// (interrupted.floating_ip, addressQuestion) records the person's answer
+// on its mark.
+func (r *Registry) CutCallAnswered(ctx context.Context, name string, args map[string]any, interrupted any) {
+	r.addressAnswered(args, interrupted)
+	for _, in := range r.cutCalls(ctx, name, args) {
+		// Answered, not known: the line stays unknown (closeAsked).
+		intent.Close(in, history.Outcome{Result: history.Unknown})
+	}
+	forgetPending(ctx)
+}
+
+func (r *Registry) questionNamesTheCut(ctx context.Context, name string, args map[string]any, answer string) string {
+	if answerStatus(answer) != "confirmation_required" {
+		return answer
+	}
+	mine := r.cutCalls(ctx, name, args)
+	if len(mine) == 0 {
+		return answer
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(answer), &m) != nil {
+		return answer
+	}
+	message, interrupted := cutCallWarning(name, mine)
+	if was, _ := m["message"].(string); was != "" {
+		message += " " + was
+	}
+	m["message"], m["interrupted"] = message, interrupted
+	r.closeAsked(ctx, mine)
+	return toJSON(m)
+}
+
+// sameToolNext reads the next step of answer when it is a call of tool
+// itself (next_tool, next_args): the operation goes on, and that call
+// goes on with it.
+func sameToolNext(tool, answer string) (args map[string]any, ok bool) {
+	var a struct {
+		NextTool string         `json:"next_tool"`
+		NextArgs map[string]any `json:"next_args"`
+	}
+	if json.Unmarshal([]byte(answer), &a) != nil || a.NextTool != tool {
+		return nil, false
+	}
+	return a.NextArgs, true
+}
+
+func (r *Registry) settleHeld(ctx context.Context, name string, args map[string]any, answer string) {
+	resource, target := r.named(ctx, name, args)
+	root, ok := r.stateDir()
+	if !ok {
+		return
+	}
+	var held []intent.Intent
+	for _, in := range pendingIn(ctx, root) {
+		if !in.Held || in.Tool != name {
+			continue
+		}
+		if (in.Name == resource && in.Target == target && (resource != "" || target != "")) ||
+			(in.Name == "" && answerNames(answer, in.Target)) {
+			held = append(held, in)
+		}
+	}
+	if len(held) == 0 || intent.OutcomeUnknown(answerReason(answer), answerHTTPStatus(answer)) || answerStatus(answer) == "confirmation_required" ||
+		refusedTheCall[answerReason(answer)] {
+		return
+	}
+	if _, goesOn := sameToolNext(name, answer); goesOn {
+		return
+	}
+	cur := r.maker()
+	out := historyOutcome(name, args, answer)
+	for _, in := range held {
+		if !in.Key.Other(cur) {
+			intent.Close(in, out)
+			forgetPending(ctx)
+		}
+	}
+}
+
+// goesOn tells a call of tool name on the resource args name whose
+// operation this caller began and evo still goes on with: its held record,
+// named as the call names the resource.
+func (r *Registry) goesOn(ctx context.Context, name string, args map[string]any) (held intent.Intent, ok bool) {
+	resource, target, err := r.resourceOf(ctx, name, args)
+	root, rooted := r.stateDir()
+	if err != nil || !rooted || (resource == "" && target == "") {
+		return intent.Intent{}, false
+	}
+	for _, in := range pendingIn(ctx, root) {
+		if in.Held && in.Tool == name && in.Name == resource && in.Target == target && !in.Key.Other(r.maker()) {
+			return in, true
+		}
+	}
+	return intent.Intent{}, false
+}
+
+func cutSendOf(ctx context.Context, held intent.Intent, answer string) {
+	if ctx.Err() == nil && !intent.OutcomeUnknown(answerReason(answer), answerHTTPStatus(answer)) {
+		return
+	}
+	if !callSent(ctx) {
+		return
+	}
+	intent.MarkCutSend(held, clock.Now())
+	forgetPending(ctx)
+}
+
+// heldSince is the start of the operation of tool on target («argument=id»)
+// that a call with this key began and evo still goes on with — its held
+// record; ok false when there is none: the operation is somebody else's, or
+// another key's, or evo stopped waiting for it. The limit of the repeats
+// of the operation counts from there, not from each repeat.
+func (r *Registry) heldSince(eng *engine.Engine, tool, target string) (since time.Time, ok bool) {
+	root, ok := r.stateDir()
+	if eng == nil || !ok {
+		return time.Time{}, false
+	}
+	cur := eng.Maker()
+	for _, in := range intent.Pending(intent.Dir(root)) {
+		if in.Held && in.Tool == tool && in.Target == target && !in.Key.Other(cur) {
+			return in.StartedAt, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// refusedTheCall are the reasons of a refusal that speaks of the call, not
+// of the operation it asked about: the request was throttled, or the key
+// or the setup did not let it through. The operation may go on all the
+// same, so a held record stays. (For the call that sends the write they
+// are an outcome — nothing was sent: intent.OutcomeUnknown.)
+var refusedTheCall = map[string]bool{
+	clierrors.CodeAPIRateLimited: true, clierrors.CodeAuthRequired: true, clierrors.CodeAuthExpired: true,
+	clierrors.CodeAuthFailed: true, clierrors.CodeConfigInvalid: true,
+}
+
+// answerNames tells an answer that names the resource of target
+// («argument=id») in the field of that argument: vm_id of a VM's answer.
+func answerNames(answer, target string) bool {
+	arg, id, ok := strings.Cut(target, "=")
+	if !ok || id == "" {
+		return false
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(answer), &m) != nil {
+		return false
+	}
+	got, _ := m[arg].(string)
+	return got == id
+}
+
+// answerStatus is the status of a tool's answer, "" when it has none.
+func answerStatus(answer string) string {
+	var a struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal([]byte(answer), &a)
+	return a.Status
+}
+
+func (r *Registry) namedKept(ctx context.Context, name string, args map[string]any, answer string) string {
+	resource, target := r.named(ctx, name, args)
+	root, ok := r.stateDir()
+	if !ok || (resource == "" && target == "") {
+		return answer
+	}
+	// The records of this directory, as withPending reads them; the key
+	// of the call is asked for only when one of them is of this call — a
+	// call with nothing left builds no engine.
+	var same []intent.Intent
+	for _, in := range pendingIn(ctx, root) {
+		if in.Tool == name && in.Name == resource && in.Target == target && in.Key != nil {
+			same = append(same, in)
+		}
+	}
+	if len(same) == 0 {
+		return answer
+	}
+	cur := r.maker()
+	var notes []string
+	for _, in := range same {
+		if in.Key.Other(cur) {
+			notes = append(notes, r.pendingNote(in, cur))
+		}
+	}
+	if named, ok := withNotes(answer, notes); ok {
+		return named
+	}
+	return answer
+}
+
+func intentResource(tool string, args map[string]any) (name, target string) {
+	arg := "name"
+	if c, ok := createdOf(tool); ok && c.arg != "" {
+		arg = c.arg
+	}
+	name, _ = args[arg].(string)
+	if c, ok := createNameOf(tool); ok && name == "" {
+		for _, a := range c.args {
+			if name, _ = args[a].(string); name != "" {
+				break
+			}
+		}
+	}
+	for _, a := range decls[tool].IDArgs {
+		if a.why == whyProjectArg {
+			continue
+		}
+		if v, _ := args[a.name].(string); v != "" {
+			return name, a.name + "=" + v
+		}
+	}
+	return name, ""
+}
+
+// intentTarget is the resource in addresses by id when its write lands
+// there: the declared target of its tool (idArg.target) that the record
+// names (Target, «argument=id»).
+func intentTarget(in intent.Intent) (a idArg, id string, ok bool) {
+	arg, id, found := strings.Cut(in.Target, "=")
+	if !found || id == "" {
+		return idArg{}, "", false
+	}
+	for _, a := range targetArgs(in.Tool) {
+		if a.name == arg {
+			return a, id, true
+		}
+	}
+	return idArg{}, "", false
+}
+
+// apiStatusField carries the status of the API's answer from errAnswer to
+// the record of the call, inside the handler; outer takes it out of the
+// answer (withoutAPIStatus).
+const apiStatusField = "_api_status"
+
+// answerHTTPStatus is the status of the API's answer a tool's error answer
+// carries (apiStatusField), 0 when none: a refusal of the platform (4xx)
+// is an outcome known, though its reason is API_ERROR as a 5xx's is.
+func answerHTTPStatus(answer string) int {
+	var a struct {
+		Status float64 `json:"_api_status"`
+	}
+	if json.Unmarshal([]byte(answer), &a) != nil {
+		return 0
+	}
+	return int(a.Status)
+}
+
+func withoutAPIStatus(answer string) string {
+	if !strings.Contains(answer, `"`+apiStatusField+`"`) {
+		return answer
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(answer), &m) != nil {
+		return answer
+	}
+	delete(m, apiStatusField)
+	return toJSON(m)
+}
+
+// answerReason is the reason of a tool's answer, "" when it has none.
+func answerReason(answer string) string {
+	var a map[string]any
+	if json.Unmarshal([]byte(answer), &a) != nil {
+		return ""
+	}
+	if r, _ := a["reason"].(string); r != "" {
+		return r
+	}
+	if e, _ := a["error"].(map[string]any); e != nil {
+		r, _ := e["reason"].(string)
+		return r
+	}
+	return ""
+}
+
+func (r *Registry) PendingNotes(root string) []string {
+	notes, _ := r.pendingNotes(root, nil, callResource{})
+	return notes
+}
+
+// pendingNotes are PendingNotes without the records of the ids own, and
+// whether any was left out.
+func (r *Registry) pendingNotes(root string, own []string, call callResource) (notes []string, leftOut bool) {
+	var named []intent.Intent
+	for _, in := range pendingIntents(root) {
+		if slices.Contains(own, in.ID) {
+			leftOut = true
+			continue
+		}
+		named = append(named, in)
+	}
+	slices.SortStableFunc(named, func(a, b intent.Intent) int { return a.StartedAt.Compare(b.StartedAt) })
+	others := 0
+	for _, in := range named {
+		if !call.names(in) {
+			others++
+		}
+	}
+	if len(named) == 0 {
+		return nil, leftOut // nothing to name: no engine is built for the key
+	}
+	fold := max(others-foldPendingAfter, 0)
+	folded := 0
+	cur := r.maker()
+	for _, in := range named {
+		if folded < fold && !call.names(in) {
+			folded++
+			continue
+		}
+		notes = append(notes, r.pendingNote(in, cur))
+	}
+	if folded > 0 {
+		notes = append(notes, i18n.Tf("and %d more, started before these: evo doctor (over MCP on stdio — the doctor tool) shows every one",
+			"и ещё %d, начатых раньше этих: evo doctor (по MCP по stdio — инструмент doctor) показывает все", folded))
+	}
+	return notes, leftOut
+}
+
+// callResource is the resource a call names (intentResource), whose
+// records the fold of the first answer never hides.
+type callResource struct{ name, target string }
+
+// callOn is the resource of a call of tool with args.
+func callOn(tool string, args map[string]any) callResource {
+	name, target := intentResource(tool, args)
+	return callResource{name, target}
+}
+
+// names tells a record of the resource: by its name or by its target,
+// whichever tool left it — a delete after a cut create of it.
+func (c callResource) names(in intent.Intent) bool {
+	return c.name != "" && in.Name == c.name || c.target != "" && in.Target == c.target
+}
+
+// foldPendingAfter is how many records of cut calls the first answer and
+// the CLI's stderr name in full (pendingNotes).
+const foldPendingAfter = 5
+
+// pendingIntents are the intents a run in root reads: the folder's and the
+// configuration directory's (evo login's key, № 37), oldest first in each.
+func pendingIntents(root string) []intent.Intent {
+	var out []intent.Intent
+	for _, dir := range intent.Dirs(root) {
+		out = append(out, intent.Pending(dir)...)
+	}
+	return out
+}
+
+func (r *Registry) pendingNote(in intent.Intent, cur *state.Maker) string {
+	started := in.StartedAt.Local().Format("02.01.2006 15:04")
+	if in.Note != "" {
+		// Its own words; the record stays until the person removes it:
+		// no list of a tool tells its outcome.
+		return i18n.Tf("%s, started %s (%s, pid %d); once checked, delete the record %s",
+			"%s, начат %s (%s, pid %d); после проверки удалите запись %s",
+			quoteCloud(in.Note), started, quoteCloud(in.Surface), in.PID, filepath.Join(in.Dir, in.ID+".json"))
+	}
+	where := ""
+	if in.ProjectID != "" {
+		where = i18n.Tf(" in project %s", " в проекте %s", quoteCloud(in.ProjectID))
+	}
+	if in.Zone != "" {
+		where += i18n.Tf(", zone %s", ", зона %s", quoteCloud(in.Zone))
+	}
+	// A call on an existing resource is named by its id (Target).
+	name := in.Name
+	if name == "" {
+		name = in.Target
+	}
+	if name == "" {
+		name = i18n.T("(no name)", "(без имени)")
+	} else {
+		name = quoteCloud(name)
+	}
+	tool := quoteCloud(in.Tool)
+	if in.InFlight() {
+		return i18n.Tf("%s %s%s, started %s (%s, pid %d): the call has not returned yet, it is going on",
+			"%s %s%s, начат %s (%s, pid %d): вызов ещё не вернулся, он идёт",
+			tool, name, where, started, quoteCloud(in.Surface), in.PID)
+	}
+	head := i18n.Tf("%s %s%s, started %s (%s, pid %d): the cloud did not answer, the outcome is unknown",
+		"%s %s%s, начат %s (%s, pid %d): облако не ответило, исход неизвестен",
+		tool, name, where, started, quoteCloud(in.Surface), in.PID)
+	// An operation that goes on: the call that started it ended at its
+	// time limit, and the step its answer named goes on with it.
+	if in.Held && !in.Key.Other(cur) {
+		return i18n.Tf("%s %s%s, started %s (%s, pid %d): the call ended at its time limit and the operation was still going — the same %s on it goes on; the record stays while evo goes on with the operation, and closes when a call of %s ends it or stops waiting for it",
+			"%s %s%s, начат %s (%s, pid %d): вызов закончился на пределе времени, операция ещё шла — тот же %s на нём продолжит; запись остаётся, пока evo сам продолжает операцию, и закрывается, когда вызов %s её завершит или перестанет её ждать",
+			tool, name, where, started, quoteCloud(in.Surface), in.PID, tool, tool)
+	}
+	// A record another key left: a call with this key does not settle it
+	// (intent.Settle), and this key may not see what that one changed.
+	if in.Key.Other(cur) {
+		return head + i18n.Tf(" — sent with another key (%s): a call with this key does not close the record; run evo doctor with that key",
+			" — отправлено другим ключом (%s): вызов этим ключом запись не закроет; запустите evo doctor с тем ключом", quoteCloud(in.Key.KeyID))
+	}
+	// Every call of the tool is one more change: the same call again does
+	// not settle the record, it changes the resource a second time.
+	if read := everySendIsAChange[in.Tool].read; read != "" {
+		return head + i18n.Tf(" — %s shows it; the same %s again is one more change, not a repeat: whether to send it is the person's decision",
+			" — его показывает %s; тот же %s ещё раз — это ещё одно изменение, а не повтор: слать ли его — решает человек", quoteCloud(read), tool)
+	}
+	if _, k, id, byID := deleteByID(in); byID {
+		if k.card == nil {
+			// No read by id closes it: doctor says the same and no more.
+			return head + i18n.Tf(" — evo has no read by id that tells a deleted %s from one of another project: check %s where it was — the same %s with the same arguments settles the record",
+				" — у evo нет чтения по id, которое отличит удалённый ресурс «%s» от ресурса другого проекта: проверьте %s там, где он был, — тот же %s с теми же аргументами закроет запись", k.what, quoteCloud(id), tool)
+		}
+		return head + i18n.T(" — evo doctor checks it by id", " — evo doctor проверит по id")
+	}
+	// The same call is the same arguments (intent.Settle): another call
+	// of the tool on the resource leaves the record.
+	return head + i18n.Tf(" — check %s for %s; the same %s with the same arguments settles it",
+		" — проверьте %s по %s; тот же %s с теми же аргументами закроет запись", quoteCloud(r.listToolOf(in.Tool)), name, tool)
+}
+
+// maker is the key the registry now runs with; nil when there is none.
+func (r *Registry) maker() *state.Maker {
+	if r.newEngine == nil {
+		return nil
+	}
+	eng, err := r.newEngine(nil)
+	if err != nil || eng == nil {
+		return nil
+	}
+	return eng.Maker()
+}
+
+// deleteByID tells an intent of a delete of the resource it addresses by
+// id: its kind and the id. The target of a delete inside a parent is the
+// parent, and reading it tells nothing of the child: not one.
+func deleteByID(in intent.Intent) (a idArg, k *ownerKind, id string, ok bool) {
+	a, id, ok = intentTarget(in)
+	if !ok {
+		return idArg{}, nil, "", false
+	}
+	if d, isDelete := deleteOf(in.Tool); !isDelete || d.parent == a.name {
+		return idArg{}, nil, "", false
+	}
+	return a, a.kind, id, true
+}
+
+// checkPending is what doctor finds out about the intent in and whether
+// its outcome is now known (the record closes): a delete of a resource
+// addressed by id is checked by a read of that id (checkByID), any other
+// by the list of what it names (checkByList).
+func (r *Registry) checkPending(ctx context.Context, in intent.Intent, eng *engine.Engine) (found string, settled bool, listedID string) {
+	if _, k, id, ok := deleteByID(in); ok {
+		return r.checkByID(ctx, in, k, id, eng.Maker())
+	}
+	return r.checkByList(ctx, in, eng.Config.ProjectID)
+}
+
+// checkByID checks a cut delete of the resource id by reading it by id
+// (readByID). found is "" when doctor has nothing to add to the record's
+// words.
+func (r *Registry) checkByID(ctx context.Context, in intent.Intent, k *ownerKind, id string, cur *state.Maker) (found string, settled bool, gone string) {
+	what, tool := quoteCloud(id), quoteCloud(in.Tool)
+	m, isGone, skip, err := r.readByID(ctx, k, id, in.Key, cur)
+	switch {
+	case skip == readNoCard || skip == readOtherKey:
+		// Never closed here; the record's own words say why (pendingNote).
+		return "", false, ""
+	case skip == readNoKey:
+		return i18n.Tf("not checked: the record or this run names no key, and another key may not see %s — run doctor with the key that sent the delete",
+			"не проверено: запись или этот запуск не называет ключ, а другой ключ может не видеть %s — запустите doctor с ключом, который отправил удаление", what), false, ""
+	case err == nil:
+		status := firstNonEmptyStr(stringArg(m, "status"), stringArg(m, "state"))
+		return i18n.Tf("%s %s is still there (status %s): the delete did not take effect, or is still going — run doctor again, or the same %s",
+			"%s %s ещё есть (статус %s): удаление не прошло или ещё идёт — повторите doctor или тот же %s", k.what, what, quoteCloud(status), tool), false, ""
+	case isGone:
+		return i18n.Tf("the read of %s %s by id, with the key that sent the delete, answers that it is not there: the delete took effect; the record is closed",
+			"чтение ресурса «%s» %s по id ключом, который отправил удаление, отвечает, что его нет: удаление прошло; запись закрыта", k.what, what), true, ""
+	}
+	reason, _, _ := errReason(err, nil)
+	return i18n.Tf("could not read %s %s by id (%s): not checked — run doctor again",
+		"не удалось прочитать ресурс «%s» %s по id (%s): не проверено — повторите doctor", k.what, what, reason), false, ""
+}
+
+// readSkip is why a read by id was not sent.
+type readSkip int
+
+const (
+	readSent readSkip = iota
+	// readNoCard: the kind has no read by id.
+	readNoCard
+	// readOtherKey: this run's key is surely not the one that sent the
+	// call.
+	readOtherKey
+	// readNoKey: the call or this run names no key.
+	readNoKey
+)
+
+func (r *Registry) readByID(ctx context.Context, k *ownerKind, id string, key, cur *state.Maker) (m map[string]any, gone bool, skip readSkip, err error) {
+	if skip := readSkipOf(k, key, cur); skip != readSent {
+		return nil, false, skip, nil
+	}
+	m, err = k.card(ctx, &ownerCall{r: r, args: map[string]any{}}, id)
+	return m, err != nil && notThere(err), readSent, err
+}
+
+// readSkipOf is why readByID would send no read of kind k for a call sent
+// with key, in a run with the key cur; readSent when it would.
+func readSkipOf(k *ownerKind, key, cur *state.Maker) readSkip {
+	switch {
+	case k == nil || k.card == nil:
+		return readNoCard
+	case key.Other(cur):
+		return readOtherKey
+	case key == nil || cur == nil:
+		return readNoKey
+	}
+	return readSent
+}
+
+func (r *Registry) checkByList(ctx context.Context, in intent.Intent, active string) (found string, settled bool, listedID string) {
+	if in.ProjectID != "" && active != "" && in.ProjectID != active {
+		return i18n.Tf("the record is of project %s, the active one is %s: check it there", "запись из проекта %s, активный — %s: проверьте в нём", quoteCloud(in.ProjectID), active), false, ""
+	}
+	c, isCreate := createdOf(in.Tool)
+	_, targetID, isDelete := strings.Cut(in.Target, "=")
+	if !isCreate {
+		for _, cc := range allCreated() {
+			if cc.delete == in.Tool && cc.list != "" {
+				c = cc
+				break
+			}
+		}
+	}
+	t, ok := r.Lookup(c.list)
+	h := t.Handler
+	// The list of a part of a parent needs the parent (listArgs): a
+	// create inside it names the parent as its target.
+	parentArg, parentID, _ := strings.Cut(in.Target, "=")
+	inParent := isCreate && len(c.listArgs) == 1 && c.listArgs[0] == parentArg && parentID != ""
+	if c.list == "" || c.field == "" || (len(c.listArgs) > 0 && !inParent) || !ok || h == nil || (isCreate && in.Name == "") || (!isCreate && !isDelete) {
+		return "", false, ""
+	}
+	listArgs := map[string]any{}
+	if inParent {
+		listArgs[parentArg] = parentID
+	}
+	if props, _ := t.InputSchema["properties"].(map[string]any); props["project_id"] != nil && in.ProjectID != "" {
+		listArgs["project_id"] = in.ProjectID
+	}
+	text, isErr := h(ctx, listArgs)
+	var m map[string]any
+	if isErr || json.Unmarshal([]byte(text), &m) != nil {
+		return "", false, ""
+	}
+	items, _ := m[c.field].([]any)
+	matched := false
+	listed := ""
+	for _, it := range items {
+		o, _ := it.(map[string]any)
+		id, _ := o["id"].(string)
+		name, _ := o["name"].(string)
+		if (isCreate && name == in.Name) || (!isCreate && id == targetID) {
+			matched, listed = true, id
+			break
+		}
+	}
+	idPart := func(id string) string {
+		if id == "" {
+			return ""
+		}
+		return i18n.Tf(" (id %s)", " (id %s)", quoteCloud(id))
+	}
+	switch {
+	case isCreate && matched:
+		return i18n.Tf("%s lists %s%s: the create took effect; the record is closed", "%s показывает %s%s: создание прошло; запись закрыта", c.list, quoteCloud(in.Name), idPart(listed)), true, listed
+	case isCreate:
+		return i18n.Tf("%s has no %s yet: the cloud did not make it, or still makes it — run doctor again, or the same %s", "в %s пока нет %s: облако его не создало или ещё создаёт — повторите doctor или тот же %s", c.list, quoteCloud(in.Name), quoteCloud(in.Tool)), false, ""
+	case !matched:
+		return i18n.Tf("%s no longer lists %s: the delete took effect; the record is closed", "%s больше не показывает %s: удаление прошло; запись закрыта", c.list, quoteCloud(targetID)), true, ""
+	}
+	return i18n.Tf("%s still lists %s: the delete did not take effect (yet) — run doctor again, or the same %s", "%s ещё показывает %s: удаление не прошло (или идёт) — повторите doctor или тот же %s", c.list, quoteCloud(targetID), quoteCloud(in.Tool)), false, ""
+}
+
+// listToolOf is the read that names what tool may have made: <service>_list
+// of a <service>_create, vm_list of the VM tools, else the tool itself
+// (its preview names the resource).
+func (r *Registry) listToolOf(tool string) string {
+	switch tool {
+	case "provision", "deploy", "deploy_apply", "destroy":
+		return "vm_list"
+	case "stack_apply", "stack_destroy":
+		return "stack_status"
+	}
+	if c, ok := createdOf(tool); ok && c.list != "" {
+		return c.list
+	}
+	for _, suffix := range []string{"_create", "_delete"} {
+		if base, ok := strings.CutSuffix(tool, suffix); ok {
+			if _, found := r.Lookup(base + "_list"); found {
+				return base + "_list"
+			}
+		}
+	}
+	return tool
+}
+
+func (r *Registry) withPending(answer string, own []string, call callResource) (string, bool) {
+	root, ok := r.stateDir()
+	if !ok {
+		if r.stateDirUndeclared() {
+			// Not «nothing was left»: the records were not read.
+			return withNotes(answer, []string{i18n.T(
+				"the records of earlier calls were not read: evo was built without their directory (a defect of evo; report it)",
+				"записи прежних вызовов не прочитаны: evo собран без их каталога (дефект evo; сообщите о нём)")})
+		}
+		return answer, true
+	}
+	notes, leftOut := r.pendingNotes(root, own, call)
+	answer, noted := withNotes(answer, notes)
+	return answer, noted && !leftOut
+}
+
+// withNotes is answer with notes in pending_operations; false when the
+// answer is not an object.
+func withNotes(answer string, notes []string) (string, bool) {
+	if len(notes) == 0 {
+		return answer, true
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(answer), &m) != nil {
+		return answer, false // not an object: the next answer carries them
+	}
+	m["pending_operations"] = notes
+	if u, _ := m["_untrusted"].([]any); slices.Contains(u, any("pending_operations")) {
+		// Named already: the answer of a call that kept a record.
+	} else if u != nil {
+		m["_untrusted"] = append(u, "pending_operations")
+	} else {
+		m["_untrusted"] = []string{"pending_operations"}
+	}
+	return toJSON(m), true
+}
+
+// notePending is answer with the intents of earlier runs, on the first JSON
+// answer of the process; the lock is released however withPending ends.
+func (r *Registry) notePending(answer string, own []string, call callResource) string {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	if !r.pendingNoted {
+		answer, r.pendingNoted = r.withPending(answer, own, call)
+	}
+	return answer
+}

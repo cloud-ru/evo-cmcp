@@ -1,0 +1,516 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package tools
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+
+	"github.com/cloud-ru/evo-cmcp/internal/dbaas"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
+	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+)
+
+const kafkaHost = "https://kafka.api.cloud.ru"
+
+func boolArg(args map[string]any, key string, def bool) bool {
+	if v, ok := args[key].(bool); ok {
+		return v
+	}
+	return def
+}
+
+// specMinStorage is the least storage, GB, a DBaaS specification takes as
+// the service lists it: min_storage_gb (PostgreSQL, Redis) or
+// min_storage_gigs (Kafka); nil when it does not.
+func specMinStorage(spec map[string]any) any {
+	if v := spec["min_storage_gb"]; v != nil {
+		return v
+	}
+	return spec["min_storage_gigs"]
+}
+
+func specStorage(args map[string]any, arg string, spec map[string]any, def int) (int, error) {
+	least := int(toF(specMinStorage(spec)))
+	storage := pgInt(args, arg, 0)
+	switch {
+	case storage == 0 && least > 0:
+		return least, nil
+	case storage == 0:
+		return def, nil
+	case storage < least:
+		id, _ := spec["id"].(string)
+		return 0, usageErr("%s %d is below the minimum of specification %s: %d GB",
+			"%s %d меньше минимума спецификации %s: %d ГБ", arg, storage, id, least)
+	}
+	return storage, nil
+}
+
+// findDbaasSpec picks a spec by id, or by cpu+memory, else the first (cheapest
+// after the caller sorted). Works for Kafka/Redis specs (cpu/memory fields).
+func findDbaasSpec(specs []map[string]any, specID string, cpu, ram int) map[string]any {
+	if specID != "" {
+		for _, sp := range specs {
+			if id, _ := sp["id"].(string); id == specID {
+				return sp
+			}
+		}
+		return nil
+	}
+	if cpu > 0 && ram > 0 {
+		for _, sp := range specs {
+			if int(toF(sp["cpu"])) == cpu && int(toF(sp["memory"])) == ram {
+				return sp
+			}
+		}
+		return nil
+	}
+	if len(specs) > 0 {
+		// Default to the CHEAPEST (fewest cpu, then memory) — the API returns
+		// specs unsorted, so specs[0] is arbitrary.
+		sorted := make([]map[string]any, len(specs))
+		copy(sorted, specs)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			ci, cj := toF(sorted[i]["cpu"]), toF(sorted[j]["cpu"])
+			if ci != cj {
+				return ci < cj
+			}
+			return toF(sorted[i]["memory"]) < toF(sorted[j]["memory"])
+		})
+		return sorted[0]
+	}
+	return nil
+}
+
+func dbaasZone(ctx context.Context, eng *engine.Engine, ref string) (id, shown string, err error) {
+	if ref == "" && eng.Config.Region != "" {
+		ref = eng.Config.Region
+	}
+	if ref != "" && looksUUID(ref) {
+		// A UUID as given; its name, when the list has it, to show.
+		if zones, err := eng.Cloud.ListAvailabilityZones(ctx); err == nil {
+			for _, z := range zones {
+				if z.ID == ref && z.Name != "" {
+					return ref, z.Name, nil
+				}
+			}
+		}
+		return ref, ref, nil
+	}
+	zones, err := eng.Cloud.ListAvailabilityZones(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf(i18n.T("list availability zones: %w", "список зон доступности: %w"), err)
+	}
+	if ref != "" {
+		z, err := provision.ResolveZone(zones, ref)
+		if err != nil {
+			return "", "", err
+		}
+		return z.ID, firstNonEmptyStr(z.Name, z.ID), nil
+	}
+	if err := everyZoneClosed(zones); err != nil {
+		return "", "", err
+	}
+	zones = engine.DefaultZoneFirst(provision.OpenZones(zones), engine.ZoneDBaaS)
+	if len(zones) == 0 || zones[0].ID == "" {
+		return "", "", errors.New(i18n.T("no availability zones listed: pass 'zone'", "список зон доступности пуст: передайте 'zone'"))
+	}
+	return zones[0].ID, zones[0].Name, nil
+}
+
+func everyZoneClosed(zones []*provision.AvailabilityZone) error {
+	if len(zones) == 0 {
+		return nil
+	}
+	for _, z := range zones {
+		if !z.Closed() {
+			return nil
+		}
+	}
+	return clierrors.New(clierrors.CodeUsage,
+		i18n.T("every availability zone is closed for new resources (enabled=false in the zone list)", "все зоны доступности закрыты для новых ресурсов (в списке зон enabled=false)"),
+		i18n.T("Pass 'zone' once a zone takes new resources: list_zones (evo vm zones) shows them.", "Передайте 'zone', когда зона снова примет новые ресурсы: их показывает list_zones (evo vm zones)."))
+}
+
+type subnetMissingError struct{ error }
+
+func (e *subnetMissingError) Unwrap() error { return e.error }
+
+// dbaasSubnetErr is the plan answer of a failed dbaasSubnet: a missing
+// subnet names missing=subnet_id; any other error refuses the plan as is.
+func dbaasSubnetErr(err error) (*Plan, error) {
+	var sm *subnetMissingError
+	if errors.As(err, &sm) {
+		return answered(errAnswer(err, map[string]any{"missing": []string{"subnet_id"}}), true), nil
+	}
+	return nil, err
+}
+
+// dbaasSubnet picks the subnet of a new Kafka/Redis cluster first and takes
+// the zone from it: the create request carries only the subnet, so the
+// cluster lives in the subnet's zone, and its specification must be one of
+// that zone (a flavor may be missing in a zone). subnet_id as given; else
+// in the configured region the zone's main subnet (provision.PickSubnet);
+// without a region the first zone with a subnet, ru.AZ-2 first (as evo
+// init). Returns the subnet, its name as the list of the project's subnets
+// gives it ("" when not read), the zone UUID and the zone to show.
+func dbaasSubnet(ctx context.Context, eng *engine.Engine, subnetArg string) (subnetID, subnetName, zoneID, zoneShown string, err error) {
+	zones, _ := eng.Cloud.ListAvailabilityZones(ctx)
+	subnetID, subnetName, zoneID, zoneShown, err = pickDBaaSSubnet(ctx, eng, subnetArg, zones)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if cerr := provision.ClosedZoneError(zones, zoneID); cerr != nil {
+		return "", "", "", "", cerr
+	}
+	return subnetID, subnetName, zoneID, zoneShown, nil
+}
+
+func pickDBaaSSubnet(ctx context.Context, eng *engine.Engine, subnetArg string, zones []*provision.AvailabilityZone) (subnetID, subnetName, zoneID, zoneShown string, err error) {
+	subs, err := eng.Cloud.ListSubnets(ctx, eng.Config.ProjectID)
+	if err != nil || len(subs) == 0 {
+		if subnetArg == "" {
+			return "", "", "", "", errors.New(i18n.T("resolve subnet: no subnet of the project could be read; pass subnet_id explicitly", "выбор подсети: не прочитано ни одной подсети проекта; передайте subnet_id"))
+		}
+		subs = nil
+	}
+	zoneName := func(id string) string {
+		for _, z := range zones {
+			if z.ID == id && z.Name != "" {
+				return z.Name
+			}
+		}
+		return id
+	}
+	var picked *provision.Subnet
+	switch {
+	case subnetArg != "":
+		for _, s := range subs {
+			if s.ID == subnetArg {
+				picked = s
+			}
+		}
+		if picked == nil && len(subs) > 0 {
+			ids := make([]string, len(subs))
+			for i, sn := range subs {
+				ids[i] = sn.ID
+			}
+			if err := notInCatalogue(i18n.T("subnet", "подсети"), subnetArg, ids, "list_subnets"); err != nil {
+				return "", "", "", "", err
+			}
+		}
+		if picked == nil || picked.AvailabilityZoneID == "" {
+			zid, shown, zerr := dbaasZone(ctx, eng, "")
+			name := ""
+			if picked != nil {
+				name = picked.Name
+			}
+			return subnetArg, name, zid, shown, zerr
+		}
+	case eng.Config.Region != "":
+		zid, shown, zerr := dbaasZone(ctx, eng, "")
+		if zerr != nil {
+			return "", "", "", "", zerr
+		}
+		if i := provision.PickSubnet(subs, zid, shown); i >= 0 && provision.SubnetInZone(subs[i], zid, shown) {
+			return subs[i].ID, subs[i].Name, zid, shown, nil
+		}
+		return "", "", "", "", &subnetMissingError{clierrors.New(clierrors.CodeUsage,
+			i18n.Tf("no subnet of the project in zone %s", "в зоне %s нет подсети проекта", shown),
+			i18n.T("Pass subnet_id (list: list_subnets) or another zone (region); ", "Передайте subnet_id (список: list_subnets) или другую зону (region); ")+engine.NoSubnetAnywhere())}
+	default:
+		if err := everyZoneClosed(zones); err != nil {
+			return "", "", "", "", err
+		}
+		for _, z := range engine.DefaultZoneFirst(provision.OpenZones(zones), engine.ZoneDBaaS) {
+			if i := provision.PickSubnet(subs, z.ID, z.Name); i >= 0 && provision.SubnetInZone(subs[i], z.ID, z.Name) {
+				return subs[i].ID, subs[i].Name, z.ID, z.Name, nil
+			}
+		}
+		picked = subs[0]
+	}
+	if picked.AvailabilityZoneID == "" {
+		zid, shown, zerr := dbaasZone(ctx, eng, "")
+		return picked.ID, picked.Name, zid, shown, zerr
+	}
+	return picked.ID, picked.Name, picked.AvailabilityZoneID, zoneName(picked.AvailabilityZoneID), nil
+}
+
+func (s *Registry) kafkaClientEng(ctx context.Context) (*dbaas.Client, *engine.Engine, error) {
+	eng, err := s.authedEngine(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	tok, err := eng.Auth.Token(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dbaas.New(tok.Value, eng.Config.ProjectID, kafkaHost), eng, nil
+}
+
+func kafkaQuery() url.Values {
+	q := url.Values{}
+	q.Set("product_type", "kafka")
+	return q
+}
+
+func (s *Registry) handleKafkaList(ctx context.Context, args map[string]any) (string, bool) {
+	cli, _, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListClusters(ctx, kafkaQuery())
+	if err != nil {
+		return errResult(err), true
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, m := range items {
+		out = append(out, map[string]any{
+			"id": m["id"], "name": m["name"], "status": m["status"],
+			"version": m["version_id"], "brokers": m["brokers"], "health": m["health"],
+			// The spec of 10.11: the subnets (1, or 3 for several zones) and
+			// the dedicated controllers, when the cluster has them.
+			"subnet_ids": m["subnet_ids"], "controller_spec": m["controller_spec"],
+		})
+	}
+	return toJSON(map[string]any{"clusters": out}), false
+}
+
+func (s *Registry) handleKafkaGet(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "cluster_id")
+	if id == "" {
+		return usageT("'cluster_id' is required (from kafka_list)", "нужен 'cluster_id' (из kafka_list)"), true
+	}
+	cli, _, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	m, err := cli.GetCluster(ctx, id)
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(m), false
+}
+
+func (s *Registry) handleKafkaVersions(ctx context.Context, args map[string]any) (string, bool) {
+	cli, _, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListVersions(ctx, kafkaQuery())
+	if err != nil {
+		return errResult(err), true
+	}
+	return toJSON(map[string]any{"versions": items}), false
+}
+
+func (s *Registry) handleKafkaSpecs(ctx context.Context, args map[string]any) (string, bool) {
+	cli, eng, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	versionID := stringArg(args, "version_id")
+	if versionID == "" {
+		if vers, e := cli.ListVersions(ctx, kafkaQuery()); e == nil && len(vers) > 0 {
+			versionID, _ = vers[len(vers)-1]["id"].(string)
+		}
+	}
+	zoneID, zone, err := dbaasZone(ctx, eng, stringArg(args, "zone"))
+	if err != nil {
+		return errResult(err), true
+	}
+	items, err := cli.ListSpecifications(ctx, versionID, zoneID)
+	if err != nil {
+		return errResult(err), true
+	}
+	out, trunc := compactSpecs(items, specMenuCap)
+	res := map[string]any{"resolved_version_id": versionID, "availability_zone": zone, "specifications": out}
+	if trunc > 0 {
+		res["specifications_truncated"] = trunc
+	}
+	return toJSON(res), false
+}
+
+func (s *Registry) planKafkaCreate(ctx context.Context, args map[string]any) (*Plan, error) {
+	name := stringArg(args, "name")
+	if name == "" {
+		return nil, usageErr("'name' is required (2-63 chars)", "нужен 'name' (2–63 символа)")
+	}
+	if b := pgInt(args, "brokers", 0); b < 0 {
+		return nil, usageErr("brokers %d: at least 1", "brokers %d: нужен хотя бы 1", b)
+	}
+	cli, eng, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := cli.ListClusters(ctx, kafkaQuery())
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("check the name is free: list clusters: %w", "проверка, что имя свободно: список кластеров: %w"), err)
+	}
+	if id, st, ok := takenName(existing, name); ok {
+		return answered(nameTakenResult(i18n.T("Kafka cluster", "кластер Kafka"), name, id, st, "kafka_get cluster_id="+id)), nil
+	}
+
+	versionID := stringArg(args, "version_id")
+	vers, e := cli.ListVersions(ctx, kafkaQuery())
+	if versionID != "" {
+		if e == nil {
+			if err := notInCatalogue(i18n.T("Kafka version", "версии Kafka"), versionID, listed(vers, "id"), "kafka_versions"); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		if e != nil {
+			return nil, fmt.Errorf(i18n.T("list versions: %w", "список версий: %w"), e)
+		}
+		if len(vers) == 0 {
+			return nil, errors.New(i18n.T("no kafka versions available", "нет доступных версий Kafka"))
+		}
+		versionID, _ = vers[len(vers)-1]["id"].(string)
+	}
+
+	// The subnet first: its zone is the cluster's, and the specifications
+	// are listed for it.
+	subnetID, subnetName, zoneID, zone, err := dbaasSubnet(ctx, eng, stringArg(args, "subnet_id"))
+	if err != nil {
+		return dbaasSubnetErr(err)
+	}
+	specs, err := cli.ListSpecifications(ctx, versionID, zoneID)
+	if err != nil {
+		return nil, fmt.Errorf(i18n.T("list specifications: %w", "список спецификаций: %w"), err)
+	}
+	specArg, cpu, ram := stringArg(args, "specification_id"), pgInt(args, "cpu", 0), pgInt(args, "ram", 0)
+	spec := findDbaasSpec(specs, specArg, cpu, ram)
+	if spec == nil {
+		menu, trunc := compactSpecs(specs, specMenuCap)
+		out := map[string]any{"resolved_version_id": versionID, "availability_zone": zone, "available_specifications": menu}
+		if trunc > 0 {
+			out["specifications_truncated"] = trunc
+		}
+		return answered(needSpecResult("kafka_specs", specArg, cpu, ram, out)), nil
+	}
+	specID, _ := spec["id"].(string)
+
+	storage, err := specStorage(args, "storage_gib", spec, 40)
+	if err != nil {
+		return nil, err
+	}
+	brokers, brokersNote, err := kafkaBrokers(pgInt(args, "brokers", 0), spec)
+	if err != nil {
+		return answered(usageResult(err), true), nil
+	}
+
+	willCreate := map[string]any{"name": name, "version_id": versionID, "specification_id": specID,
+		"cpu": spec["cpu"], "memory_gb": spec["memory"], "storage_gib": storage, "brokers": brokers, "subnet_id": subnetID,
+		"availability_zone": zone, "ui_enabled": boolArg(args, "ui_enabled", false),
+		"cruise_control_enabled": false, "cruise_control_rebalance_auto_enabled": false,
+		"controllers": "combined"}
+	if subnetName != "" {
+		willCreate["subnet_name"] = subnetName
+	}
+	out := map[string]any{"message": i18n.T("kafka_create provisions a BILLABLE Managed Kafka cluster (async, ~minutes).",
+		"kafka_create создаёт ПЛАТНЫЙ кластер Managed Kafka (асинхронно, несколько минут)."),
+		"will_create": willCreate,
+		"preview": willPreview(engine.ResourceKafka, name, zone, willCreate,
+			[]string{"version_id", "cpu", "memory_gb", "storage_gib", "brokers", "subnet_id", "subnet_name", "ui_enabled",
+				"cruise_control_enabled", "cruise_control_rebalance_auto_enabled", "controllers"}, brokersNote)}
+	if brokersNote != "" {
+		out["warning"] = brokersNote
+	}
+	return &Plan{Preview: out, Execute: func(ctx context.Context) (string, bool) {
+		body := map[string]any{
+			"name": name, "project_id": cli.ProjectID(), "version_id": versionID,
+			"specification_id": specID, "subnet_id": subnetID, "storage_gib": storage, "brokers": brokers,
+			"ui_enabled": willCreate["ui_enabled"], "cruise_control_enabled": willCreate["cruise_control_enabled"],
+			"cruise_control_rebalance_auto_enabled": willCreate["cruise_control_rebalance_auto_enabled"],
+		}
+		if d := stringArg(args, "description"); d != "" {
+			body["description"] = d
+		}
+		op, err := cli.CreateCluster(ctx, body)
+		if err != nil || op.ID == "" {
+			if err == nil {
+				err = noID("operation")
+			}
+			list := func(ctx context.Context) ([]map[string]any, error) { return cli.ListClusters(ctx, kafkaQuery()) }
+			return lostCreate(ctx, "kafka_create", list, i18n.T("Kafka cluster", "кластер Kafka"), name, willCreate, "kafka_get cluster_id", fmt.Errorf(i18n.T("create cluster: %w", "создание кластера: %w"), err))
+		}
+		out := map[string]any{"status": "creating", "operation_id": op.ID, "cluster_id": op.ResourceID,
+			"created": willCreate, "note": i18n.T("Async (~minutes). Poll kafka_operation(operation_id); then kafka_get for status READY + kafka_hosts.",
+				fmt.Sprintf("Асинхронно (несколько минут). Ход: evo kafka operation %s; %s — до статуса READY и kafka_hosts.", quoteCloud(op.ID), clusterReadRU("kafka", op.ResourceID)))}
+		s.goingOn(ctx, out, "kafka_operation", op.ID, op.ResourceID, nil)
+		return toJSON(out), false
+	}}, nil
+}
+
+func kafkaBrokers(arg int, spec map[string]any) (brokers int, note string, err error) {
+	minB, maxB := int(toF(spec["min_brokers"])), int(toF(spec["max_brokers"]))
+	brokers = arg
+	if brokers == 0 {
+		brokers = minB
+	}
+	if brokers == 0 {
+		brokers = 1
+		note = i18n.T("brokers: 1 (the specification gives no minimum): a single broker keeps one copy of each partition and stops on any broker failure. Pass brokers=3 for a replicated cluster.",
+			"brokers: 1 (спецификация не задаёт минимума): единственный брокер хранит одну копию каждой партиции и останавливается при любом сбое брокера. Для кластера с репликацией передайте brokers=3.")
+	}
+	if minB > 0 && brokers < minB {
+		return 0, "", fmt.Errorf(i18n.T("brokers %d: this specification takes at least %d", "brokers %d: для этой конфигурации нужно не меньше %d"), brokers, minB)
+	}
+	if maxB > 0 && brokers > maxB {
+		return 0, "", fmt.Errorf(i18n.T("brokers %d: this specification takes at most %d", "brokers %d: для этой конфигурации можно не больше %d"), brokers, maxB)
+	}
+	return brokers, note, nil
+}
+
+func (s *Registry) planKafkaDelete(ctx context.Context, args map[string]any) (*Plan, error) {
+	id := stringArg(args, "cluster_id")
+	if id == "" {
+		return nil, usageErr("'cluster_id' is required (from kafka_list)", "нужен 'cluster_id' (из kafka_list)")
+	}
+	cli, _, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deletePlan("kafka_delete", "kafka_delete PERMANENTLY deletes Kafka cluster %s and its data.",
+		"kafka_delete БЕЗВОЗВРАТНО удаляет кластер Kafka %s и его данные.",
+		id, func() (map[string]any, error) { return cli.GetCluster(ctx, id) },
+		func(ctx context.Context) (string, bool) {
+			op, err := cli.DeleteCluster(ctx, id)
+			if err != nil {
+				if msg := fmt.Sprintf("delete cluster: %v", err); strings.Contains(msg, "API 500") {
+					return errResult(clierrors.New(clierrors.CodeAPIError, msg, i18n.T(
+						"Cloud.ru refuses to delete a cluster still being created or in FAILED. Still being created (DEPLOYING): wait until kafka_get shows it READY, then call kafka_delete again. In FAILED: ",
+						"Cloud.ru не удаляет кластер, который ещё создаётся или в FAILED. Ещё создаётся (DEPLOYING): дождитесь READY в kafka_get и повторите kafka_delete. В FAILED: ")+engine.FailedDeleteNote(id))), true
+				}
+				return s.deleteFailed("kafka_delete", id, fmt.Errorf(i18n.T("delete cluster: %w", "удаление кластера: %w"), err))
+			}
+			return deleteOutcome(ctx, args, opWatch("kafka_delete", id, map[string]any{"id": id}, op.ID, "kafka_operation", cli.GetOperation))
+		}), nil
+}
+
+func (s *Registry) handleKafkaOperation(ctx context.Context, args map[string]any) (string, bool) {
+	id := stringArg(args, "operation_id")
+	if id == "" {
+		return usageT("'operation_id' is required", "нужен 'operation_id'"), true
+	}
+	cli, _, err := s.kafkaClientEng(ctx)
+	if err != nil {
+		return errResult(err), true
+	}
+	return s.operation(ctx, "kafka_operation", args, func(ctx context.Context) (any, error) { return cli.GetOperation(ctx, id) })
+}
+
+func clusterReadRU(svc, id string) string {
+	if id == "" {
+		return "id кластера по имени покажет evo " + svc + " list, затем evo " + svc + " get <id>"
+	}
+	return "затем evo " + svc + " get " + quoteCloud(id)
+}

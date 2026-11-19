@@ -1,0 +1,228 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package engine
+
+import (
+	"context"
+	"errors"
+	"io"
+	"path/filepath"
+
+	"github.com/cloud-ru/evo-cmcp/internal/compose"
+	"github.com/cloud-ru/evo-cmcp/internal/deployplan"
+	clerrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/output"
+	"github.com/cloud-ru/evo-cmcp/internal/pricing"
+	"github.com/cloud-ru/evo-cmcp/internal/provision"
+	"github.com/cloud-ru/evo-cmcp/internal/state"
+)
+
+// errNoSize: the flavor is auto and the compose file cannot be read, so
+// there is nothing to size the VM by (deploy itself stops on the file).
+var errNoSize = errors.New("no compose file to size the VM by")
+
+func (e *Engine) DeployPreview(ctx context.Context, cidr string) (*CreatePreview, error) {
+	sf, err := state.Read(state.DefaultPath(e.StateDir))
+	if err != nil || sf.ActiveComposeDeployment() != nil {
+		return nil, nil
+	}
+	project, err := compose.Parse(e.Config.ComposeFile)
+	if err != nil {
+		return nil, err
+	}
+	if e.Config.KeyID != "" && e.Config.Secret != "" {
+		if e.Config.ProjectID == "" {
+			return nil, clerrors.ProjectRequired()
+		}
+		if err := e.DeployInputError(); err != nil {
+			return nil, err
+		}
+	}
+	cfg := e.Config
+	projectName := cfg.ProjectName
+	if projectName == "" {
+		projectName = filepath.Base(e.StateDir)
+	}
+	public := true
+	p := &CreatePreview{Resource: ResourceVM, Name: vmNameFor(projectName),
+		ProjectID: cfg.ProjectID, ProjectFrom: cfg.ProjectOrigin, PublicIP: &public}
+	if cfg.KeyID != "" && cfg.Secret != "" && e.Auth != nil && e.Cloud != nil {
+		lctx, cancel := context.WithTimeout(ctx, PreviewLookupTimeout)
+		tok, terr := e.Auth.Token(lctx)
+		if terr == nil {
+			e.Cloud.SetToken(tok.Value)
+			terr = e.deployNameFree(lctx, cfg.ProjectID, p.Name, sf)
+			if terr != nil && lctx.Err() == nil {
+				cancel()
+				return nil, terr
+			}
+		}
+		cancel()
+	}
+	vm := deployplan.VMSpec{Name: p.Name,
+		Zone: deployplan.RefSpec{ID: cfg.Region},
+		Disk: deployplan.DiskSpec{Type: "SSD"}}
+	// The image as BootImage takes it: image_id first, else image (a name
+	// or a UUID).
+	switch {
+	case cfg.ImageID != "":
+		vm.Image.ID = cfg.ImageID
+	case isUUID(cfg.Image):
+		vm.Image.ID = cfg.Image
+	default:
+		vm.Image.Name = cfg.Image
+	}
+	if f := cfg.Flavor; f != "" && f != "auto" {
+		if isUUID(f) {
+			vm.Flavor.ID = f
+		} else {
+			vm.Flavor.Name = f
+		}
+	}
+	vm.Disk.SizeGB, _ = provision.BootDiskGB(cfg.DiskSize, 0)
+	// A zone named by its name, as deploy takes it (resolveNetwork): an
+	// unknown name is refused on the preview, not after the consent.
+	if ref := cfg.Region; ref != "" && !isUUID(ref) && e.Auth != nil && e.Cloud != nil {
+		zone, err := e.zoneOfPreview(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		if zone != nil {
+			vm.Zone = deployplan.RefSpec{ID: zone.ID, Name: zone.Name}
+		}
+	}
+	p.VM = &vm
+	for _, m := range []struct{ name, val string }{
+		{"project_id", p.ProjectID}, {"image_id", firstNonEmpty(vm.Image.ID, vm.Image.Name)}, {"region", cfg.Region},
+	} {
+		if m.val == "" {
+			p.Missing = append(p.Missing, m.name)
+		}
+	}
+	p.AddPorts(project.Ports, project.UDPPorts, cidr)
+	p.Add("upload", SSHUpload(""))
+	// The flavor deploy takes (resolveFlavor): the one given, else the
+	// smallest that fits the compose file's services.
+	pick := func(flavors []*provision.Flavor) (string, error) {
+		if want := firstNonEmpty(vm.Flavor.ID, vm.Flavor.Name); want != "" {
+			return PickVMFlavorIn(flavors, want, &vm.Zone)
+		}
+		match := sizeFlavor(project, flavors, &vm.Zone)
+		if match == nil {
+			return "", errNoSize
+		}
+		return match.ID, FlavorOutOfZone(match, &vm.Zone)
+	}
+	if err := e.completePreview(ctx, p, pick, false); err != nil {
+		return nil, err
+	}
+	if err := e.previewNetwork(ctx, p); err != nil {
+		return nil, err
+	}
+	if p.SecurityGroup != nil {
+		p.PortsGroup(firstNonEmpty(p.SecurityGroup.Name, p.SecurityGroup.ID))
+	}
+	return p, nil
+}
+
+// zoneOfPreview is the zone ref names (ResolveZoneRef), read within the
+// time of a preview's lookups.
+func (e *Engine) zoneOfPreview(ctx context.Context, ref string) (*provision.AvailabilityZone, error) {
+	ctx, cancel := context.WithTimeout(ctx, PreviewLookupTimeout)
+	defer cancel()
+	tok, err := e.Auth.Token(ctx)
+	if err != nil {
+		return ResolveZoneRef(nil, err, ref)
+	}
+	e.Cloud.SetToken(tok.Value)
+	zones, err := e.Cloud.ListAvailabilityZones(ctx)
+	return ResolveZoneRef(zones, err, ref)
+}
+
+// PlanPreview is the preview of deploy_apply: the VM of a saved plan as
+// deploy_plan resolved and priced it — its name, the project, the zone,
+// the flavor, the image, the boot disk, the subnet, the floating IP, the
+// ports and the monthly price the plan was quoted. It is made from the plan
+// alone, with no lookup and no new quote: the user approves the plan
+// deploy_apply executes, at the price deploy_plan showed (break 1.2,
+// B12-8). The ports name their group by the name the plan kept (by its id
+// for a plan made before 1.7) and the source the plan was made with (P5).
+func PlanPreview(plan *deployplan.Plan) *CreatePreview {
+	vm := plan.VM
+	public := plan.Network.FloatingIP
+	cost := plan.Cost
+	p := &CreatePreview{Resource: ResourceVM, Name: vm.Name,
+		ProjectID: plan.ProjectID, ProjectFrom: originPlan, VM: &vm, PublicIP: &public,
+		SubnetID: plan.Network.SubnetID, SubnetName: plan.Network.SubnetName, Cost: &cost, CostNote: costNote}
+	if cost.Source == pricing.SourceAPI {
+		p.CostNote = apiCostNote
+	}
+	p.AddPorts(plan.Ports, nil, plan.PortsSource)
+	p.PortsGroup(firstNonEmpty(plan.Network.SecurityGroupName, plan.Network.SecurityGroupID))
+	p.Add("product", plan.Product)
+	p.setPriceClasses()
+	return p
+}
+
+// previewNetwork adds to a deploy preview the subnet and the security group
+// the new VM is plugged into, and the id of its disk type: what the preview
+// of evo deploy named before the command called its tool (v1.1). Reads
+// only, best effort and bounded: a choice that fails here fails deploy at
+// its own step, with the warnings deploy prints there (not here: the
+// preview has no output of its own).
+func (e *Engine) previewNetwork(ctx context.Context, p *CreatePreview) error {
+	if p.VM == nil || p.ProjectID == "" || e.Auth == nil || e.Cloud == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, networkCheckTimeout)
+	defer cancel()
+	tok, err := e.Auth.Token(ctx)
+	if err != nil {
+		return nil
+	}
+	e.Cloud.SetToken(tok.Value)
+	quiet := *e
+	quiet.Printer = output.NewWithWriter(io.Discard, output.ModeJSON, false)
+	n, err := quiet.resolveNetwork(ctx, p.ProjectID, p.VM.Zone.ID)
+	var ce *clerrors.CLIError
+	switch {
+	case err == nil:
+		p.SubnetID, p.SubnetName = n.SubnetID, n.SubnetName
+		p.SecurityGroup = &NetworkRef{ID: n.SecurityGroupID, Name: n.SecurityGroup}
+	case errors.As(err, &ce) && ce.Code == clerrors.CodeConfigInvalid:
+		return err
+	}
+	if dt, err := quiet.resolveDiskType(ctx, p.ProjectID, defaultDiskTypeName); err == nil {
+		p.VM.Disk.TypeID = dt.ID
+	}
+	return nil
+}
+
+// DeployDetailsV11 are the details 'evo deploy --dry-run --json' gave for a
+// new VM in v1.1, made from the deploy tool's preview p: the deploy tool
+// keeps them in its answer beside preview, so the command's details — the
+// tool's answer — still have every key they had. Deprecated, removed in
+// v2.0: use preview (preview.cost, preview.vm, …).
+func (e *Engine) DeployDetailsV11(p *CreatePreview) map[string]any {
+	var tcp, udp []int
+	if project, err := compose.Parse(e.Config.ComposeFile); err == nil {
+		tcp, udp = project.Ports, project.UDPPorts
+	}
+	sg := map[string]string{"id": "", "name": ""}
+	if p.SecurityGroup != nil {
+		sg = map[string]string{"id": p.SecurityGroup.ID, "name": p.SecurityGroup.Name}
+	}
+	return map[string]any{
+		"project_id":     p.ProjectID,
+		"project_from":   p.ProjectFrom,
+		"vm":             p.VM,
+		"floating_ip":    true,
+		"subnet_id":      p.SubnetID,
+		"security_group": sg,
+		"open_ports":     tcp,
+		"open_udp_ports": udp,
+		"cost":           p.Cost,
+		"cost_note":      p.CostNote,
+	}
+}

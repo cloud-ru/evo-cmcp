@@ -1,0 +1,272 @@
+# Установка
+
+Готовые бинари лежат в [GitHub Releases](https://github.com/cloud-ru/evo-cmcp/releases):
+Linux, macOS и Windows, каждая для amd64 и arm64. К каждому релизу приложены
+`checksums.txt` (sha256 всех архивов) и подписи cosign keyless
+(`*.sigstore.json`). Бинарь статический и ничего, кроме себя, не требует —
+кроме `kubectl`/`helm` для нескольких команд `k8s` (см. [ниже](#kubectl-и-helm)).
+
+## Linux и macOS: install.sh
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cloud-ru/evo-cmcp/main/install.sh | sh
+evo version
+```
+
+Если скрипт напишет, что `~/.local/bin` нет в `PATH`, в zsh (macOS) добавьте
+его так: `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc`.
+В примерах документации строки с `#` — пояснения; чтобы zsh не ругался на них
+при копировании, включите `setopt interactivecomments` (так же, через `~/.zshrc`).
+
+Скрипт:
+
+1. определяет ОС и архитектуру (`uname`);
+2. скачивает архив и `checksums.txt` нужного релиза;
+3. если в `PATH` есть [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/),
+   проверяет подпись `checksums.txt` (identity — workflow `release.yml` этого
+   репозитория на теге релиза); без cosign пишет, что подпись не проверена;
+4. сверяет sha256 архива и кладёт бинарь в `~/.local/bin` (под root — в
+   `/usr/local/bin`); если каталога нет в `PATH`, подскажет строку для профиля
+   оболочки.
+5. ставит автодополнение по Tab туда, где оболочка находит его сама: fish —
+   `~/.config/fish/completions/evo.fish`, bash —
+   `~/.local/share/bash-completion/completions/evo` (нужен пакет
+   bash-completion), zsh — каталог из `$fpath` в домашнем каталоге, если он
+   там есть. Если такого каталога нет (так на macOS по умолчанию), `_evo`
+   ложится в `~/.local/share/zsh/site-functions` (или
+   `$XDG_DATA_HOME/zsh/site-functions`), а в конец `~/.zshrc` дописывается
+   блок, который добавляет этот каталог в `$fpath` и подключает `_evo`:
+
+   ```zsh
+   # >>> evo: автодополнение (install.sh; убрать: install.sh --uninstall; не трогать: EVO_ZSHRC=0) >>>
+   fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+   if (( $+functions[compdef] )); then autoload -Uz _evo && compdef _evo evo; else autoload -Uz compinit && compinit; fi
+   # <<< evo <<<
+   ```
+
+   Это единственная правка evo в файле вне его каталогов. Блок ставится,
+   только если ваша оболочка — zsh (`$SHELL`); повторная установка заменяет
+   его, а не дописывает второй (метки узнаются и с пробелами или `\r` в
+   конце строки); строки вне меток скрипт не трогает. Перед заменой или
+   удалением блока скрипт копирует файл в `~/.zshrc.evo-backup` и удаляет
+   копию после удачной записи; запись не удалась — копия остаётся, скрипт
+   называет её путь и завершается с ошибкой. Если конечная метка блока
+   стёрта, скрипт файл не трогает (ни установка, ни `--uninstall`) и просит
+   убрать строки блока вручную.
+   Не трогать `~/.zshrc` — `EVO_ZSHRC=0`: тогда скрипт печатает эти строки,
+   и вы добавляете их сами. Убрать — `install.sh --uninstall` (блок уходит
+   вместе с пустой строкой перед ним, файл становится прежним) или вручную:
+   удалить строки между метками. Для PowerShell скрипт печатает строку для
+   профиля. Выбор стрелками в zsh скрипт автодополнения evo включает сам —
+   только для evo и только если у вас нет своего стиля.
+
+Переменные скрипта:
+
+| Переменная | Что задаёт | По умолчанию |
+|---|---|---|
+| `CLOUDRU_VM_VERSION` | тег релиза, например `v1.9.0` | последний стабильный; pre-release (`-rc.N`) надо назвать явно |
+| `INSTALL_DIR` | каталог для бинаря | `~/.local/bin`, под root `/usr/local/bin` |
+| `CLOUDRU_VM_BASE_URL` | откуда качать вместо GitHub (зеркало); ожидается `<base>/<тег>/<файл>` | GitHub Releases |
+| `EVO_ZSHRC` | `0` — не дописывать блок автодополнения в `~/.zshrc`, а напечатать его строки (шаг 5) | блок дописывается, если оболочка — zsh и в `$fpath` нет каталога в домашнем |
+
+```sh
+# конкретная версия, в свой каталог
+curl -fsSL https://raw.githubusercontent.com/cloud-ru/evo-cmcp/main/install.sh \
+  | CLOUDRU_VM_VERSION=v1.9.0 INSTALL_DIR="$HOME/bin" sh
+```
+
+Без `CLOUDRU_VM_VERSION` скрипт ставит последний стабильный релиз; кандидаты
+в релиз (`-rc.N`) — только с явной версией. Релизы до
+переименования (`v1.0.0-rc.1`) выпущены под старым именем — архив
+`cloudru-vm_<версия>_…` с одним бинарём `cloudru-vm`; скрипт узнаёт это по
+`checksums.txt` релиза и ставит `cloudru-vm`. С `v1.0.0-rc.2` — `evo` и alias
+`cloudru-vm`. Обновление — тот же запуск: бинарь и файлы автодополнения
+заменяются, блок в `~/.zshrc` — тоже, чужие файлы не трогаются. Удаление
+бинарей, файлов автодополнения и блока в `~/.zshrc`, которые поставил скрипт:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cloud-ru/evo-cmcp/main/install.sh | sh -s -- --uninstall
+```
+
+Данные evo (профили, кэш) остаются, см.
+[auth.md → «Что хранится на машине»](auth.md#что-хранится-на-машине).
+
+## Linux и macOS вручную
+
+```sh
+# OS: linux | darwin; ARCH: amd64 | arm64
+V=1.3.0; OS=linux; ARCH=amd64
+base=https://github.com/cloud-ru/evo-cmcp/releases/download/v$V
+curl -fLO "$base/evo_${V}_${OS}_${ARCH}.tar.gz"
+curl -fLO "$base/checksums.txt"
+curl -fLO "$base/checksums.txt.sigstore.json"
+# проверка подписи и хэша — раздел ниже
+tar -xzf "evo_${V}_${OS}_${ARCH}.tar.gz" evo
+install -m 0755 evo ~/.local/bin/
+```
+
+В архиве есть и `cloudru-vm` — тот же бинарь под старым именем (alias до
+v2.0, см. [rename.md](rename.md)). Нужен он,
+только если скрипты или конфиг MCP ещё вызывают `cloudru-vm`; `install.sh`
+ставит его рядом с `evo`.
+
+## Windows
+
+Скрипта-установщика для Windows пока нет.
+
+1. Скачайте из релиза `evo_<версия>_windows_amd64.zip` (или `_arm64`) и
+   `checksums.txt`.
+2. Сверьте хэш в PowerShell — значение должно совпасть со строкой архива в
+   `checksums.txt`:
+
+   ```powershell
+   (Get-FileHash .\evo_1.3.0_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+   Select-String -Path .\checksums.txt -Pattern windows_amd64
+   ```
+
+3. Распакуйте `evo.exe`, например, в `%LOCALAPPDATA%\Programs\evo`
+   (`cloudru-vm.exe` в архиве — alias со старым именем до v2.0, нужен только
+   старым скриптам).
+4. Добавьте этот каталог в `Path` пользователя: «Параметры → Система → О
+   программе → Дополнительные параметры системы → Переменные среды», или в
+   PowerShell:
+
+   ```powershell
+   $dir = "$env:LOCALAPPDATA\Programs\evo"
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User")
+   ```
+
+5. Откройте новый терминал: `evo version`.
+
+На Windows вместо прав `0600` файлы с ключами получают собственный ACL без
+наследования: доступ только у вас, SYSTEM и Администраторов (подробнее —
+[docs/auth.md](auth.md)). Команды `k8s kubectl/apply/helm` на Windows —
+без гарантий (см. [ниже](#kubectl-и-helm)).
+
+## Проверка подписи
+
+Релизы подписывает workflow `release.yml` через cosign keyless: сертификат
+выдаётся на OIDC-токен GitHub Actions, запись ложится в публичный журнал
+Rekor. Ключей у проекта нет — проверяется *кто* подписал (identity workflow).
+
+```sh
+V=v1.9.0
+cosign verify-blob --bundle checksums.txt.sigstore.json \
+  --certificate-identity "https://github.com/shatim-ops/evo-cli/.github/workflows/release.yml@refs/tags/$V" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum --ignore-missing -c checksums.txt     # macOS: shasum -a 256 --ignore-missing -c checksums.txt
+```
+
+Подпись — в формате бандла sigstore v0.3 (её ставит cosign v3). Нужен cosign
+v3 или v2.4+; у cosign v2 добавьте `--new-bundle-format`, иначе он ответит
+«bundle does not contain cert for verification». `install.sh` пробует оба
+варианта сам.
+
+`v1.0.0-rc.1` и `v1.0.0-rc.2` подписаны до переименования репозитория: для
+них в identity — `cloud-ru/evo-cmcp` вместо `cloud-ru/evo-cmcp`
+(`install.sh` это учитывает).
+
+`Verified OK` от cosign и `OK` у вашего архива — бинарь собран из этого
+репозитория в GitHub Actions на этом теге и не изменён. У каждого архива есть и
+собственная подпись (`<архив>.sigstore.json`), проверяется так же.
+
+## Gatekeeper (macOS) и SmartScreen (Windows)
+
+Бинари подписаны cosign, но **не нотаризованы Apple и не подписаны
+Authenticode**.
+
+- **macOS.** После `install.sh` или `curl` бинарь запускается без вопросов:
+  curl не ставит атрибут карантина. Если архив скачан браузером, macOS скажет
+  «не удаётся проверить разработчика». После проверки sha256 снимите карантин:
+  `xattr -d com.apple.quarantine ~/.local/bin/evo`.
+- **Windows.** SmartScreen может показать «Windows защитила ваш компьютер» —
+  «Подробнее» → «Выполнить в любом случае». Или до первого запуска, после
+  проверки хэша: `Unblock-File .\evo.exe`.
+
+## Автодополнение по Tab
+
+Tab дополняет команды и флаги, а с 1.5 — и значения, которые ссылаются на
+ресурсы облака: зону (`--region ru.`+Tab), flavor, образ, подсеть, VPC,
+бакет, путь секрета, проект, id и имена ресурсов в `get`, `delete`,
+`attach` (`evo disk delete `+Tab — диски проекта с именами). Набранное
+начало сужает список (`--image Ubu`+Tab — только Ubuntu).
+
+Следующий параметр — после пробела и Tab: на пустом слове после команды Tab
+называет флаги, которых ещё нет, — сначала обязательные, затем остальные, — а
+строка подсказки под ними говорит, что ещё обязательно («ещё обязательно:
+--size-gb», пара «одно из» — как `--value | --values`), или что всё задано:
+«готово к запуску: Enter или --dry-run». После флага со свободным значением
+(имя, размер, порт) подсказка называет его описание и границы из справки; у
+флага с закрытым списком Tab предлагает значения. Файлы Tab предлагает только
+там, где evo ждёт путь (`--manifest`, `--config`, `--password-file`). Порядок
+параметров в команде остаётся свободным. Подсказки (ActiveHelp, в zsh и bash)
+включены по умолчанию; выключить — `EVO_ACTIVE_HELP=0` (или общее для программ
+на cobra `COBRA_ACTIVE_HELP=0`).
+
+Значения читаются тем же списком, что и `evo … list`: только чтение, без
+согласия и без записи в журнал (`evo diag`); значения секретов не
+читаются. Список хранится несколько минут в каталоге кэша evo (только id и
+имена, файл `0600`), поэтому повторный Tab не идёт в облако. Облако не
+ответило за 1,5 с — список пуст, оболочка не зависает. Без ключа и проекта
+(`evo configure` не выполнен) Tab значений молчит.
+
+`install.sh` ставит файл автодополнения сам (шаг 5 выше). Вручную или после
+установки из архива — скрипт для своей оболочки:
+
+```sh
+# bash (нужен пакет bash-completion)
+evo completion bash > ~/.local/share/bash-completion/completions/evo
+# zsh: каталог из $fpath, куда у вас есть запись, например
+evo completion zsh > "${fpath[1]}/_evo"
+# fish
+evo completion fish > ~/.config/fish/completions/evo.fish
+# PowerShell: скрипт в $HOME и строка «. $HOME\evo.ps1» в профиле ($PROFILE)
+evo completion powershell > $HOME\evo.ps1
+```
+
+Выбор из списка стрелками в zsh скрипт `evo completion zsh` включает сам —
+только для evo (`zstyle ':completion:*:*:evo:*' menu yes select`) и только если
+у вас нет своего стиля для evo. В остальных оболочках это их настройка: PowerShell —
+`Set-PSReadLineKeyHandler -Key Tab -Function MenuComplete` в профиле;
+bash — `bind 'TAB:menu-complete'` в `~/.bashrc`. fish показывает меню сам.
+
+## kubectl и helm
+
+Почти все команды работают без внешних программ: API Cloud.ru и SSH
+реализованы в самом бинаре. Исключение — три команды, которые управляют
+содержимым кластера Kubernetes:
+
+| Команда (инструмент MCP) | Нужна программа |
+|---|---|
+| `k8s kubectl` (`k8s_kubectl`) | `kubectl` |
+| `k8s apply` (`k8s_apply`) | `kubectl` |
+| `k8s helm` (`k8s_helm`) | `helm` |
+
+Программы ищутся в `PATH`, затем в `~/.local/bin`, `/usr/local/bin`,
+`/usr/bin`. Установка: [kubectl](https://kubernetes.io/docs/tasks/tools/),
+[helm](https://helm.sh/docs/intro/install/). Проверить, видит ли их
+evo, — `evo doctor` (отсутствие — предупреждение, не ошибка).
+
+Ограничения:
+
+- в **Docker-образе** MCP-сервера `kubectl` и `helm` нет — эти три
+  инструмента отвечают ошибкой «not available in this mode»; используйте
+  `k8s kubeconfig` и свой `kubectl` (см. [mcp.md](mcp.md#ограничения-http-режима));
+- флаги evo (`--json`, `--yes`, `--dry-run`, `--profile`) у `k8s kubectl`
+  ставятся до идентификатора кластера: `evo k8s kubectl --json <cluster-id>
+  get pods`. Всё после него уходит в `kubectl` как есть, поэтому
+  `--dry-run=server` после кластера — флаг kubectl; `--json` и `--yes` там
+  отклоняются с подсказкой (кроме части после `--`, команды в контейнере);
+- на **Windows** — без гарантий: поиск путей рассчитан на Unix, работает,
+  только если `kubectl.exe`/`helm.exe` лежат в `PATH`.
+
+## Сборка из исходников
+
+```sh
+git clone https://github.com/cloud-ru/evo-cmcp && cd evo-cmcp
+go build -o bin/evo ./cmd/evo
+```
+
+Нужен Go версии из `go.mod` (CI собирает на Go 1.26.10). `evo version`
+у такой сборки показывает версию модуля и коммит из данных VCS.

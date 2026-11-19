@@ -1,0 +1,169 @@
+// SPDX-FileCopyrightText: 2026 ООО «Облачные технологии» (Cloud.ru)
+// SPDX-License-Identifier: Apache-2.0
+
+package mk8s
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+)
+
+// --- Node pool types (v3) ---
+
+type FixedScale struct {
+	Count int `json:"count"`
+}
+
+type AutoScale struct {
+	MinCount     int `json:"minCount"`
+	MaxCount     int `json:"maxCount"`
+	InitialCount int `json:"initialCount,omitempty"`
+}
+
+type ScalePolicy struct {
+	FixedScale *FixedScale `json:"fixedScale,omitempty"`
+	AutoScale  *AutoScale  `json:"autoScale,omitempty"`
+}
+
+type DiskRequest struct {
+	TypeName string `json:"typeName,omitempty"`
+	Size     int    `json:"size,omitempty"`
+}
+
+type MachineConfigurationRequest struct {
+	FlavorID string       `json:"flavorId"`
+	Disk     *DiskRequest `json:"disk,omitempty"`
+}
+
+type NodePoolNetworkConfigurationRequest struct {
+	NodesSubnetID   string `json:"nodesSubnetId"`
+	SecurityGroupID string `json:"securityGroupId,omitempty"`
+}
+
+type NodePoolUpdateConfiguration struct {
+	Strategy string `json:"strategy"` // StrategyRollingUpdate
+}
+
+// StrategyRollingUpdate updates the nodes of a pool one by one: the
+// strategy evo creates a pool with.
+const StrategyRollingUpdate = "NODE_POOL_UPDATE_STRATEGY_ROLLING_UPDATE"
+
+// CreateNodePoolReq mirrors the confirmed v3 CreateNodePoolRequest.
+type CreateNodePoolReq struct {
+	ClusterID            string                              `json:"clusterId"`
+	Name                 string                              `json:"name"`
+	ScalePolicy          ScalePolicy                         `json:"scalePolicy"`
+	MachineConfiguration MachineConfigurationRequest         `json:"machineConfiguration"`
+	NetworkConfiguration NodePoolNetworkConfigurationRequest `json:"networkConfiguration"`
+	UpdateConfiguration  NodePoolUpdateConfiguration         `json:"updateConfiguration"`
+}
+
+// CreateNodePool submits a node-pool create and returns the async operation.
+func (c *Client) CreateNodePool(ctx context.Context, req CreateNodePoolReq) (*Operation, error) {
+	data, st, err := c.do(ctx, http.MethodPost, "/v3/nodePools", nil, req)
+	if err != nil {
+		return nil, err
+	}
+	if st != 200 {
+		return nil, apiError(st, data)
+	}
+	var op Operation
+	if err := json.Unmarshal(data, &op); err != nil {
+		return nil, fmt.Errorf(i18n.T("parse operation: %w", "разбор операции: %w"), err)
+	}
+	return &op, nil
+}
+
+// ListNodePools lists the node pools of a cluster, following
+// nextPageToken. clusterId is required by the API (openapi-v3.yaml of
+// mk8s, NodePoolService_List): without it the call fails, so an empty
+// clusterID is refused here.
+func (c *Client) ListNodePools(ctx context.Context, clusterID string) ([]map[string]any, error) {
+	if clusterID == "" {
+		return nil, errors.New("mk8s: node pools need a cluster ID")
+	}
+	var out []map[string]any
+	query := func() url.Values { return url.Values{"clusterId": {clusterID}} }
+	err := c.walk(ctx, "/v3/nodePools", query, func(data []byte) (string, error) {
+		var r struct {
+			NodePools     []map[string]any `json:"nodePools"`
+			NextPageToken string           `json:"nextPageToken"`
+		}
+		if err := json.Unmarshal(data, &r); err != nil {
+			return "", fmt.Errorf(i18n.T("parse node pools: %w", "разбор групп узлов: %w"), err)
+		}
+		out = append(out, r.NodePools...)
+		return r.NextPageToken, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetNodePool reads a node pool by its id (NodePoolService_Get).
+func (c *Client) GetNodePool(ctx context.Context, id string) (map[string]any, error) {
+	data, st, err := c.do(ctx, http.MethodGet, "/v3/nodePools/"+seg(id), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if st != 200 {
+		return nil, apiError(st, data)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf(i18n.T("parse node pool: %w", "разбор группы узлов: %w"), err)
+	}
+	return m, nil
+}
+
+// scaleNodePoolReq is the body of a scale: the fixed count of the pool and
+// nothing else. UpdateNodePoolRequest of the specification takes labels
+// and taints too, and «an object that is created and holds no data
+// removes them all»: the body of a scale carries neither, so it cannot
+// wipe what the call did not name.
+type scaleNodePoolReq struct {
+	ScalePolicy ScalePolicy `json:"scalePolicy"`
+}
+
+// ScaleNodePool sets the fixed number of nodes of a pool
+// (NodePoolService_Update, PATCH /v3/nodePools/{id}) and returns the async
+// operation.
+func (c *Client) ScaleNodePool(ctx context.Context, id string, count int) (*Operation, error) {
+	req := scaleNodePoolReq{ScalePolicy: ScalePolicy{FixedScale: &FixedScale{Count: count}}}
+	data, st, err := c.do(ctx, http.MethodPatch, "/v3/nodePools/"+seg(id), nil, req)
+	if err != nil {
+		return nil, err
+	}
+	if st != 200 {
+		return nil, apiError(st, data)
+	}
+	var op Operation
+	if err := json.Unmarshal(data, &op); err != nil {
+		return nil, fmt.Errorf(i18n.T("parse operation: %w", "разбор операции: %w"), err)
+	}
+	return &op, nil
+}
+
+// DeleteNodePool deletes the node pool id (DELETE /v3/nodePools/{id});
+// the answer is the operation of the delete.
+func (c *Client) DeleteNodePool(ctx context.Context, id string) (*Operation, error) {
+	data, st, err := c.do(ctx, http.MethodDelete, "/v3/nodePools/"+seg(id), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if st != 200 {
+		return nil, apiError(st, data)
+	}
+	var op Operation
+	if err := json.Unmarshal(data, &op); err != nil {
+		return nil, fmt.Errorf(i18n.T("parse operation: %w", "разбор операции: %w"), err)
+	}
+	return &op, nil
+}
