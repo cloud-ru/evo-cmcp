@@ -20,7 +20,7 @@ Registry и Container Apps — и развёртывает `docker-compose`-пр
   показывают превью с ценой и ждут подтверждения — одинаково у человека и у
   агента.
 
-  [Руководство пользователя](https://cdn.cloud.ru/docs/files/cmcp/evolution-cmcp-1.9.0-cloud.ru-v13.pdf)
+  [Руководство пользователя](https://cdn.cloud.ru/docs/files/cmcp/evolution-cmcp-1.9.0-cloud.ru-v14.pdf)
 
 ## Возможности (v1.9.0)
 
