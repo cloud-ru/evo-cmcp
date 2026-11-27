@@ -24,7 +24,8 @@ type CLISpec struct {
 	// Rename maps a tool argument to its flag name, when the default
 	// (snake_case → kebab-case) clashes or reads badly.
 	Rename map[string]string
-	Omit   map[string]bool
+
+	Omit map[string]bool
 	// Pairs are object arguments given as a repeatable key=value flag
 	// (--meta admin_password=…) instead of one JSON object.
 	Pairs map[string]bool
@@ -40,7 +41,8 @@ type CLISpec struct {
 	// that the secret stays out of argv and the shell history. The tool
 	// gets the same argument either way; one of the two flags, not both.
 	SecretFiles map[string]bool
-	Paths       map[string]bool
+
+	Paths map[string]bool
 	// Columns are the table columns of a list answer (default: picked from
 	// the rows).
 	Columns []string
@@ -189,6 +191,8 @@ var cliSpecs = map[string]CLISpec{
 	"cert_private_key": {Group: "cert", Verb: "private-key", Args: []string{"certificate_id"}},
 	"cert_operation":   {Group: "cert", Verb: "operation", Args: []string{"operation_id"}},
 
+	// lb, tg: the command is the prefix of the tool's name, not its group
+	// (nlb, which --toolsets keeps): owner's decision Q4.
 	"lb_list":      {Group: "lb", Verb: "list"},
 	"lb_get":       {Group: "lb", Verb: "get", Args: []string{"id"}},
 	"lb_create":    {Group: "lb", Verb: "create", Args: []string{"name"}},
@@ -249,7 +253,9 @@ var cliSpecs = map[string]CLISpec{
 	"org_quotas":           {Group: "org", Verb: "quotas", Rename: map[string]string{"project_id": "project-id"}},
 	"iam_service_accounts": {Group: "iam", Verb: "service-accounts", Rename: map[string]string{"project_id": "project-id"}},
 
-	"metrics_history": {Group: "metrics", Verb: "history", Args: []string{"match"}},
+	// metrics: the command is the prefix of the tool's name, not its group
+	// (monitoring, which --toolsets keeps): owner's decision Q4.
+	"metrics_history": {Group: "metrics", Verb: "history", Args: []string{"match"}, Render: "metric-series"},
 	"metrics_scrape":  {Group: "metrics", Verb: "scrape", Args: []string{"match?"}, Render: "exposition"},
 
 	// stack
@@ -258,14 +264,18 @@ var cliSpecs = map[string]CLISpec{
 	"stack_status":  {Group: "stack", Verb: "status", Args: []string{"job_id"}},
 	"stack_destroy": {Group: "stack", Verb: "destroy", Args: []string{"job_id"}},
 
-	"deploy":       {Verb: "deploy"},
-	"status":       {Verb: "status"},
-	"logs":         {Verb: "logs"},
-	"list_images":  {Verb: "list-images"},
-	"whoami":       {Verb: "whoami"},
-	"agent_skill":  {Group: "agent", Verb: "skill"},
-	"doctor":       {Verb: "doctor"},
-	"history":      {Verb: "history"},
+	"deploy":      {Verb: "deploy"},
+	"status":      {Verb: "status"},
+	"logs":        {Verb: "logs"},
+	"list_images": {Verb: "list-images"},
+	"whoami":      {Verb: "whoami"},
+	"agent_skill": {Group: "agent", Verb: "skill"},
+	"doctor":      {Verb: "doctor"},
+	"history":     {Verb: "history"},
+	// The deploy wizard and the records: subcommands of the engine command
+	// evo deploy, which is a command with an action of its own and a group
+	// at once (spec.md R7): 'evo deploy' deploys, 'evo deploy plan' plans.
+	// The trees add them to evo deploy instead of a second root deploy.
 	"deploy_plan":  {Group: "deploy", Verb: "plan", Rename: map[string]string{"image_metadata": "meta", "ports": "port"}, Pairs: map[string]bool{"image_metadata": true}, Paths: map[string]bool{"compose_file": true}},
 	"deploy_apply": {Group: "deploy", Verb: "apply", Args: []string{"plan_id"}},
 	"list":         {Group: "deploy", Verb: "list", Columns: []string{"id", "vm_name", "vm_ip", "status", "flavor_name", "created_at"}},

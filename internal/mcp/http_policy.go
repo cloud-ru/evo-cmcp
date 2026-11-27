@@ -46,6 +46,10 @@ type Restriction struct {
 	Summary       string // what the client sees
 }
 
+// HTTPRestrictions is the closed list. restrictForHTTP wraps a handler only
+// through an entry here (restrict panics otherwise), and
+// TestHTTPPolicy_ClosedList checks the list against the handlers and
+// against docs/mcp.md.
 var HTTPRestrictions = []Restriction{
 	{ID: "H1", Tools: []string{"k8s_apply", "k8s_helm", "k8s_kubectl"},
 		Where: "internal/mcp/http_policy.go", Symbol: "binaryAvailable",
@@ -86,9 +90,10 @@ var HTTPRestrictions = []Restriction{
 	{ID: "H13",
 		Where: "internal/mcp/http.go", Symbol: "withNotifier(ctx, notify)",
 		Summary: "the progress of a long call (notifications/progress) goes on the SSE stream of its tools/call only: a client that takes the answer as plain JSON gets none"},
+
 	{ID: "H14", StdioToo: true,
 		Where: "internal/mcp/server.go", Symbol: "SetCallBudget(tools.MCPCallBudget)",
-		Summary: "a call waits for the cloud at most ~45 s (MCPCallBudget): what is not done by then answers with its state so far and the next step (status creating, next, next_tool, next_args), wait_seconds takes at most 45; wait=true lifts it; the CLI waits as before"},
+		Summary: "by default the MCP cloud wait budget is ~45 s (MCPCallBudget). Continue with next_tool and next_args. wait_seconds takes at most 45. For async deletes (including dns_zone_delete and k8s_nodepool_delete), wait=false skips the outcome read and wait=true waits at most 45 s. On deleting, follow the read tool in next_tool with next_args. For ca_delete, use ca_get for the same app. An interrupted wait keeps the started operation ID. The CLI has no MCP budget; evo ca delete --wait waits up to 2 minutes"},
 	{ID: "H15", StdioToo: true,
 		Where: "internal/tools/tools.go", Symbol: "recordedTarget(eng.StateDir)",
 		Summary: "destroy confirmed without vm_id or name, with a deployment recorded in the server's folder, deletes nothing: USAGE with the recorded vm_id; the preview names the target as before; evo destroy in a terminal is as before"},
@@ -128,6 +133,7 @@ func (w wording) redactedNote() string {
 	if w.elsewhere != "" {
 		how += ", " + w.elsewhere
 	}
+
 	return "The values of the fields listed in redacted are hidden " + w.where + " and are not in this answer, whatever the rest of it says. To get them, " + how + ". " +
 		"A value shown only once, such as the password of a new VM, no call shows again: do not repeat the call for it, reset it in the Cloud.ru console."
 }

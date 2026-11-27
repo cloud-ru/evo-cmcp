@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	stderrors "errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
@@ -18,6 +17,7 @@ import (
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 	"github.com/cloud-ru/evo-cmcp/internal/images"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 	"github.com/cloud-ru/evo-cmcp/internal/provision"
 )
 
@@ -25,7 +25,8 @@ import (
 // project that owns one.
 type ownerKind struct {
 	// what names the kind in messages ("PostgreSQL cluster").
-	what   string
+	what string
+
 	byName bool
 	// listTool lists the resources of the project (the hint of a refusal).
 	listTool string
@@ -53,7 +54,12 @@ type idArg struct {
 	// project of this resource (namedProject).
 	target bool
 	// ids reads the argument; nil reads it as one string.
-	ids   func(args map[string]any) []string
+	ids func(args map[string]any) []string
+	// party resolves the argument the way the tool's handler does (a name
+	// or an address to the id of the resource): the change acts on that
+	// resource, and the record of the call names it (intent.Intent.Parties)
+	// — the same arguments on another resource are another call (R-101).
+	// nil for an argument that is an id already or names no participant.
 	party func(ctx context.Context, r *Registry, ref string) (id string, err error)
 }
 
@@ -69,6 +75,7 @@ const (
 		"the items that list read; it reaches no API as an id"
 	whyInProject = "the request carries the project (projectId in the query), and the API looks the resource up in that project"
 	whyInParent  = "a part of the resource the call's other id argument names (checked): the API addresses it inside that resource"
+
 	whyContinued = "the VM the next step of a call goes on with (continuedVM): the call only reads it by id, to refuse when it is gone; " +
 		"what the call writes lands in its own project, as without the argument"
 	whyContainerImage = "a container image reference (registry/name:tag) the app pulls, not a Cloud.ru resource id"
@@ -216,6 +223,7 @@ func (c *ownerCall) admit(k *ownerKind, id, project string) error {
 		if stderrors.Is(err, ErrProjectNotAllowed) {
 			return notInProject(k, id)
 		}
+
 		return err
 	}
 	return nil
@@ -225,6 +233,7 @@ func (c *ownerCall) admit(k *ownerKind, id, project string) error {
 // of another project, or gone — one answer for both, NOT_FOUND as the API
 // gives for one that is gone, naming no project.
 func notInProject(k *ownerKind, id string) error {
+
 	return clierrors.New(clierrors.CodeNotFound,
 		i18n.Tf("%s %s is deleted or not in the projects of this server (--allow-project); nothing was done",
 			"%s %s удалён или не в проектах этого сервера (--allow-project); ничего не сделано", k.what, id),
@@ -335,6 +344,23 @@ func mapIDs(items []map[string]any) []string {
 	return out
 }
 
+// A project list containing an unidentified cluster cannot establish either
+// membership or absence for an operation restricted to that project.
+func clusterIDs(items []map[string]any, err error) ([]string, error) {
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(items))
+	for _, item := range items {
+		id, _ := item["id"].(string)
+		if strings.TrimSpace(id) == "" {
+			return nil, pager.Incomplete(i18n.T("a cluster has no ID to check", "у кластера нет ID для проверки"))
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 var (
 	kindVM = byName(inProjectList("VM", "vm_list", computeList(func(ctx context.Context, eng *engine.Engine) ([]string, error) {
 		vms, err := eng.Cloud.ListVMsInProject(ctx, eng.Config.ProjectID)
@@ -344,6 +370,7 @@ var (
 		}
 		return ids, err
 	})))
+
 	kindBackup = byProjectField("backup", "backup_list", func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
 		eng, err := c.engine(ctx)
 		if err != nil {
@@ -395,16 +422,14 @@ var (
 		if err != nil {
 			return nil, err
 		}
-		items, err := cli.ListClusters(ctx, kafkaQuery())
-		return mapIDs(items), err
+		return clusterIDs(cli.ListClusters(ctx, kafkaQuery()))
 	})
 	kindRedis = inProjectList("Redis cluster", "redis_list", func(ctx context.Context, c *ownerCall) ([]string, error) {
 		cli, _, err := c.r.redisClientEng(ctx)
 		if err != nil {
 			return nil, err
 		}
-		items, err := cli.ListClusters(ctx, url.Values{})
-		return mapIDs(items), err
+		return clusterIDs(cli.ListClusters(ctx, url.Values{}))
 	})
 
 	// A DNS zone: the project's public and private zones, as
@@ -485,6 +510,7 @@ var (
 	// of the cluster. A pool that names no cluster, or whose cluster is
 	// not read, is refused — never passed unchecked.
 	kindK8sNodePool = &ownerKind{what: "node pool", listTool: "k8s_nodepools", project: nodePoolProject,
+
 		card: func(ctx context.Context, c *ownerCall, id string) (map[string]any, error) {
 			cli, _, _, err := c.r.k8sClient(ctx)
 			if err != nil {
@@ -655,7 +681,11 @@ func dnsZoneIDs(ctx context.Context, c *ownerCall) ([]string, error) {
 			return nil, err
 		}
 		for _, z := range zones {
-			ids = append(ids, fmt.Sprint(z["id"]))
+			id := stringArg(z, "id")
+			if strings.TrimSpace(id) == "" {
+				return nil, pager.Incomplete(i18n.T("a DNS zone has no ID to check", "у зоны DNS нет ID для проверки"))
+			}
+			ids = append(ids, id)
 		}
 	}
 	return ids, nil

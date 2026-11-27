@@ -5,10 +5,12 @@ package tools
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 
 	"github.com/cloud-ru/evo-cmcp/internal/clock"
 	"github.com/cloud-ru/evo-cmcp/internal/config"
+	"github.com/cloud-ru/evo-cmcp/internal/engine"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/history"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
@@ -35,6 +37,7 @@ func historyOutcome(name string, args map[string]any, answer string) history.Out
 		details, _ := res["details"].(map[string]any)
 		return createdRef(name, args, details)
 	}
+
 	madeByAnswer := func() string {
 		if !isCreate {
 			return ""
@@ -45,10 +48,12 @@ func historyOutcome(name string, args map[string]any, answer string) history.Out
 		details, _ := res["details"].(map[string]any)
 		return createdID(name, details)
 	}
+
 	job := stringArg(res, "job_id")
 	if job == "" {
 		job = stringArg(args, "job_id")
 	}
+
 	if job != "" && groupOf(name) == "stack" {
 		out.Kind, out.ResourceID, out.JobID = "stack", job, job
 		out.Reason = answerReason(answer)
@@ -62,14 +67,26 @@ func historyOutcome(name string, args map[string]any, answer string) history.Out
 		}
 		switch {
 		case out.Reason != "" && status == "" && (out.Reason == clierrors.CodeNotFound || out.Reason == clierrors.CodeUsage):
+
 			out.Result, out.ResourceID = history.Error, ""
 		case out.Reason != "":
 			out.Result = history.Unknown
 		}
 		return out
 	}
+	deleteID := stringArg(args, d.arg)
+	if name == "destroy" {
+		deleteID = firstNonEmptyStr(stringArg(res, "deleted_vm"), stringArg(res, "vm_id"), deleteID)
+	}
+	if name == "pg_delete" {
+		deleteID = firstNonEmptyStr(deleteID, stringArg(args, "cluster_id"))
+	}
 	switch reason := answerReason(answer); {
+	case name == "destroy" && (status == "partial" || boolArg(res, "cleanup_pending", false)):
+		out.CleanupPending = true
+		out.Result, out.ResourceID, out.Reason = history.Unknown, deleteID, reason
 	case reason != "" && intent.OutcomeUnknown(reason, answerHTTPStatus(answer)):
+
 		out.Result, out.Reason, out.ResourceID = history.Unknown, reason, made()
 	case reason != "":
 		if id := madeByAnswer(); id != "" {
@@ -80,12 +97,12 @@ func historyOutcome(name string, args map[string]any, answer string) history.Out
 	case status == "already_deleted":
 		out.Result = history.AlreadyDeleted
 		if isDelete {
-			out.ResourceID = stringArg(args, d.arg)
+			out.ResourceID = deleteID
 		}
 	case isDelete:
 		// The id the delete takes: the same createdRef wrote in the line
 		// of the create, so the two meet (history.Live).
-		out.ResourceID = stringArg(args, d.arg)
+		out.ResourceID = deleteID
 		// A delete that goes on — its status a doing («deleting»), or a
 		// next step to read — has not removed its resource yet.
 		if strings.HasSuffix(status, "ing") || stringArg(res, "next_tool") != "" {
@@ -98,10 +115,18 @@ func historyOutcome(name string, args map[string]any, answer string) history.Out
 		switch {
 		case id == "":
 			out.Result = history.Unknown
-		case strings.HasPrefix(status, "already_"):
+		case name == "deploy" && stringArg(res, "deploy_action") == "updated":
+			out.Result, out.ResourceID = history.Changed, id
+		case strings.HasPrefix(status, "already_") || (name == "deploy" && stringArg(res, "deploy_action") == "unchanged"):
 			out.Result, out.ResourceID = history.Found, id
 		default:
 			out.Result, out.ResourceID = history.Created, id
+			// Both lostCreate and the create can return subnet_id. Only the
+			// latter carries the subnet object from POST.
+			if name == "subnet_create" {
+				subnet, _ := res["subnet"].(map[string]any)
+				out.CreateReceipt = stringArg(subnet, "id") == id
+			}
 		}
 	default:
 		out.Result = history.Changed
@@ -217,10 +242,12 @@ func (r *Registry) journalCheck(dir string) (DoctorCheck, bool) {
 		Detail: i18n.Tf("%s: %d KB since %s, %d live lines (made and not removed, or an outcome not known)",
 			"%s: %d КБ с %s, живых строк — %d (создано и не удалено или итог неизвестен)", dir, (s.Bytes+1023)/1024, s.Oldest, s.Live)}
 	if len(s.Deferred) > 0 {
+
 		c.Status, c.Files = CheckWarn, s.Deferred
 		var files []string
 		for _, f := range s.Deferred {
 			if f.Name == history.LiveName {
+
 				files = append(files, i18n.Tf("%s: %d lines not read — the mark of the days pruned is gone or older than them; %d lines evo did not write, %d live; %s is not to be moved or removed whatever the counts",
 					"%s: строк не читается — %d: метки вычищенных дней нет или она старше их; строк не от evo — %d, живых — %d; %s не переносить и не удалять ни при каком счёте", f.Name, f.Unread, f.NotEvos, f.Live, f.Name))
 				continue
@@ -231,6 +258,7 @@ func (r *Registry) journalCheck(dir string) (DoctorCheck, bool) {
 			"; очистка отложена: продолжение изменило бы то, что history находит живым, — ничего не удаляется, и журнал растёт; очистка пробует снова каждый день (%s). Живое показывает history. Файл с живыми строками не переносить и не удалять: живая строка — ресурс, созданный и не удалённый, или неизвестный итог", strings.Join(files, "; "))
 	}
 	if s.Unfinished {
+
 		c.Status = CheckWarn
 		c.Detail += i18n.T("; the last pruning did not fit its limit of time (a large journal): nothing was removed, and it tries again the next day",
 			"; последняя очистка не уложилась в свой предел времени (журнал велик): ничего не удалено, очистка попробует снова на следующий день")
@@ -241,4 +269,44 @@ func (r *Registry) journalCheck(dir string) (DoctorCheck, bool) {
 			"; одни живые строки больше потолка 64 МБ: ни одна не удаляется, и журнал растёт — строка закрывается, когда ресурс удалён через evo")
 	}
 	return c, true
+}
+
+// Each supported delete names the journal evidence required for its preview.
+// Redis creation recorded both IDs in 1.9.0; recovery by name has no
+// operation ID. For subnets only the receipt distinguishes a POST response.
+var journalCreationProof = map[string]func(history.Line) bool{
+	"redis_delete": func(l history.Line) bool {
+		return l.Tool == "redis_create" && l.OperationID != ""
+	},
+	"subnet_delete": func(l history.Line) bool {
+		return l.Tool == "subnet_create" && l.CreateReceipt
+	},
+}
+
+// journalProvenance uses the project independently resolved for this preview.
+// An unsupported delete has no journal provenance field.
+// The configuration journal and other state directories are outside its scope.
+func (r *Registry) journalProvenance(del, project, id string) *engine.Provenance {
+	provesCreation := journalCreationProof[del]
+	if provesCreation == nil {
+		return nil
+	}
+	unknown := &engine.Provenance{CreatedByEvo: engine.ProvenanceUnknown, Note: i18n.T("this folder's journal does not confirm creation of this resource in its project", "журнал этой папки не подтверждает создание ресурса в его проекте")}
+	root, ok := r.stateDir()
+	if !ok || project == "" || id == "" {
+		return unknown
+	}
+	j, err := history.ReadAll(history.DirOf(intent.Dir(root)), r.historyCheck)
+	if err != nil || j.Skipped > 0 {
+		return unknown
+	}
+	for _, l := range history.Live(j.Lines) {
+		if l.Outcome != history.Created || l.Kind != resourceKind(del) || l.ProjectID != project || l.ResourceID != id || l.Parent != "" || l.StateDir == "" || filepath.Clean(l.StateDir) != filepath.Clean(root) {
+			continue
+		}
+		if provesCreation(l) {
+			return &engine.Provenance{CreatedByEvo: engine.ProvenanceYes, Note: i18n.T("this folder's journal records the cloud ID returned by creation in this project", "журнал этой папки содержит облачный ID из ответа на создание ресурса в этом проекте")}
+		}
+	}
+	return unknown
 }

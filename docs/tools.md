@@ -1,12 +1,16 @@
 # Каталог инструментов
 
+<!-- Файл сгенерирован из реестра инструментов. Руками не править:
+     go test ./internal/cli -run TestToolsDoc -update-docs
+     CI сверяет файл с реестром (TestToolsDoc). -->
+
 Инструменты evo — те же, что у MCP-сервера ([mcp.md](mcp.md)) и у
-`evo tools call`. «Команда консольной утилиты» — команда инструмента в evo
+`evo tools call`. «Команда CLI» — команда инструмента в evo
 ([commands.md](commands.md)). «Описание» — первая фраза английского описания,
 которое читает агент в MCP; «Описание (RU)» — краткое русское, из справки
 команды. Полное описание и схема аргументов — `evo tools describe <имя>`
 (с `EVO_LANG=en` — по-английски). «Меняет»: «да» — инструмент
-создаёт или меняет ресурсы и без `confirmed=true` (в консольной утилите — `--yes`)
+создаёт или меняет ресурсы и без `confirmed=true` (в CLI — `--yes`)
 только показывает превью; «удаляет» — может удалить или перезаписать данные;
 «нет, секрет» — ничего не меняет, но показывает секрет открытым текстом и
 тоже требует `confirmed=true` (`--yes`); «побочно» — согласия не
@@ -18,7 +22,7 @@
 
 ## ar
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `ar_list` | `evo ar list` | нет | — | List Artifact Registry registries in the project (id, name, type, status, public, tariff). | Реестры Artifact Registry проекта |
 | `ar_get` | `evo ar get` | нет | `id` | Get full details of one Artifact Registry registry by id (from ar_list). | Реестр Artifact Registry по ID: все сведения |
@@ -28,22 +32,22 @@
 
 ## audit
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `audit_events` | `evo audit events` | нет | — | Who did what in the project: control-plane events (create, delete, modify of VMs, DBs, k8s, S3, IAM, …) with actor, action, resource, time — for 'who deleted … | Журнал аудита проекта: кто, что и когда сделал |
 
 ## auth
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `agent_skill` | `evo agent skill` | нет | — | Read the card of a tool group: its tools, where their ids come from, what deletes what a create made, what to wait with, and the group's notes. | Карточка группы инструментов для агента |
 | `whoami` | `evo whoami` | нет | — | Whom the tools work as: profile, masked access key ID, where the key and the project come from (profile, env, project file, flag), the project, the IAM token's … | Активный профиль и проверка его ключа |
 | `doctor` | `evo doctor` | нет | — | Check the setup the tools use: the configuration (profile, key and project sources, warnings), whether IAM and Compute APIs are reachable (http_status is what … | Проверить настройки, ключ доступа и связь с API |
-| `history` | `evo history` | нет | — | What evo changed in the cloud from this folder of state: the journal of changes (.evo/history/, a line for each end of a call that changes the cloud). | Что evo изменил в облаке из этой папки состояния (журнал изменений) |
+| `history` | `evo history` | нет | — | Local cloud change journal (.evo/history/): one line per completed call that changes the cloud. | Что evo изменил в облаке из этой папки состояния (журнал изменений) |
 
 ## backup
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `backup_list` | `evo backup list` | нет | — | List the backups of VMs and disks in the project: id, name, state, type (full or incremental), size_mb, created_at, last_restore_time, and the source … | Резервные копии ВМ и дисков: id, имя, состояние, тип, размер, исходный ресурс |
 | `backup_get` | `evo backup get` | нет | `backup_id` | A backup by id (from backup_list): the fields of its row, its description and plan, whether its source still exists, and the source as the backup holds it (a … | Резервная копия по id: исходный ресурс, существует ли он, план копирования |
@@ -53,7 +57,7 @@
 
 ## billing
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `billing_balance` | `evo billing balance` | нет | — | Balance of the billing agreement (RUB, active flag, raw agreement object). | Баланс по договору: сумма в рублях, признак активности |
 | `billing_consumption` | `evo billing consumption` | нет | `start` | Consumption cost for a date range, by the agreement (CLOUDRU_AGREEMENT_ID) or, without it, by the project; scope in the answer says which. | Стоимость потребления за период по сервисам: по договору или по проекту |
@@ -61,11 +65,11 @@
 
 ## ca
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `ca_list` | `evo ca list` | нет | — | List Container Apps (serverless containers) in the project (name, status). | Приложения Container Apps проекта |
 | `ca_get` | `evo ca get` | нет | `name` | Get a Container App by name — full details incl. | Приложение Container Apps по имени: состояние, публичный URL |
-| `ca_deploy` | `evo ca deploy` | да | `name`, `image` | Deploy a serverless Container App from an image; the preview lists every setting, root included. | Развернуть приложение Container Apps из образа контейнера (асинхронно) |
+| `ca_deploy` | `evo ca deploy` | да | `name`, `image` | Deploy a serverless Container App from an image. | Развернуть приложение Container Apps из образа контейнера (асинхронно) |
 | `ca_delete` | `evo ca delete` | удаляет | `name` | Delete a Container App by name. | Удалить приложение Container Apps (асинхронно) |
 | `ca_logs` | `evo ca logs` | нет | `name` | Get recent logs of a Container App: the last 100 lines by time, oldest first (app logs are the container's stdout/stderr). | Последние журналы приложения Container Apps |
 | `ca_start` | `evo ca start` | да | `name` | Start a stopped Container App (it is billed while running). | Запустить остановленное приложение Container Apps |
@@ -73,7 +77,7 @@
 
 ## cert
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `cert_list` | `evo cert list` | нет | — | List TLS certificates in the project; filter by name, dns_name, common_name, type, state. | TLS-сертификаты проекта в Certificate Manager |
 | `cert_get` | `evo cert get` | нет | `id` | Get one certificate by id (metadata, primary version, expiry, status). | Сертификат по ID: метаданные, основная версия, срок действия, состояние |
@@ -88,21 +92,21 @@
 
 ## deploy
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
-| `deploy` | `evo deploy` | да | — | Deploy the local compose project to a VM evo-<project_name> (billable when created) with a public floating IP: uploads the compose files over SSH, runs them … | Развернуть локальный проект docker-compose на ВМ Cloud.ru |
+| `deploy` | `evo deploy` | да | — | Deploy the local compose project to a VM evo-<project_name> (billed on creation) with a public floating IP. | Развернуть локальный проект docker-compose на ВМ Cloud.ru |
 | `status` | `evo status` | нет | — | Current deployment from the local state: VM id, public IP, flavor, region, health, ports. | Состояние текущего развёртывания |
 | `list` | `evo deploy list` | нет | — | List all recorded deployments for this project (VM IP, status, flavor, creation time). | Локальные записи развёртываний этого проекта |
 | `logs` | `evo logs` | нет | — | Retrieve container logs from the deployed VM via 'docker compose logs' over SSH. | Журналы контейнеров развёрнутой ВМ |
 | `destroy` | `evo vm delete` | удаляет | — | Permanently delete a VM and all data on it. | Удалить ВМ и все данные на ней (безвозвратно) |
-| `deploy_plan` | `evo deploy plan` | нет | — | Step 1 of the deploy wizard, read-only: resolves a VM configuration (flavor, image, zone, disk, network, SSH) with its monthly cost and a plan_id (cost.source … | Шаг 1 мастера развёртывания: рассчитать ВМ и её цену, ничего не создавая |
+| `deploy_plan` | `evo deploy plan` | нет | — | Read-only VM plan: flavor, image, zone, disk, network, SSH, monthly cost and plan_id (cost.source: the Cloud.ru price API, else a rate-card estimate; an image … | Шаг 1 мастера развёртывания: рассчитать ВМ и её цену, ничего не создавая |
 | `deploy_apply` | `evo deploy apply` | да | `plan_id` | Creates only the VM, without the application, from a plan of deploy_plan (STEP 2 of the deploy wizard): a compose project goes through deploy. | Создать только ВМ по плану, без приложения (шаг 2 мастера; compose запускает evo deploy) |
 | `open_ports` | `evo vpc open-ports` | да | `security_group`, `ports` | Open inbound ports on a Cloud.ru security group (add ingress rules, tcp, from 0.0.0.0/0 by default). | Открыть входящие порты в группе безопасности |
-| `close_ports` | `evo vpc close-ports` | да | `security_group`, `ports` | Close inbound ports on a Cloud.ru security group: delete the ingress rules of the ports given (tcp, from 0.0.0.0/0 by default). | Закрыть входящие порты в группе безопасности |
+| `close_ports` | `evo vpc close-ports` | да | `security_group`, `ports` | Delete ingress rules for the given ports in a Cloud.ru security group (defaults: tcp, 0.0.0.0/0). | Закрыть входящие порты в группе безопасности |
 
 ## disk
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `list_disk_types` | `evo disk types` | нет | — | List available Cloud.ru disk types (UUID + name, e.g. | Типы дисков (UUID и имя, например SSD или HDD) |
 | `disk_list` | `evo disk list` | нет | — | List block-storage disks (id, name, size_gb, state, disk_type, zone, attached VMs). | Диски: id, имя, размер, состояние, тип, зона, к каким ВМ подключены |
@@ -114,7 +118,7 @@
 
 ## dns
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `dns_zones` | `evo dns zones` | нет | — | List DNS zones in the project, public and private (id, name, domain, visibility, state, confirm_state of a public zone, valid, delegated). | Зоны DNS проекта: публичные и приватные |
 | `dns_zone_get` | `evo dns zone-get` | нет | `id` | Get full details of one DNS zone by id (from dns_zones). | Зона DNS по ID: все сведения |
@@ -128,29 +132,29 @@
 
 ## iam
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `iam_service_accounts` | `evo iam service-accounts` | нет | — | List IAM service accounts for a project (id, name, email, type, enabled). | Сервисные аккаунты IAM проекта |
 
 ## image
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `image_list` | `evo image list` | нет | — | Search the VM image catalogue: OS images (type public), Marketplace products (marketplace), the project's own images (private). | Поиск образов: ОС (public), маркетплейс (marketplace), образы проекта (private) |
 | `marketplace_list` | `evo marketplace list` | нет | — | Read-only: what Cloud.ru offers to deploy, in one list: shared-catalogue VM images and Managed Kubernetes addons. | Витрина: ОС, продукты маркетплейса и плагины Kubernetes одним списком, с командой развёртывания |
 | `list_images` | `evo list-images` | нет | — | List available Cloud.ru VM boot images (UUID + name). | Загрузочные образы ВМ (UUID и имя) |
-| `image_create` | `evo image create` | да | `name`, `disk_id` | Create a VM image from a bootable disk. | Создать образ ВМ из загрузочного диска (платно, асинхронно) |
+| `image_create` | `evo image create` | да | `name`, `disk_id` | Create a VM image from a detached bootable disk (disk_detach; disk_list: 'available'). | Создать образ ВМ из загрузочного диска (платно, асинхронно) |
 | `image_get` | `evo image get` | нет | `image` или `image_id` | Get one VM image by name, display name or UUID (exact name, exact display_name, then a unique substring; several matches: USAGE with candidates[]). | Образ по имени или UUID: минимум ресурсов, зоны, поля и кто их заполнит, команда создания ВМ |
 | `image_delete` | `evo image delete` | удаляет | `image_id` | Delete a VM image. | Удалить образ ВМ |
 
 ## k8s
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `k8s_list` | `evo k8s list` | нет | — | List Managed Kubernetes (mk8s) clusters in the project (id, name, status). | Кластеры Managed Kubernetes проекта |
 | `k8s_get` | `evo k8s get` | нет | `cluster_id` | Get a Managed Kubernetes cluster by id (full details incl. | Кластер Managed Kubernetes по ID |
 | `k8s_options` | `evo k8s options` | нет | — | List available Kubernetes versions (by release channel), node flavors and zones for mk8s; a flavor's purpose (CONTROLPLANE/DATAPLANE) when named. | Версии Kubernetes, flavor узлов и зоны для кластеров |
-| `k8s_plan` | `evo k8s plan` | нет | — | Step 1 for Managed Kubernetes: resolve a cluster config (version, control-plane flavor, master count, subnet, service account) without creating anything. | Шаг 1: рассчитать конфигурацию кластера, ничего не создавая |
+| `k8s_plan` | `evo k8s plan` | нет | — | Preview Managed Kubernetes version, control-plane flavor, master count, subnet and service account. | Шаг 1: рассчитать конфигурацию кластера, ничего не создавая |
 | `k8s_create` | `evo k8s create` | да | — | STEP 2 for Managed Kubernetes: create the cluster resolved by k8s_plan, with the same args. | Шаг 2: создать кластер по расчёту k8s plan (платно, асинхронно, около 10 минут) |
 | `k8s_kubeconfig` | `evo k8s kubeconfig` | побочно | `cluster_id` | Get the kubeconfig of a Managed Kubernetes cluster. | kubeconfig кластера (по умолчанию со встроенным токеном примерно на час) |
 | `k8s_delete` | `evo k8s delete` | удаляет | `cluster_id` | Permanently delete a Managed Kubernetes cluster. | Удалить кластер Managed Kubernetes (асинхронно) |
@@ -162,14 +166,14 @@
 | `k8s_add_nodepool` | `evo k8s add-nodepool` | да | `cluster_id` | Add a worker node pool to a Managed Kubernetes cluster (pods need workers; a fresh cluster has none). | Добавить группу рабочих узлов (платно, асинхронно) |
 | `k8s_addons` | `evo k8s addons` | нет | — | Search the Managed Kubernetes addon catalogue (ingress, cert-manager, monitoring, CSI drivers, …). | Каталог плагинов Kubernetes: поиск по имени и описанию, категория, платность |
 | `k8s_addon_versions` | `evo k8s addon-versions` | нет | `name` | Releases of one Managed Kubernetes addon, newest first: version (appVersion, what k8s_add_addon takes), addon_version, mode (ACTIVE, EXPERIMENTAL … | Версии плагина: режим поддержки, требования к кластеру, схема настроек |
-| `k8s_add_addon` | `evo k8s add-addon` | удаляет | `cluster_id`, `name` | Install a Managed Kubernetes addon release into a cluster. | Установить плагин в кластер (асинхронно; версия по умолчанию — последняя активная) |
+| `k8s_add_addon` | `evo k8s add-addon` | удаляет | `cluster_id`, `name` | Install a Managed Kubernetes addon. | Установить плагин в кластер (асинхронно; версия по умолчанию — последняя активная) |
 | `k8s_kubectl` | `evo k8s kubectl` | удаляет | `cluster_id`, `args` | Run any kubectl command on a cluster (the token is embedded). | Команда kubectl в кластере (изменяющие — с подтверждением) |
 | `k8s_apply` | `evo k8s apply` | удаляет | `cluster_id`, `manifest` | Apply a Kubernetes manifest (YAML/JSON, may be multi-document) to a cluster, like `kubectl apply -f -`. | Применить манифест Kubernetes (как kubectl apply -f -) |
 | `k8s_helm` | `evo k8s helm` | удаляет | `cluster_id`, `action` | Helm on a cluster: install/upgrade/uninstall require confirmed=true after the user approves. | Helm в кластере: install, upgrade, uninstall, list, status |
 
 ## kafka
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `kafka_list` | `evo kafka list` | нет | — | List Managed Kafka clusters (id, name, status, brokers, version). | Кластеры Managed Kafka проекта |
 | `kafka_get` | `evo kafka get` | нет | `cluster_id` | Get a Managed Kafka cluster by id (status, kafka_hosts, brokers, version). | Кластер Kafka по ID: состояние, адреса, брокеры, версия |
@@ -181,14 +185,14 @@
 
 ## monitoring
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `metrics_history` | `evo metrics history` | нет | `match` | Read a metric's history over a recent window: time series {metric labels, values, timestamps}. | История метрики за недавний период (Service Monitoring) |
 | `metrics_scrape` | `evo metrics scrape` | нет | — | Service Monitoring — current metric values in Prometheus text exposition (read-only snapshot of all/matched metrics right now). | Текущие значения метрик в текстовом формате Prometheus |
 
 ## nlb
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `lb_list` | `evo lb list` | нет | — | List L4 load balancers in the project (id, name, status, vpc, external_ip). | Балансировщики нагрузки проекта (L4) |
 | `lb_get` | `evo lb get` | нет | `id` | Get full details of one load balancer by id (from lb_list): rules, listeners, addresses, AZs, status. | Балансировщик по ID: правила, обработчики, адреса, зоны |
@@ -202,14 +206,14 @@
 
 ## org
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `org_projects` | `evo org projects` | нет | — | List Cloud.ru projects visible to the caller (id, name, status, org unit) and the active project (active). | Проекты Cloud.ru, которые видит ключ доступа |
 | `org_quotas` | `evo org quotas` | нет | — | List quota usages (resource code, its name, unit and product where the quota-type catalogue names them, limit, current usage) — for capacity planning. | Квоты: ресурс, лимит, текущее использование |
 
 ## pg
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `pg_list` | `evo pg list` | нет | — | List Managed PostgreSQL clusters in the project (id, name, status, version, health). | Кластеры Managed PostgreSQL проекта |
 | `pg_get` | `evo pg get` | нет | `id` или `cluster_id` | Get full details of one Managed PostgreSQL cluster by id (from pg_list): version, instances, storage, connection_string, subnets, status, access (placed in its … | Кластер PostgreSQL по ID: версия, хранилище, строка подключения, состояние |
@@ -229,7 +233,7 @@
 
 ## redis
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `redis_list` | `evo redis list` | нет | — | List Managed Redis clusters (id, name, status, type, shards, replicas). | Кластеры Managed Redis проекта |
 | `redis_get` | `evo redis get` | нет | `cluster_id` | Get a Managed Redis cluster by id (status, redis_hosts, type, shards, replicas). | Кластер Redis по ID: состояние, адреса, тип, шарды, реплики |
@@ -241,7 +245,7 @@
 
 ## s3
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `s3_buckets` | `evo s3 buckets` | нет | — | List Object Storage (S3) buckets. | Бакеты Object Storage |
 | `s3_ls` | `evo s3 ls` | нет | `bucket` | List objects in an S3 bucket (key, size, last_modified). | Объекты бакета: ключ, размер, время изменения |
@@ -253,7 +257,7 @@
 
 ## secret
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `secret_list` | `evo secret list` | нет | — | List secrets in the project (id, name, path, description) from Cloud.ru Secret Management. | Секреты проекта (без значений) |
 | `secret_get` | `evo secret get` | нет | `path` | Get one secret's metadata by path (from secret_list): folder, labels, versions, KMS key. | Метаданные секрета: папка, метки, версии, ключ KMS (без значения) |
@@ -264,7 +268,7 @@
 
 ## snat
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `snat_list` | `evo snat list` | нет | — | List SNAT gateways of the project. | SNAT-шлюзы проекта |
 | `snat_create` | `evo snat create` | да | `name` | Create a public SNAT gateway: outbound internet for every routed subnet of its zone (an isolated subnet is not served; a VM with its own public IP goes out … | Создать публичный SNAT-шлюз: исходящий интернет для подсетей зоны (платно) |
@@ -272,7 +276,7 @@
 
 ## stack
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `stack_plan` | `evo stack plan` | нет | `manifest` | Plan a multi-resource stack from one declarative manifest. | Спланировать стек ресурсов по одному манифесту (ничего не создаёт) |
 | `stack_apply` | `evo stack apply` | да | `job_id` | Apply a planned stack (from stack_plan). | Создать ресурсы спланированного стека (платно) |
@@ -281,7 +285,7 @@
 
 ## vm
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `provision` | `evo vm create` | да | — | Provision a bare VM (docker-compose: use 'deploy'). | Создать ВМ (по умолчанию с floating IP; без внешнего адреса — --no-public-ip) |
 | `vm_get` | `evo vm get` | нет | `vm_id` или `name` | Live details of one VM by vm_id or name: private_ip, public_ip (public or floating), state, every network interface with its security groups and subnet. | ВМ по ID или имени: внутренний и внешний IP, состояние, интерфейсы |
@@ -296,7 +300,7 @@
 
 ## vpc
 
-| Инструмент | Команда консольной утилиты | Меняет | Обязательные аргументы | Описание | Описание (RU) |
+| Инструмент | Команда CLI | Меняет | Обязательные аргументы | Описание | Описание (RU) |
 |---|---|---|---|---|---|
 | `fip_attach` | `evo vpc fip-attach` | да | `fip`, `vm` | Bind an existing FREE floating IP to a VM's primary interface, giving it a public address. | Привязать свободный floating IP к основному интерфейсу ВМ |
 | `list_subnets` | `evo vpc subnets` | нет | — | List Cloud.ru subnets (UUID, name, availability zone). | Подсети: UUID, имя, зона доступности |

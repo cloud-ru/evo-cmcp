@@ -31,6 +31,12 @@ import (
 // consent at the engine's gate, the table of status, the error as the
 // engine gave it, doctor's checks of this machine.
 
+// engineCommand is one engine command: the tool it calls, the tool argument
+// each of its flags gives (Flags), the flags that give none (CLIOnly) and
+// the arguments it has no flag for (Omit), each with the reason. Alias,
+// when set, says why the command is a second command of its tool: the
+// tool's own command is the one its CLISpec names. TestParity_EngineCommands
+// keeps the table, the commands and the schemas in step.
 type engineCommand struct {
 	Path    string
 	Tool    string
@@ -51,7 +57,7 @@ var engineCommands = []engineCommand{
 		Flags: map[string]string{"no-refresh": "refresh"}},
 	{Path: "evo logs", Tool: "logs",
 		Flags:   map[string]string{"service": "service", "tail": "tail"},
-		CLIOnly: map[string]string{"follow": "журнал потоком до Ctrl-C: потоковых ответов в MCP нет"}},
+		CLIOnly: map[string]string{"follow": "журнал потоком до Ctrl-C: потоковых ответов в MCP нет (spec.md, не-цели; Q7)"}},
 	{Path: "evo destroy", Tool: "destroy",
 		Alias:   "удаляет ВМ развёртывания этого каталога (destroy без vm_id и name); ВМ по ID или имени удаляет evo vm delete",
 		CLIOnly: map[string]string{"force": "устаревший синоним --yes, скрыт из справки; удаляется в v2.0"},
@@ -65,7 +71,8 @@ var engineCommands = []engineCommand{
 		Alias: "алиас evo org projects; до v2.0 ответ Organization API с ошибкой — пометка, а не ошибка, как с v1.0"},
 	{Path: "evo whoami", Tool: "whoami"},
 	{Path: "evo agent skill", Tool: "agent_skill",
-		Flags:   map[string]string{"group": "group"},
+		Flags: map[string]string{"group": "group"},
+
 		CLIOnly: map[string]string{"read-only": "правила скилла для сервера --read-only: текст без --group — правила для агента с терминалом, у инструмента его нет"}},
 	{Path: "evo doctor", Tool: "doctor"},
 	{Path: "evo history", Tool: "history", Flags: map[string]string{"since": "since", "project-id": "project_id", "check": "check"}},
@@ -92,6 +99,8 @@ func engineCommandOf(tool string) (engineCommand, bool) {
 	return engineCommand{}, false
 }
 
+// engineCmd marks cmd as the command of the engine tool: the annotation of
+// the trees, for TestParity_CommandsAndTools.
 func engineCmd(cmd *cobra.Command, tool string) *cobra.Command {
 	if cmd.Annotations == nil {
 		cmd.Annotations = map[string]string{}
@@ -126,18 +135,25 @@ func callEngineTool(cmd *cobra.Command, tool string, args map[string]any, c *too
 		return text, nil
 	}
 	if c.Err != nil {
-		return text, withAnswerDetails(c.Err, text)
+		return text, withAnswerDetails(c.Err, text, tool)
 	}
 	return text, toolError(text, commandHints(cmd, nil))
 }
 
-func withAnswerDetails(err error, text string) error {
+func withAnswerDetails(err error, text, tool string) error {
 	m := parseObject(text)
 	var ce *clerrors.CLIError
 	if m == nil || !stderrors.As(err, &ce) {
 		return err
 	}
 	add := map[string]any{}
+	if tool == "destroy" && m["cleanup_pending"] == true {
+		for _, k := range []string{"vm_id", "floating_ip_id", "cleanup_pending", "status"} {
+			if v, ok := m[k]; ok && !(k == "status" && v == "error") {
+				add[k] = v
+			}
+		}
+	}
 	if m["access_denied"] == true {
 		add["access_denied"], add["http_status"] = m["access_denied"], m["http_status"]
 	}
@@ -273,6 +289,10 @@ compose file changed (with --force, even if it did not).`, `Развернуть
 	cmd.Flags().BoolVar(&nonInteractive, "non-interactive", false, i18n.T("Never prompt; creating a VM, and updating the VM of an existing deployment, then requires --yes",
 		"Никогда не спрашивать; тогда и для создания ВМ, и для обновления ВМ развёртывания нужен --yes"))
 
+	// evo deploy is an action and the group of the deploy wizard (plan,
+	// apply, list: the trees add them) at once (spec.md R7): an argument
+	// that is no subcommand ('evo deploy pln') is "unknown command", as it
+	// was with cobra.NoArgs, now with a suggestion.
 	cmd.SuggestionsMinimumDistance = 2
 	cmd.Args = unknownSubcommand
 
@@ -558,8 +578,10 @@ func newProjectListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: i18n.T("List the projects the key sees (* — the active one)", "Проекты, которые видит ключ (* — активный)"),
+		Long: i18n.T("List visible projects. If the Organization API returns an HTTP error, this command exits 0 with projects: null and the locally selected project in active. Scripts that need the cloud list should check that projects is an array.",
+			"Проекты, которые видит ключ. При HTTP-ошибке Organization API команда возвращает код 0, projects: null и локально выбранный проект в active. Если скрипту нужен список из облака, проверьте, что projects — массив."),
 		Example: `  evo project list
-  evo project list --json | jq -r '.projects[].id'`,
+  evo project list --json | jq -e '(.projects | type) == "array"'`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printer := output.New(flagJSON, flagNoColor)
@@ -587,6 +609,11 @@ func newProjectListCmd() *cobra.Command {
 			switch {
 			case err == nil:
 			case tools.OrganizationAnswered(c.Err):
+				// The Organization API answered with an error: since v1.0
+				// this command takes any such answer as "the key cannot
+				// list projects" — a note and the active project, exit 0
+				// (QA r3 C3); org_projects does so for 400, 403 and 404.
+				// So until v2.0.
 				cfg, cerr := resolveConfig(printer, scopeOverrides())
 				if cerr != nil {
 					return cerr

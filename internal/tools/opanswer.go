@@ -20,6 +20,10 @@ import (
 
 type resourceRead struct{ tool, arg, noState, noStateRU string }
 
+// operationReads are the reads of each *_operation's resource, tried in
+// order: an NLB operation is of a balancer or of a target group, a DNS one
+// of a zone or of a record (TestOperation_EveryOperationDeclared keeps the
+// table closed).
 var operationReads = map[string][]resourceRead{
 	"ar_operation":    {{"ar_get", "id", "", ""}},
 	"cert_operation":  {{"cert_get", "id", "the state of a certificate is the object issueState, not a word of the answer", "состояние сертификата — объект issueState, а не слово ответа"}},
@@ -41,6 +45,7 @@ func (s *Registry) operation(ctx context.Context, tool string, args map[string]a
 			return nil, err
 		}
 		m := opToMap(op)
+
 		for _, k := range decls[tool].Untrusted.own {
 			delete(m, k)
 		}
@@ -49,7 +54,7 @@ func (s *Registry) operation(ctx context.Context, tool string, args map[string]a
 	var m map[string]any
 	var err error
 	if w := pgInt(args, "wait_seconds", 0); w > 0 {
-		m, err = waitForOpJSON(ctx, w, fetch)
+		m, err = waitForOpJSON(ctx, min(w, opWaitMaxSeconds), fetch)
 	} else {
 		m, err = fetch(ctx)
 	}
@@ -78,6 +83,7 @@ func quotaFailure(tool string, m map[string]any) {
 	m["details"] = details
 	hint := quotaHint(true)
 	if m["resource_status"] == "FAILED" {
+
 		if del := failedDeletes[tool]; del != "" {
 			hint += " " + i18n.Tf("The resource is left FAILED. What to do with it is the person's decision: %s removes it after their approval; a database cluster in FAILED may not be deletable through the API — then the Cloud.ru console or support.",
 				"Ресурс остался в FAILED. Что с ним делать — решает человек: %s удаляет его после его согласия; кластер базы в FAILED через API может не удалиться — тогда консоль Cloud.ru или поддержка.", del)
@@ -195,6 +201,7 @@ func (s *Registry) goingOn(ctx context.Context, ans map[string]any, opTool, opID
 			m["resource_status_note"] = note + i18n.T(" — do not create it again", " — не создавайте его повторно")
 		}
 	}
+
 	if m["resource_status"] == nil && m["resource_status_error"] == nil && m["resource_status_note"] == nil {
 		m["resource_status_error"] = clierrors.CodeAPIError
 		m["resource_status_note"] = noStateRead(id)
@@ -298,6 +305,7 @@ func (s *Registry) addResourceStatus(ctx context.Context, tool string, m map[str
 				return
 			}
 		}
+
 		if r.noState != "" {
 			m["resource_status_note"] = i18n.T(fmt.Sprintf("%s finds the resource; it has no state to name: %s", r.tool, r.noState),
 				fmt.Sprintf("%s находит ресурс; состояния у него нет: %s", r.tool, r.noStateRU))
@@ -315,6 +323,7 @@ func (s *Registry) addResourceStatus(ctx context.Context, tool string, m map[str
 		reads = append(reads, r.tool)
 	}
 	m["resource_status"] = "not_found"
+
 	if done, _ := m["done"].(bool); !done {
 		m["resource_status_note"] = i18n.Tf("%s does not find %s yet: while the operation goes on, its resource may not be shown yet; the read of the operation says when it ends",
 			"%s пока не находит %s: пока операция идёт, её ресурс может быть ещё не виден; чтение операции скажет, когда она кончится",

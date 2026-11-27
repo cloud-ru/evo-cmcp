@@ -64,7 +64,7 @@ evo version
 
 | Переменная | Что задаёт | По умолчанию |
 |---|---|---|
-| `CLOUDRU_VM_VERSION` | тег релиза, например `v1.9.0` | последний стабильный; pre-release (`-rc.N`) надо назвать явно |
+| `CLOUDRU_VM_VERSION` | тег релиза, например `v1.9.1` | последний стабильный; pre-release (`-rc.N`) надо назвать явно |
 | `INSTALL_DIR` | каталог для бинаря | `~/.local/bin`, под root `/usr/local/bin` |
 | `CLOUDRU_VM_BASE_URL` | откуда качать вместо GitHub (зеркало); ожидается `<base>/<тег>/<файл>` | GitHub Releases |
 | `EVO_ZSHRC` | `0` — не дописывать блок автодополнения в `~/.zshrc`, а напечатать его строки (шаг 5) | блок дописывается, если оболочка — zsh и в `$fpath` нет каталога в домашнем |
@@ -72,7 +72,7 @@ evo version
 ```sh
 # конкретная версия, в свой каталог
 curl -fsSL https://raw.githubusercontent.com/cloud-ru/evo-cmcp/main/install.sh \
-  | CLOUDRU_VM_VERSION=v1.9.0 INSTALL_DIR="$HOME/bin" sh
+  | CLOUDRU_VM_VERSION=v1.9.1 INSTALL_DIR="$HOME/bin" sh
 ```
 
 Без `CLOUDRU_VM_VERSION` скрипт ставит последний стабильный релиз; кандидаты
@@ -95,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/cloud-ru/evo-cmcp/main/install.sh |
 
 ```sh
 # OS: linux | darwin; ARCH: amd64 | arm64
-V=1.3.0; OS=linux; ARCH=amd64
+V=1.9.1; OS=linux; ARCH=amd64
 base=https://github.com/cloud-ru/evo-cmcp/releases/download/v$V
 curl -fLO "$base/evo_${V}_${OS}_${ARCH}.tar.gz"
 curl -fLO "$base/checksums.txt"
@@ -120,8 +120,8 @@ v2.0, см. [rename.md](rename.md)). Нужен он,
    `checksums.txt`:
 
    ```powershell
-   (Get-FileHash .\evo_1.3.0_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
-   Select-String -Path .\checksums.txt -Pattern windows_amd64
+   (Get-FileHash .\evo_1.9.1_windows_amd64.zip -Algorithm SHA256).Hash.ToLower()
+   Select-String -Path .\checksums.txt -Pattern 'windows_amd64\.zip$'
    ```
 
 3. Распакуйте `evo.exe`, например, в `%LOCALAPPDATA%\Programs\evo`
@@ -150,7 +150,7 @@ v2.0, см. [rename.md](rename.md)). Нужен он,
 Rekor. Ключей у проекта нет — проверяется *кто* подписал (identity workflow).
 
 ```sh
-V=v1.9.0
+V=v1.9.1
 cosign verify-blob --bundle checksums.txt.sigstore.json \
   --certificate-identity "https://github.com/shatim-ops/evo-cli/.github/workflows/release.yml@refs/tags/$V" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -268,5 +268,5 @@ git clone https://github.com/cloud-ru/evo-cmcp && cd evo-cmcp
 go build -o bin/evo ./cmd/evo
 ```
 
-Нужен Go версии из `go.mod` (CI собирает на Go 1.26.10). `evo version`
+Нужен Go версии из `go.mod` (CI собирает на Go 1.26.11). `evo version`
 у такой сборки показывает версию модуля и коммит из данных VCS.

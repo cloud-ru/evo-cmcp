@@ -25,6 +25,7 @@ import (
 	"github.com/cloud-ru/evo-cmcp/internal/confirm"
 	"github.com/cloud-ru/evo-cmcp/internal/engine"
 	clerrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 	"github.com/cloud-ru/evo-cmcp/internal/output"
 	"github.com/cloud-ru/evo-cmcp/internal/pager"
@@ -223,6 +224,11 @@ func runConfigure(ctx context.Context, opts configureOptions, con *console, prin
 	if con.interactive {
 		fmt.Fprintf(con.out, i18n.T("Configuring profile %q in %s\n", "Настройка профиля %q в %s\n"), name, config.Dir())
 	}
+	// No terminal and no flag at all: nothing to change. With a stored key
+	// this used to re-save the profile unchanged and answer «Профиль
+	// сохранён» with exit 0 — in CI a forgotten --secret-stdin went
+	// unnoticed (QA r4 Q11). --project-id or --region alone still update
+	// just them with the stored key.
 	if !con.interactive && !opts.secretStdin && opts.keyID == "" && opts.projectID == "" && opts.region == "" {
 		return errNeedKey()
 	}
@@ -335,6 +341,9 @@ type orgProject struct {
 	Status string `json:"status"`
 }
 
+// listProjects calls the Organization API with an IAM token and reads
+// every page (#98): the answer carries next_page_token, the next request
+// sends page_token (api.op.v3.yaml).
 func listProjects(ctx context.Context, token string) ([]orgProject, error) {
 	var all []orgProject
 	// An empty page ends the list of the Organization API (IAM-10).
@@ -366,7 +375,16 @@ func listProjectsPage(ctx context.Context, token, pageToken string) ([]orgProjec
 			clerrors.NetworkHint(err, i18n.T("Check your network connection, or pass --project-id", "Проверьте сеть или передайте --project-id")), err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// Keep the original cap on error details. Successful pages have no size cap here.
+	var limit int64
+	if resp.StatusCode >= 400 {
+		limit = 64 << 10
+	}
+	body, status, err := httpretry.ReadAPIResponse(req, resp, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	err = pager.PageStatus(status, body, pageToken != "", func(status int, body []byte) error {
 		code := clerrors.CodeAPIError
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			code = clerrors.CodeAuthFailed
@@ -375,24 +393,28 @@ func listProjectsPage(ctx context.Context, token, pageToken string) ([]orgProjec
 		var apiErr struct {
 			Message string `json:"message"`
 		}
-		if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&apiErr) == nil && apiErr.Message != "" {
+		if json.Unmarshal(body, &apiErr) == nil && apiErr.Message != "" {
 			msg += ": " + apiErr.Message
 		}
 		// Observed 2026-10-14: for a service account the API answers
 		// 400 "(user_id) is invalid argument: user not found".
-		return nil, "", clerrors.New(code, msg,
+		return clerrors.New(code, msg,
 			i18n.T("The Organization API may not list projects for this key; pass --project-id (find it in the Cloud.ru console)",
 				"Organization API может не отдавать список проектов для этого ключа; передайте --project-id (он есть в консоли Cloud.ru)"))
+	})
+	if err != nil {
+		return nil, "", err
 	}
-	var body struct {
-		Projects      []orgProject `json:"projects"`
-		NextPageToken string       `json:"next_page_token"`
+	projects, next, err := pager.ObjectPage[orgProject](body, "projects", "next_page_token")
+	if err != nil {
+		return nil, "", err
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, "", clerrors.Wrap(clerrors.CodeAPIError, i18n.T("unexpected response from the Organization API", "неожиданный ответ Organization API"),
-			i18n.T("Pass --project-id", "Передайте --project-id"), err)
+	for _, project := range projects {
+		if strings.TrimSpace(project.ID) == "" {
+			return nil, "", pager.Incomplete(i18n.T("project without an ID", "проект без ID"))
+		}
 	}
-	return body.Projects, body.NextPageToken, nil
+	return projects, next, nil
 }
 
 // chooseProject picks the project for the profile: the only one, the

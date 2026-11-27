@@ -16,10 +16,10 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,6 +28,7 @@ import (
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 )
 
 const defaultBaseURL = "https://audit.api.cloud.ru"
@@ -67,8 +68,7 @@ func (c *Client) do(ctx context.Context, path string, q url.Values) ([]byte, int
 		return nil, 0, fmt.Errorf(i18n.T("audit request failed: %w", "запрос к audit не удался: %w"), err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return data, resp.StatusCode, nil
+	return httpretry.ReadAPIResponse(req, resp, 0)
 }
 
 // MaxPageSize is the largest limit the API takes.
@@ -120,7 +120,9 @@ func apiError(status int, body []byte) error {
 type EventPage struct {
 	Events        []map[string]any `json:"events"`
 	NextPageToken string           `json:"nextPageToken"`
-	Logs          []map[string]any `json:"logs,omitempty"`
+	// Logs is the array the spec (audit openapi-v3) names; Events is what
+	// evo read so far. List accepts either spelling (api-contract §4.2).
+	Logs []map[string]any `json:"logs,omitempty"`
 }
 
 // ListOptions filter an audit-events query. Start/End are RFC3339 (required by
@@ -154,22 +156,23 @@ func (c *Client) List(ctx context.Context, opts ListOptions) (*EventPage, error)
 	if err != nil {
 		return nil, err
 	}
-	if status < 200 || status >= 300 {
-		return nil, apiError(status, data)
+	if err := pager.PageStatus(status, data, opts.PageToken != "", apiError); err != nil {
+		return nil, err
 	}
 	page := &EventPage{}
-	// Tolerate {events:[…],nextPageToken} or a bare array.
-	trimmed := strings.TrimSpace(string(data))
-	if strings.HasPrefix(trimmed, "[") {
-		_ = json.Unmarshal(data, &page.Events)
-		return page, nil
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("[")) {
+		page.Events, err = pager.ObjectRows[map[string]any](data, "events")
+	} else {
+		page.Events, page.NextPageToken, err = pager.ObjectPage[map[string]any](data, "logs", "nextPageToken", pager.PageFields{Items: "events"})
+		if err == nil && page.Events == nil {
+			err = pager.Incomplete(i18n.T("audit page has no logs or events array", "на странице аудита нет массива logs или events"))
+		}
 	}
-	if err := json.Unmarshal(data, page); err != nil {
+	if err != nil {
 		return nil, fmt.Errorf(i18n.T("parse audit events: %w", "разбор событий аудита: %w"), err)
 	}
-	if len(page.Events) == 0 && len(page.Logs) > 0 {
-		page.Events = page.Logs
+	if page.NextPageToken != "" && page.NextPageToken == opts.PageToken {
+		return nil, pager.RepeatedToken(page.NextPageToken)
 	}
-	page.Logs = nil
 	return page, nil
 }

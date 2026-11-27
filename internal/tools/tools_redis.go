@@ -108,6 +108,7 @@ func (s *Registry) planRedisCreate(ctx context.Context, args map[string]any) (*P
 	if name == "" {
 		return nil, usageErr("'name' is required", "нужен 'name'")
 	}
+
 	rtype, shards, replicas, err := redisShape(args)
 	if err != nil {
 		return answered(usageResult(err), true), nil
@@ -116,7 +117,7 @@ func (s *Registry) planRedisCreate(ctx context.Context, args map[string]any) (*P
 	if err != nil {
 		return nil, err
 	}
-	existing, err := cli.ListClusters(ctx, url.Values{})
+	existing, err := namedResources(cli.ListClusters(ctx, url.Values{}))
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("check the name is free: list clusters: %w", "проверка, что имя свободно: список кластеров: %w"), err)
 	}
@@ -127,6 +128,7 @@ func (s *Registry) planRedisCreate(ctx context.Context, args map[string]any) (*P
 	versionID := stringArg(args, "version_id")
 	vers, e := cli.ListVersions(ctx, url.Values{})
 	if versionID != "" {
+
 		if e == nil {
 			if err := notInCatalogue(i18n.T("Redis version", "версии Redis"), versionID, listed(vers, "id"), "redis_versions"); err != nil {
 				return nil, err
@@ -208,7 +210,9 @@ func (s *Registry) planRedisCreate(ctx context.Context, args map[string]any) (*P
 			if err == nil {
 				err = noID("operation")
 			}
-			list := func(ctx context.Context) ([]map[string]any, error) { return cli.ListClusters(ctx, url.Values{}) }
+			list := func(ctx context.Context) ([]map[string]any, error) {
+				return namedResources(cli.ListClusters(ctx, url.Values{}))
+			}
 			return lostCreate(ctx, "redis_create", list, i18n.T("Redis cluster", "кластер Redis"), name, willCreate, "redis_get cluster_id", fmt.Errorf(i18n.T("create cluster: %w", "создание кластера: %w"), err))
 		}
 		out := map[string]any{"status": "creating", "operation_id": op.ID, "cluster_id": op.ResourceID,

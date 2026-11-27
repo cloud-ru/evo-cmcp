@@ -51,6 +51,7 @@ func uncodedReason(err error, fields map[string]any) string {
 	answer := strings.ToLower(toJSON(fields) + " " + err.Error())
 	notFound := strings.Contains(answer, "not found") || strings.Contains(answer, "не найден")
 	if st := apiStatus(err); st != 0 {
+
 		switch {
 		case st == http.StatusNotFound:
 			return clierrors.CodeNotFound
@@ -76,6 +77,7 @@ func uncodedReason(err error, fields map[string]any) string {
 		}
 		return clierrors.CodeAPIError
 	}
+
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
 	if (stderrors.As(err, &syntaxErr) || stderrors.As(err, &typeErr)) && parseAnswerRE.MatchString(answer) {
@@ -111,7 +113,7 @@ func uncodedHint(err error, reason string) string {
 		case http.StatusUnauthorized:
 			return clierrors.TokenRejectedHint()
 		case http.StatusForbidden:
-			// Object Storage is reached with keys of its own (Ц-3).
+
 			var se minio.ErrorResponse
 			if stderrors.As(err, &se) {
 				return clierrors.S3AccessHint()
@@ -139,6 +141,11 @@ var operationFailedRE = regexp.MustCompile(`\boperation\b[^"]*\bfailed\b`)
 func definiteRefusal(err error) bool {
 	return intent.DefiniteRefusal(apiStatus(err))
 }
+
+// Some clients return only a service label, an HTTP status and the body.
+// Frame the body (including an empty one after the colon). A standalone
+// technical status such as HTTP 500 keeps its original CLI text.
+var bareServiceStatus = regexp.MustCompile(`^(?:[A-Za-z0-9_.-]+ API(?:: HTTP)?|HTTP) [1-5][0-9]{2}:`)
 
 // apiStatus is the HTTP status of the API answer behind err, 0 without one.
 func apiStatus(err error) int {

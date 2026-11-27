@@ -6,7 +6,6 @@ package engine
 import (
 	"context"
 
-	"github.com/cloud-ru/evo-cmcp/internal/config"
 	clerrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 	"github.com/cloud-ru/evo-cmcp/internal/state"
@@ -15,10 +14,7 @@ import (
 // Maker is the key evo now runs with, as a deployment record keeps it;
 // nil without a key.
 func (e *Engine) Maker() *state.Maker {
-	if e.Config.KeyID == "" {
-		return nil
-	}
-	return &state.Maker{ServiceAccountID: e.Config.ServiceAccountID, KeyID: config.MaskKeyID(e.Config.KeyID)}
+	return state.NewMaker(e.Config.ServiceAccountID, e.Config.KeyID)
 }
 
 func (e *Engine) NotVisibleToThisKey(rec state.DeploymentRecord) error {

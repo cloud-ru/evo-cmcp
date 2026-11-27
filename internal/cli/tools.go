@@ -101,7 +101,10 @@ func newToolsCmd() *cobra.Command {
 Tools that create paid resources or delete data ask for confirmation the same
 way as the other commands: a prompt on a terminal, --yes to confirm in
 advance, --dry-run to see the preview only; without a terminal and without
---yes the call stops with exit code 3.`, `Любая операция MCP-сервера доступна здесь как инструмент.
+--yes the call stops with exit code 3. The CLI uses Russian by default and
+English with EVO_LANG=en for tool descriptions, result messages and diagnostics.
+With --json, evo's messages are in English; JSON keys and status codes stay the
+same. The service's own text is passed through in its original language.`, `Любая операция MCP-сервера доступна здесь как инструмент.
 
   evo tools list [--group vm]
   evo tools describe vm_get
@@ -110,8 +113,10 @@ advance, --dry-run to see the preview only; without a terminal and without
 Инструменты, которые создают платные ресурсы или удаляют данные, спрашивают
 подтверждение так же, как остальные команды: вопрос на терминале, --yes —
 согласие заранее, --dry-run — только превью; без терминала и без --yes вызов
-завершается с кодом 3. Описания инструментов — по-русски (с EVO_LANG=en — по-английски,
-как их видит агент в MCP); ответы инструментов — на английском, как в MCP.`),
+завершается с кодом 3. Описания инструментов, сообщения в результатах
+и диагностика evo по умолчанию русские, с EVO_LANG=en — английские.
+С --json сообщения evo английские. Ключи JSON и коды статусов одинаковы
+в обоих языках. Собственный текст сервиса передаётся на языке источника.`),
 	})
 	cmd.AddCommand(newToolsListCmd(), newToolsDescribeCmd(), newToolsCallCmd())
 	return cmd
@@ -354,6 +359,7 @@ func schemaParams(t tools.Tool) []param {
 func lookupTool(reg *tools.Registry, name string) (tools.Tool, error) {
 	t, ok := reg.Lookup(name)
 	if !ok {
+
 		return tools.Tool{}, clerrors.New(clerrors.CodeUsage, i18n.T("unknown tool", "неизвестный инструмент"),
 			i18n.T("Run 'evo tools list' to see the tools.", "Список инструментов: 'evo tools list'."))
 	}
@@ -399,6 +405,10 @@ func newToolsCallCmd() *cobra.Command {
 }
 
 const toolsCallHelpRU = `Вызвать инструмент и напечатать его ответ (JSON) как есть.
+Сообщения evo и диагностика по умолчанию русские, с EVO_LANG=en — английские.
+Если инструмент вернул ошибку, его ответ идёт в stdout, а диагностика evo —
+в stderr. С --json тексты evo английские, JSON ошибки идёт только в stderr.
+Ключи JSON, коды и текст самого сервиса сохраняются.
 
 Аргументы берутся из --args-file, затем из --args-json, затем из --arg
 (более поздние перекрывают ранние). Значения --arg приводятся к типам схемы
@@ -418,6 +428,10 @@ const toolsCallHelpRU = `Вызвать инструмент и напечата
 объект не найден, иначе 5.`
 
 const toolsCallHelpEN = `Call a tool and print its JSON result as is.
+By default evo's messages and diagnostics are in Russian; EVO_LANG=en selects
+English. If the tool returns an error, its result goes to stdout and evo's
+diagnostic goes to stderr. With --json evo uses English and sends the JSON
+error to stderr only. Keys, codes and service text are preserved.
 
 Arguments come from --args-file, then --args-json, then --arg (later ones
 win). --arg values are converted by the tool's schema: integer, number and
@@ -451,6 +465,7 @@ func runToolsCall(cmd *cobra.Command, name, argsFile, argsJSON string, argPairs 
 		}
 	}
 	text, err := invokeTool(cmd.Context(), cmd, t, callArgs, false, callHints(t.Name))
+
 	if text != "" && (err == nil || !flagJSON) {
 		fmt.Fprintln(cmd.OutOrStdout(), text)
 	}
@@ -495,15 +510,18 @@ func buildToolArgs(t tools.Tool, file, rawJSON string, pairs []string) (map[stri
 		}
 	}
 	if unknown > 0 {
+
 		return nil, unknownArgError(t, i18n.Tf("%s does not take %d argument(s) of the JSON", "%s не принимает аргументов JSON: %d", t.Name, unknown))
 	}
 	for i, pair := range pairs {
 		name, value, ok := strings.Cut(pair, "=")
 		if !ok || name == "" {
+
 			return nil, clerrors.New(clerrors.CodeUsage, i18n.Tf("--arg number %d: want name=value", "--arg номер %d: нужно имя=значение", i+1), "")
 		}
 		p, known := params[name]
 		if !known {
+
 			return nil, unknownArgError(t, i18n.Tf("%s has no argument named by --arg number %d", "у %s нет аргумента, названного в --arg номер %d", t.Name, i+1))
 		}
 		v, err := coerceArg(p, value)
@@ -517,6 +535,11 @@ func buildToolArgs(t tools.Tool, file, rawJSON string, pairs []string) (map[stri
 			i18n.T("Confirm with --yes or at the prompt; --dry-run shows the preview only.",
 				"Подтвердите флагом --yes или ответом на вопрос; --dry-run покажет только превью."))
 	}
+	// The types of the arguments and the enum values: the check every call
+	// of the tool makes, MCP included (tools.CheckArgs, spec.md REQ-8) — a
+	// string where the schema wants a number would otherwise reach the
+	// handler, which silently takes its default; a string for an array is
+	// the form MCP takes ("80,443").
 	if err := tools.CheckArgs(t, args); err != nil {
 		return nil, err
 	}
@@ -639,6 +662,7 @@ func coerceArg(p param, value string) (any, error) {
 	case "object":
 		var m map[string]any
 		if err := json.Unmarshal([]byte(value), &m); err != nil {
+
 			return nil, stderrors.New(tools.JSONProblem(err))
 		}
 		return m, nil
@@ -646,6 +670,16 @@ func coerceArg(p param, value string) (any, error) {
 	return value, nil
 }
 
+// checkItems checks the items of a JSON array against the item type of p
+// by the rule of the tool's own check for a scalar (tools.CheckArgs):
+// ports=[80,"x"] is refused as ports=80,x is, and so is ports [80,"x"] in
+// --args-json, as the CLI always did. It is the one check the CLI makes
+// beyond the tool's: MCP leaves the items to the handler (docs/mcp.md:
+// "arrays are not checked by type"), which refuses a port "x" but drops a
+// domain 1 of cert_issue_le dns_names silently. Checking the items in
+// tools.CheckArgs would refuse over MCP what MCP takes in 1.1 — a question
+// to the owner (report of PR 6, spec.md REQ-8); until then the CLI keeps
+// its check, and nothing the CLI took is refused.
 func checkItems(p param, items []any) error {
 	if p.ItemType == "" {
 		return nil
@@ -739,6 +773,7 @@ func invokeTool(ctx context.Context, cmd *cobra.Command, t tools.Tool, args map[
 		}
 		ask := opts
 		if interrupted, cut := resp["interrupted"]; cut {
+
 			ask.PersonOnly = true
 			ask.Hint = cutCallHint(cmd, interrupted)
 			ask.Answered = func() { registryOf(cmd).CutCallAnswered(ctx, t.Name, args, interrupted) }
@@ -885,6 +920,7 @@ func argLines(m map[string]any) []string {
 			b, _ := json.Marshal(m[k])
 			v = string(b)
 		}
+
 		lines = append(lines, k+": "+engine.PreviewText(v))
 	}
 	return lines
@@ -901,7 +937,8 @@ type toolHints struct {
 	flag func(arg string) string
 	// how names a tool argument for a schema-rule hint: "--subnet-id" or
 	// the positional "id"; nil keeps the tool's hint.
-	how    func(arg string) string
+	how func(arg string) string
+
 	prefix string
 }
 
@@ -959,7 +996,8 @@ func argsHint(help string) string {
 // to an agent (the argument, the server's settings), in the CLI's terms.
 var missingInputHints = map[string]func(flag string, answer map[string]any) string{
 	"region": zoneHint,
-	"zone":   zoneHint,
+
+	"zone": zoneHint,
 	"image": func(flag string, _ map[string]any) string {
 		return i18n.Tf("Pass %[1]s (list: evo image list), e.g. %[1]s Ubuntu-24.04.",
 			"Задайте %[1]s (список: evo image list), например %[1]s Ubuntu-24.04.", flag)
@@ -975,6 +1013,7 @@ var missingInputHints = map[string]func(flag string, answer map[string]any) stri
 // command that keeps it.
 func zoneHint(flag string, answer map[string]any) string {
 	if z, _ := answer["default_zone"].(string); z != "" {
+
 		z = images.ShellQuote(output.SanitizeCell(z))
 		return i18n.Tf("The default zone is %[1]s (evo vm zones): add %[2]s %[1]s, or keep it in the profile: evo configure --region %[1]s.",
 			"Зона по умолчанию — %[1]s (evo vm zones): добавьте %[2]s %[1]s или запомните её в профиле: evo configure --region %[1]s.", z, flag)
@@ -1002,6 +1041,9 @@ func missingInputHint(answer map[string]any, h toolHints) string {
 	return strings.Join(hints, " ")
 }
 
+// argumentHint is the CLI's hint for a schema-rule refusal that names the
+// argument (and optionally its format) in the answer: the tool's hint
+// points at inputSchema, which the CLI user has not (G130-35).
 func argumentHint(argument, format string, h toolHints) string {
 	if h.how == nil || h.help == "" || argument == "" {
 		return ""
@@ -1078,6 +1120,7 @@ func toolError(text string, h toolHints) error {
 	ce := clerrors.New(code, msg, hint)
 	ce.Details = details
 	if reason == clerrors.ReasonInterrupted {
+
 		return fmt.Errorf("%w: %w", context.Canceled, ce)
 	}
 	return ce

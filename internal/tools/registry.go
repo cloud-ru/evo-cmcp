@@ -87,6 +87,9 @@ type Registry struct {
 	newEngine EngineFactory
 	tools     []Tool
 	handlers  map[string]toolHandler
+	// unchecked are the handlers under the check of the arguments
+	// (checkedArgs): Wrap wraps them, so the check stays the first layer of
+	// every call whatever a transport adds (G13-1).
 	unchecked map[string]Handler
 
 	// served reports whether the server serves the tool named (evo mcp
@@ -137,6 +140,7 @@ func (r *Registry) withCallStart(ctx context.Context) context.Context {
 	if _, ok := ctx.Value(callUntilKey{}).(time.Time); ok || r.callBudget <= 0 {
 		return ctx
 	}
+
 	return context.WithValue(ctx, callUntilKey{}, time.Now().Add(r.callBudget))
 }
 
@@ -169,6 +173,7 @@ func budgetLeft(ctx context.Context) (time.Duration, bool) {
 	if !ok {
 		return 0, false
 	}
+
 	return max(time.Until(until), 0), true
 }
 
@@ -303,6 +308,14 @@ func resolvedOnly(ctx context.Context) context.Context {
 	return context.WithValue(ctx, resolvedOnlyKey{}, true)
 }
 
+// markSent is told by the counter of the call's writes
+// (httpretry.CountWrites) right before a write goes out, until it says the
+// call is marked: the record the call opened is marked at once — a process
+// killed after the write leaves the mark. A write before the record is
+// opened marks nothing and does not spend the mark (false). An error: the
+// mark is not written, and the write does not go out. The mark names the
+// parties the call has resolved by then (parties; nil names none): what
+// the write goes to, read before it as the handler read it (R-101).
 func markSent(ctx context.Context, parties func() []string) (marked bool, err error) {
 	c, ok := ctx.Value(callRecordsKey{}).(*callRecords)
 	if !ok || !c.hasOpen {
@@ -353,6 +366,12 @@ func New(factory EngineFactory) *Registry {
 		t.Decl = decls[t.Name]
 		t.Group = groupOf(t.Name)
 		t.Mutating = isMutating(*t)
+		t.InputSchema["additionalProperties"] = false
+		if !takesConsent(*t) {
+			// checkArgs accepts and ignores confirmed on these tools. Keep
+			// it outside properties, which declares actual consent gates.
+			t.InputSchema["patternProperties"] = map[string]any{"^confirmed$": true}
+		}
 		if takesConsent(*t) && t.Decl.PartialConsent == nil {
 			t.Description += " " + consentText(t.Name)
 		}
@@ -510,6 +529,7 @@ func ParseToolsets(groups []string) ([]string, error) {
 		case g == "all":
 			return nil, nil
 		case !known[g]:
+
 			return nil, fmt.Errorf("unknown toolset (item %d of the list); known: all, %s", i+1, strings.Join(Groups(), ", "))
 		default:
 			seen[g] = true

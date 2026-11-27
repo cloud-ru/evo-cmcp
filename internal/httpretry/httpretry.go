@@ -12,8 +12,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"io"
+	"math"
 	"mime"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
@@ -23,6 +26,7 @@ import (
 	"time"
 
 	clerrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 	"github.com/cloud-ru/evo-cmcp/internal/product"
 )
 
@@ -253,6 +257,11 @@ func (t uaTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // answered 401 to (OnTokenRejected).
 var tokenRejected atomic.Pointer[func(token string)]
 
+// OnTokenRejected sets f to be told the bearer token of every request a
+// Cloud.ru API answers 401 to, whichever client sent it: the token
+// provider drops that token, so the next call exchanges the key again
+// instead of sending a token the services reject until its deadline
+// (G140-3). nil stops it.
 func OnTokenRejected(f func(token string)) {
 	if f == nil {
 		tokenRejected.Store(nil)
@@ -265,12 +274,6 @@ func OnTokenRejected(f func(token string)) {
 // (OnTokenRenewed).
 var tokenRenewed atomic.Pointer[func(ctx context.Context, token string) (string, bool)]
 
-// OnTokenRenewed sets f to be asked, for the bearer token a service
-// refused, the token that replaces it: a new one from the provider that
-// issued it, and the request goes once more with that. A service client takes its token once, when it is built; after
-// the machine slept the services refuse it, and a wait would end with
-// the 401 of one poll while the operation goes on (process backlog 1.6,
-// priority 1). nil stops it.
 func OnTokenRenewed(f func(ctx context.Context, token string) (string, bool)) {
 	if f == nil {
 		tokenRenewed.Store(nil)
@@ -341,7 +344,8 @@ func RouteNotFoundAsBadGateway(req *http.Request, resp *http.Response) *http.Res
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
-	return badGateway(resp, `{"message":"Cloud.ru answered 404 without the service's answer: `+routeNotFound+`"}`)
+	message := i18n.T(routeNotFoundEN, routeNotFoundRU)
+	return badGateway(resp, `{"message":"`+message+`"}`)
 }
 
 func peek(body io.ReadCloser, n int64) ([]byte, io.ReadCloser, error) {
@@ -361,14 +365,21 @@ type brokenBody struct{ err error }
 
 func (b brokenBody) Read([]byte) (int, error) { return 0, b.err }
 
-// routeNotFound is how the 502 of RouteNotFoundAsBadGateway says what it is.
-const routeNotFound = "the route or the address of the service is not there, and the resource was not checked"
+// Only the transport writes these messages. A service body passes through unchanged.
+const (
+	routeNotFoundEN = "Cloud.ru answered 404 without the service's answer: the route or the address of the service is not there, and the resource was not checked"
+	routeNotFoundRU = "Шлюз Cloud.ru вернул 404 без ответа сервиса. Маршрут или адрес сервиса недоступен. Ресурс не проверен."
+)
 
 // RouteNotFound reports whether err carries the answer of
 // RouteNotFoundAsBadGateway: whatever the client wrapped it in, its message
 // keeps the body.
 func RouteNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), routeNotFound)
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, routeNotFoundEN) || strings.Contains(message, routeNotFoundRU)
 }
 
 // Replaced is the header of an answer the transport wrote in place of the
@@ -445,6 +456,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// One id for every attempt of the request: support sees them as one.
 	req = withHeaders(req)
 	resp, err := t.renewing(req)
+
 	if err == nil && !t.Policy.Keep404 {
 		resp = RouteNotFoundAsBadGateway(req, resp)
 	}
@@ -553,4 +565,55 @@ func retryAfter(v string) (time.Duration, bool) {
 		d = maxRetryAfter
 	}
 	return d, true
+}
+
+// readComplete permits at most limit bytes when a client caps response size.
+// One extra byte distinguishes a complete response at the cap from a prefix.
+func readComplete(resp *http.Response, limit int64) ([]byte, error) {
+	if resp.StatusCode == http.StatusPartialContent || (resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get("Content-Range") != "") {
+		return nil, io.ErrUnexpectedEOF
+	}
+	n := int64(math.MaxInt64)
+	if limit > 0 && limit < n {
+		n = limit + 1
+	}
+	data, _, err := peek(resp.Body, n)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, io.ErrShortBuffer
+	}
+	if resp.ContentLength > 0 && int64(len(data)) != resp.ContentLength {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
+// ReadAPIResponse supplies the complete body and HTTP status to a service
+// client. A nonzero limit bounds the read. When the body of a refusal is
+// incomplete, the status alone still carries the refusal, but a partial
+// GET or DELETE 404 cannot establish that the addressed resource is gone.
+// No body bytes are returned for an incomplete response, and the caller
+// remains responsible for closing it.
+func ReadAPIResponse(req *http.Request, resp *http.Response, limit int64) ([]byte, int, error) {
+	data, err := readComplete(resp, limit)
+	status := resp.StatusCode
+	if err == nil {
+		return data, status, nil
+	}
+	if ctxErr := req.Context().Err(); ctxErr != nil {
+		return nil, status, ctxErr
+	}
+	// http.Client.Timeout sets a deadline on its own copy of req. Its body
+	// can time out while the caller's context is still live.
+	var timeout net.Error
+	if errors.Is(err, context.Canceled) || errors.As(err, &timeout) && timeout.Timeout() {
+		return nil, status, err
+	}
+	if status >= 400 && (status != http.StatusNotFound || (req.Method != http.MethodGet && req.Method != http.MethodDelete)) {
+		return nil, status, nil
+	}
+	return nil, status, clerrors.Wrap(clerrors.CodeAPIError,
+		i18n.T("Could not read the complete API response.", "Не удалось полностью прочитать ответ API."), "", err)
 }

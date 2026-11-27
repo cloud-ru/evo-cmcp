@@ -54,7 +54,7 @@ MCP-клиента и попросит согласие на запись. Ка�
 
 Выполни `evo version`.
 
-- Печатает версию 1.9.0 или новее — переходи к шагу 2.
+- Печатает версию 1.9.1 или новее — переходи к шагу 2.
 - `evo` не найден или версия старше — установи его сам, сказав человеку,
   что ставишь. Установщик скачивает последний стабильный выпуск, сверяет
   sha256 архива (и подпись, если есть `cosign`) и кладёт бинарь в
@@ -66,7 +66,7 @@ MCP-клиента и попросит согласие на запись. Ка�
     ```powershell
     $v = (Invoke-RestMethod https://api.github.com/repos/cloud-ru/evo-cmcp/releases/latest).tag_name.TrimStart("v"); $arch = "amd64"; $dir = "$env:LOCALAPPDATA\Programs\evo"; $base = "https://github.com/cloud-ru/evo-cmcp/releases/download/v$v"; $zip = "evo_${v}_windows_$arch.zip"; $tmp = New-Item -ItemType Directory -Force "$env:TEMP\evo-$v"
     Invoke-WebRequest "$base/$zip" -OutFile "$tmp\$zip"; Invoke-WebRequest "$base/checksums.txt" -OutFile "$tmp\checksums.txt"
-    $want = ((Select-String -Path "$tmp\checksums.txt" -Pattern $zip).Line -split '\s+')[0]; if ($want -ne (Get-FileHash "$tmp\$zip" -Algorithm SHA256).Hash.ToLower()) { throw "sha256 mismatch" }
+    $want = ((Select-String -Path "$tmp\checksums.txt" -Pattern ([regex]::Escape($zip) + '$')).Line -split '\s+')[0]; if ($want -ne (Get-FileHash "$tmp\$zip" -Algorithm SHA256).Hash.ToLower()) { throw "sha256 mismatch" }
     Expand-Archive "$tmp\$zip" -DestinationPath $dir -Force
     if (($env:Path -split ';') -notcontains $dir) { [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$dir", "User"); $env:Path += ";$dir" }
     ```
@@ -88,7 +88,7 @@ MCP-клиента и попросит согласие на запись. Ка�
   выпуска прошли, а единственные предупреждения возникли на этом
   необязательном этапе, запусти установленный бинарь по пути из вывода,
   например `"$HOME/.local/bin/evo" version`. При успешном выводе ожидаемой
-  версии выпуска (1.9.0 или новее) **сразу переходи к шагу 2**. Предупреждения
+  версии выпуска (1.9.1 или новее) **сразу переходи к шагу 2**. Предупреждения
   об автодополнении в ответ пользователю выносить не нужно. Сообщение
   `Broken pipe` само по себе не определяет, какой этап завершился ошибкой.
 

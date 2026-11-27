@@ -70,12 +70,15 @@ var treeRenders = map[string]renderFunc{
 	"addon-versions":   renderAddonVersions,
 	"log-lines":        renderLogLines,
 	"exposition":       renderExposition,
+	"metric-series":    renderMetricSeries,
 	"project-list":     renderProjectList,
 	"billing-balance":  renderBillingBalance,
 	"billing-usage":    renderBillingConsumption,
 	"billing-finops":   renderBillingFinops,
 }
 
+// treeGroupShort is the English summary of each tree (treeGroupShortRU is
+// the Russian one). A CLISpec group without one fails TestTrees_BuildAndHelp.
 var treeGroupShort = map[string]string{
 	"vm":          "Virtual machines",
 	"image":       "VM images: operating systems and Marketplace products",
@@ -127,7 +130,7 @@ func treeGroupsOf(reg *tools.Registry) []treeGroup {
 		if t.CLI.Render != "" {
 			c.render = treeRenders[t.CLI.Render]
 			if c.render == nil {
-				panic("command tree: " + t.Name + ": no view " + t.CLI.Render)
+				panic("command tree: " + t.Name + ": no view " + t.CLI.Render) // caught by TestParity_CommandsAndTools
 			}
 		}
 		byGroup[t.CLI.Group] = append(byGroup[t.CLI.Group], c)
@@ -144,7 +147,7 @@ func treeGroupsOf(reg *tools.Registry) []treeGroup {
 		default:
 			short, ok := treeGroupShort[name]
 			if !ok {
-				panic("command tree: no summary for group " + name)
+				panic("command tree: no summary for group " + name) // caught by TestTrees_BuildAndHelp
 			}
 			g.Short = short
 			if ru, ok := treeGroupShortRU[name]; ok {
@@ -157,6 +160,8 @@ func treeGroupsOf(reg *tools.Registry) []treeGroup {
 	return out
 }
 
+// toolAnnotation marks a command built from a tool's CLISpec with the
+// tool's name (TestParity_CommandsAndTools reads it).
 const toolAnnotation = "evo.tool"
 
 // filterExampleAnnotation holds the arguments of a list command's example
@@ -204,6 +209,10 @@ Flags:
 // given with --yes or at the prompt.
 var rootArgs = map[string]bool{"project_id": true, "region": true, "confirmed": true}
 
+// newTreeCmds builds the command trees from the registry's CLISpecs. A
+// group that is an engine command of root (evo deploy) gets the commands
+// of its tools as subcommands, beside its own action (spec.md R7): no
+// second root command of that name.
 func newTreeCmds(root *cobra.Command, reg *tools.Registry) []*cobra.Command {
 	var out []*cobra.Command
 	for _, g := range treeGroupsOf(reg) {
@@ -355,6 +364,7 @@ func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
 				msg := fmt.Sprintf(i18n.T("%s: want %s, got %d argument(s)", "%s: нужно %s, передано аргументов: %d"),
 					cmd.CommandPath(), strings.Join(use[1:], " "), len(args))
 				if maxArgs >= 0 && len(args) > maxArgs {
+
 					msg += i18n.Tf("; extra arguments: %d — a flag left out?", "; лишних аргументов: %d — пропущен флаг?",
 						len(args)-maxArgs)
 				}
@@ -423,6 +433,7 @@ func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
 			case on:
 				desc = defaultTrueRE.ReplaceAllString(desc, "") + note(" To turn off: --"+name+"=false", " Выключить: --"+name+"=false")
 			case slices.Contains(tools.ListFilters(t), p.Name):
+
 				desc += note(" (false is given as --"+name+"=false)", " (false задаётся так: --"+name+"=false)")
 			}
 			cmd.Flags().Bool(name, on, desc)
@@ -434,6 +445,7 @@ func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
 	}
 	noEmptyScope(cmd.Flags())
 	if filters := tools.ListFilters(t); filters != nil {
+
 		grouped := false
 		for _, a := range filters {
 			if cmd.Flags().Lookup(c.flagName(a)) != nil {
@@ -464,6 +476,10 @@ func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
 		if err != nil {
 			return err
 		}
+		// The tool's own check of the arguments (tools.CheckArgs, spec.md
+		// REQ-8), before the preview: its refusal is the one the tool
+		// gives, as every refusal of a tool is shown. Hints name flags
+		// and positionals, not inputSchema (G130-35).
 		hints := treeCommandHints(cmd, c)
 		if err := tools.CheckArgs(t, callArgs); err != nil {
 			return toolError(tools.ErrResult(err), hints)
@@ -487,6 +503,7 @@ func newTreeLeaf(reg *tools.Registry, c treeCmd, t tools.Tool) *cobra.Command {
 		}
 		return c.show(cmdPrinter(cmd), cmd.OutOrStdout(), text)
 	}
+
 	flags := make(map[string]string, len(flagArgs))
 	for _, p := range flagArgs {
 		flags[c.flagName(p.Name)] = p.Name
@@ -692,6 +709,7 @@ func pairsArg(ctx context.Context, stdin io.Reader, prompt io.Writer, flag strin
 		k, val, ok := strings.Cut(v, "=")
 		k = strings.TrimSpace(k)
 		if !ok || k == "" {
+
 			return nil, clerrors.New(clerrors.CodeUsage,
 				i18n.Tf("--%s number %d: want key=value", "--%s номер %d: нужно поле=значение", flag, i+1),
 				i18n.Tf("Example: --%[1]s hostname=web-01; a password from a file or stdin: --%[1]s admin_password=@./admin.pass or --%[1]s admin_password=-; the fields of an image: evo image get <image>.",

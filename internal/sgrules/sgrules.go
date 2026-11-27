@@ -18,6 +18,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/netip"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -38,6 +39,17 @@ func PortKey(proto string, port int) string {
 // Label is the short form shown to people: "80" for tcp, "53/udp".
 func Label(key string) string {
 	return strings.TrimSuffix(key, "/tcp")
+}
+
+var plainVMID = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+// displayVMID preserves the 1.9.0 label for ordinary IDs and quotes other
+// values so a cloud-supplied ID cannot add a line or a terminal escape.
+func displayVMID(id string) string {
+	if plain := plainVMID.FindString(id); plain != "" {
+		return plain
+	}
+	return strconv.Quote(id)
 }
 
 func splitKey(key string) (proto string, port int) {
@@ -101,6 +113,13 @@ type GroupOnlyPort struct {
 	Groups []string `json:"groups"`
 }
 
+// GroupsOnly names the security groups that alone let proto/port in, when
+// Coverage counts the port as open and no rule lets it in from an address:
+// each rule that covers it has another group as its source, so only the
+// interfaces of those groups get through — not cidr. nil when a rule with
+// an address source (or none named) covers the port, or none covers it.
+// Coverage is not changed by it: no second rule is made for such a port
+// (owner's decision 12.11, variant «б») — what is said about it is.
 func GroupsOnly(rules []*provision.SGRule, proto string, port int, cidr string) []string {
 	var byAddress, byGroup []*provision.SGRule
 	for _, r := range rules {
@@ -260,6 +279,8 @@ func Open(ctx context.Context, cloud provision.CloudAPI, projectID, sgID string,
 	}
 	openedHere := map[string]bool{}
 
+	// errored: the create failed without a refusal (lost answer, 5xx): the
+	// rule may exist, and is adopted if the listing shows it (QA r3 R6).
 	type pending struct {
 		key, desc string
 		errored   bool
@@ -395,7 +416,7 @@ func (r OpenResult) NotOurs(rec *state.DeploymentRecord) []string {
 
 func addRule(rec *state.DeploymentRecord, r state.SGRule) {
 	for _, have := range rec.OpenedRules {
-		if have.ID == r.ID {
+		if have.ID == r.ID && have.SecurityGroupID == r.SecurityGroupID {
 			return
 		}
 	}
@@ -436,11 +457,16 @@ func (r OpenResult) Note() string {
 // neededBy returns another live deployment in sf that needs port key in
 // group sgID. A record written before security_group_id existed may be in
 // any group: its tcp exposed_ports count.
-func neededBy(sf *state.File, exceptID, sgID, key string) *state.DeploymentRecord {
+func neededBy(sf *state.File, record *state.DeploymentRecord, sgID, key string) *state.DeploymentRecord {
 	proto, port := splitKey(key)
+	project, _ := record.RecordedCleanupProject()
 	for i := range sf.Deployments {
 		d := &sf.Deployments[i]
-		if d.ID == exceptID || d.Status == "destroyed" || d.Status == "destroying" {
+		if d.ID == record.ID || d.Status == "destroyed" || d.Status == "destroying" {
+			continue
+		}
+		otherProject, _ := d.RecordedCleanupProject()
+		if project != "" && otherProject != "" && otherProject != project {
 			continue
 		}
 		if d.SecurityGroupID == sgID {
@@ -479,7 +505,7 @@ func Plan(sf *state.File, recIDs ...string) []Planned {
 		}
 		for _, r := range rec.OpenedRules {
 			p := Planned{Rule: r, RecordID: id}
-			if other := neededBy(sf, id, r.SecurityGroupID, r.Port); other != nil {
+			if other := neededBy(sf, rec, r.SecurityGroupID, r.Port); other != nil {
 				p.KeptFor = other.ID
 			}
 			out = append(out, p)
@@ -490,9 +516,10 @@ func Plan(sf *state.File, recIDs ...string) []Planned {
 
 // CloseResult says what Close did, by port label.
 type CloseResult struct {
-	Closed []string `json:"closed,omitempty"`
-	Kept   []string `json:"kept,omitempty"`   // "80 (needed by deployment vm-2)"
-	Failed []string `json:"failed,omitempty"` // "80: <error>"
+	LabeledClosed []string `json:"-"` // subset of Closed, for the human-readable summary
+	Closed        []string `json:"closed,omitempty"`
+	Kept          []string `json:"kept,omitempty"`   // "80 (needed by deployment vm-2)"
+	Failed        []string `json:"failed,omitempty"` // "80: <error>"
 }
 
 // Empty reports whether there was nothing to do.
@@ -501,8 +528,63 @@ func (r CloseResult) Empty() bool { return len(r.Closed)+len(r.Kept)+len(r.Faile
 // Add appends another result.
 func (r *CloseResult) Add(o CloseResult) {
 	r.Closed = append(r.Closed, o.Closed...)
+	r.LabeledClosed = append(r.LabeledClosed, o.LabeledClosed...)
 	r.Kept = append(r.Kept, o.Kept...)
 	r.Failed = append(r.Failed, o.Failed...)
+}
+
+// readOwnedRule checks the exact group and rule IDs without filtering out
+// transitional states. A rule in "deleting" can still allow traffic.
+func readOwnedRule(ctx context.Context, cloud provision.CloudAPI, r state.SGRule, projectID string) (*provision.SGRule, error) {
+	rows, err := provision.ReadSecurityGroupRulesForCleanup(ctx, cloud, r.SecurityGroupID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var found *provision.SGRule
+	for _, row := range rows {
+		if row == nil || row.ID == "" || row.ID == r.ID && found != nil {
+			return nil, clerrors.New(clerrors.CodeAPIError, i18n.T("The rule list is incomplete.", "Список правил получен не полностью."), "")
+		}
+		if row.ID == r.ID {
+			found = row
+		}
+	}
+	return found, nil
+}
+
+// deleteOwnedRule verifies a previous request before retrying it, and any
+// new accepted DELETE by a complete read. A port or a CIDR cannot identify it.
+func deleteOwnedRule(ctx context.Context, cloud provision.CloudAPI, r state.SGRule, projectID string) error {
+	if r.DeleteError != "" || r.LabelVMID != "" {
+		current, err := readOwnedRule(ctx, cloud, r, projectID)
+		if err != nil || current == nil {
+			return err
+		}
+		if current.State == "deleting" {
+			return clerrors.New(clerrors.CodeAPIError, i18n.T("The rule is still being deleted.", "Правило ещё удаляется."), "")
+		}
+		if r.LabelVMID != "" && (current.Direction != "ingress" || current.Description != RuleLabel(Label(r.Port), r.LabelVMID)) {
+			return clerrors.New(clerrors.CodeAPIError, i18n.T("The rule no longer carries this VM's ingress label.", "У входящего правила больше нет метки этой ВМ."), "")
+		}
+	}
+	err := cloud.DeleteSecurityGroupRule(ctx, r.SecurityGroupID, r.ID)
+	var cliErr *clerrors.CLIError
+	if err != nil && !(stderrors.As(err, &cliErr) && (cliErr.Code == clerrors.CodeNotFound || cliErr.Code == clerrors.CodeVMNotFound)) {
+		return err
+	}
+	current, err := readOwnedRule(ctx, cloud, r, projectID)
+	if err != nil {
+		return err
+	}
+	if current != nil {
+		return clerrors.New(clerrors.CodeAPIError, i18n.T("The rule is still present after the delete request.", "После запроса удаления правило ещё есть в группе."), "")
+	}
+	return nil
+}
+
+// RuleRetryHint explains where the operation can be safely continued.
+func RuleRetryHint() string {
+	return i18n.T("Run 'evo destroy' again in the same directory to check the saved rule IDs.", "Повторите 'evo destroy' в том же каталоге, чтобы проверить сохранённые ID правил.")
 }
 
 // Close deletes the rules deployment recID created, in sf. A rule another
@@ -511,32 +593,59 @@ func (r *CloseResult) Add(o CloseResult) {
 // a rule already gone (404) counts as closed. Call it once the VM is
 // deleted: closing first would cut a running app off if the VM delete
 // then failed.
-func Close(ctx context.Context, cloud provision.CloudAPI, sf *state.File, recID string) CloseResult {
+func Close(ctx context.Context, cloud provision.CloudAPI, sf *state.File, recID, projectID string, maker *state.Maker) CloseResult {
 	var res CloseResult
 	rec := sf.FindDeployment(recID)
 	if rec == nil || len(rec.OpenedRules) == 0 {
 		return res
 	}
+	// A successful exact read still works for old records. A missing parent
+	// needs additional proof that this is the original project and principal.
+	recordedProject, consistent := rec.RecordedCleanupProject()
+	sameOwner, knownOwner := rec.CreatedBy.MatchRuleOwner(maker)
+	wrongScope := !consistent || recordedProject != "" && projectID != "" && recordedProject != projectID || knownOwner && !sameOwner || rec.CreatedBy.Other(maker)
+	if recordedProject != projectID || !sameOwner {
+		projectID = ""
+	}
 	rules := rec.OpenedRules
 	var left []state.SGRule
 	for _, r := range rules {
 		label := Label(r.Port)
-		if other := neededBy(sf, recID, r.SecurityGroupID, r.Port); other != nil {
+		if r.ID == "" || r.SecurityGroupID == "" {
+			// An incomplete legacy receipt cannot identify a rule to delete.
+			r.DeleteError = i18n.T("no rule or group ID in state", "в записи нет ID правила или группы")
+			left = append(left, r)
+			res.Failed = append(res.Failed, label+": "+r.DeleteError)
+			continue
+		}
+		if other := neededBy(sf, rec, r.SecurityGroupID, r.Port); !wrongScope && other != nil {
 			r.DeleteError = ""
-			addRule(other, r)
+			sameOwner, _ := rec.CreatedBy.MatchRuleOwner(other.CreatedBy)
+			otherProject, otherConsistent := other.RecordedCleanupProject()
+			// Keep a shared port open even when the deployments use different
+			// profiles. Only transfer its receipt if that preserves its scope.
+			if otherConsistent && recordedProject == otherProject && (sameOwner || rec.CreatedBy == nil && other.CreatedBy == nil) {
+				addRule(other, r)
+			} else {
+				left = append(left, r)
+			}
 			res.Kept = append(res.Kept, fmt.Sprintf("%s (needed by deployment %s)", label, other.ID))
 			continue
 		}
-		if r.ID == "" || r.SecurityGroupID == "" {
-			// Only a hand-edited state has these: DELETE .../rules/ with an
-			// empty ID is not this rule. Nothing to retry.
-			res.Failed = append(res.Failed, label+": no rule or group ID in state — delete it in the Cloud.ru console")
-			continue
+		var err error
+		if wrongScope {
+			err = clerrors.New(clerrors.CodeConfigInvalid, i18n.T("Select the project and profile of the saved security group rule.", "Выберите проект и профиль сохранённого правила группы безопасности."), "")
+		} else {
+			err = deleteOwnedRule(ctx, cloud, r, projectID)
 		}
-		err := cloud.DeleteSecurityGroupRule(ctx, r.SecurityGroupID, r.ID)
-		var cliErr *clerrors.CLIError
-		if err == nil || (stderrors.As(err, &cliErr) && (cliErr.Code == clerrors.CodeNotFound || cliErr.Code == clerrors.CodeVMNotFound)) {
+		if r.LabelVMID != "" {
+			label += " (vm " + displayVMID(r.LabelVMID) + ")"
+		}
+		if err == nil {
 			res.Closed = append(res.Closed, label)
+			if r.LabelVMID != "" {
+				res.LabeledClosed = append(res.LabeledClosed, label)
+			}
 			continue
 		}
 		r.DeleteError = err.Error()
@@ -553,7 +662,7 @@ func Close(ctx context.Context, cloud provision.CloudAPI, sf *state.File, recID 
 func Pending(sf *state.File) []string {
 	var ids []string
 	for _, d := range sf.Deployments {
-		if d.Status == "destroyed" && len(d.OpenedRules) > 0 {
+		if d.Status == "destroyed" && (len(d.OpenedRules) > 0 || d.PendingRuleScan != nil) {
 			ids = append(ids, d.ID)
 		}
 	}
@@ -568,7 +677,7 @@ func Retire(sf *state.File, recID string) {
 	if rec == nil {
 		return
 	}
-	if len(rec.OpenedRules) == 0 {
+	if len(rec.OpenedRules) == 0 && rec.PendingRuleScan == nil {
 		sf.RemoveDeployment(recID)
 		return
 	}

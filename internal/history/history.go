@@ -22,7 +22,8 @@ const (
 	// Created: the call made a resource; ResourceID names it.
 	Created = "created"
 	// Deleted: the call removed the resource.
-	Deleted        = "deleted"
+	Deleted = "deleted"
+
 	AlreadyDeleted = "already_deleted"
 	// Changed: the call changed a resource that was there and is there
 	// after it — a reboot, a resize, a rule of a group.
@@ -54,7 +55,12 @@ func Known(outcome string) bool { return outcomes[outcome] }
 // Outcome is what the end of a call says of it: the part of a line the
 // caller knows and the record of the intent does not.
 type Outcome struct {
-	Result string
+	// CleanupPending means this result cannot settle an earlier interrupted
+	// operation: its resource cleanup still awaits confirmation.
+	CleanupPending bool
+	// CreateReceipt distinguishes an ID returned by create from a match by name.
+	CreateReceipt bool
+	Result        string
 	// Kind is the kind of the resource ("disk"): with ResourceID it tells
 	// one resource from another of the same id or name.
 	Kind string
@@ -73,8 +79,10 @@ const Format = 1
 
 // Line is one line of the journal.
 type Line struct {
+	CreateReceipt bool `json:"create_receipt,omitempty"`
 	// Format is the form of the line (Format); Append sets it.
-	Format    int    `json:"format"`
+	Format int `json:"format"`
+
 	Time      string `json:"time"`
 	Tool      string `json:"tool"`
 	Surface   string `json:"surface,omitempty"`
@@ -96,8 +104,9 @@ type Line struct {
 	JobID    string `json:"job_id,omitempty"`
 	// StateDir is the folder of the state the call went with; "" for
 	// the configuration's (evo login).
-	StateDir string       `json:"state_dir,omitempty"`
-	Key      *state.Maker `json:"key,omitempty"`
+	StateDir string `json:"state_dir,omitempty"`
+
+	Key *state.Maker `json:"key,omitempty"`
 }
 
 // DirName is the directory of the journal: beside intents/.
@@ -123,6 +132,7 @@ func Append(dir string, l Line) error {
 		return fmt.Errorf("outcome %q is not of the journal", l.Outcome)
 	}
 	l.Format = Format
+
 	for _, f := range []*string{&l.Tool, &l.Surface, &l.ProjectID, &l.Zone, &l.Name, &l.Target, &l.Kind, &l.Parent, &l.ResourceID, &l.Reason, &l.OperationID, &l.JobID, &l.StateDir} {
 		*f = fit(*f)
 	}
@@ -135,6 +145,7 @@ func Append(dir string, l Line) error {
 	if err != nil {
 		return err
 	}
+
 	l.Time = at.UTC().Format(time.RFC3339)
 	if fi, err := os.Lstat(dir); err == nil && !fi.IsDir() {
 		return fmt.Errorf("%s is not a directory of evo", dir)
@@ -155,6 +166,7 @@ func Append(dir string, l Line) error {
 	if err != nil {
 		return err
 	}
+
 	line := append(data, '\n')
 	if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
 		last := make([]byte, 1)
@@ -199,6 +211,7 @@ func liveMask(lines []Line) []bool {
 	held := map[string][]mark{} // created or found, not gone yet
 	gone := map[string][]mark{} // deleted, already_deleted, not_found
 	key := func(l Line) string { return l.Kind + "\x00" + l.Parent + "\x00" + l.ResourceID }
+
 	order := make([]int, len(lines))
 	for i := range order {
 		order[i] = i
@@ -210,6 +223,7 @@ func liveMask(lines []Line) []bool {
 	}
 	for _, i := range order {
 		l := lines[i]
+
 		if l.Format != Format || !Known(l.Outcome) {
 			continue
 		}

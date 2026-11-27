@@ -52,19 +52,30 @@ type Intent struct {
 	Name string   `json:"name,omitempty"`
 	// Target is the resource a call on an existing one names, as
 	// «argument=id» (vm_id=…): a delete, a resize. Not a secret.
-	Target    string   `json:"target,omitempty"`
-	Parties   []string `json:"parties,omitempty"`
-	ProjectID string   `json:"project_id,omitempty"`
-	Zone      string   `json:"zone,omitempty"`
+	Target string `json:"target,omitempty"`
+	// Parties are the other resources the change acts on that the call
+	// named by a name or an address, as evo resolved them before the
+	// call went out («argument=id», sorted): the VM a disk is attached
+	// to, the group a port is opened in. A name may later resolve to
+	// another resource, and a call there is another call (R-101). Nil in
+	// a record of evo before them, or of a call that resolves none.
+	Parties []string `json:"parties,omitempty"`
+
+	ProjectID string `json:"project_id,omitempty"`
+	Zone      string `json:"zone,omitempty"`
 	// Key is the key the call was sent with: a read by id answers for the
 	// resource only with the key that saw it (state.Maker.Other). Nil in a
 	// record of evo before 1.9.
-	Key       *state.Maker `json:"key,omitempty"`
-	Note      string       `json:"note,omitempty"`
-	Surface   string       `json:"surface"`
-	PID       int          `json:"pid"`
-	StartedAt time.Time    `json:"started_at"`
-	Held      bool         `json:"held,omitempty"`
+	Key *state.Maker `json:"key,omitempty"`
+	// Note is what the next run says of the intent when the words of a
+	// call that the cloud did not answer do not fit it (evo login killed
+	// after its key: findings ledger 1.8, № 37); "" for a tool's call.
+	Note      string    `json:"note,omitempty"`
+	Surface   string    `json:"surface"`
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+
+	Held bool `json:"held,omitempty"`
 	// Print tells the same call again from another call of the tool on
 	// the same resource (a rule of a security group, a kubectl): the hash
 	// of the record's id and of the arguments that make the call what it
@@ -81,9 +92,12 @@ type Intent struct {
 	// Sent tells a call whose first write went out: it is marked right
 	// before that write is sent (MarkSent), so a process killed after it
 	// leaves the mark.
-	Sent    bool      `json:"sent,omitempty"`
-	Counts  bool      `json:"counts,omitempty"`
-	Machine string    `json:"machine,omitempty"`
+	Sent bool `json:"sent,omitempty"`
+
+	Counts bool `json:"counts,omitempty"`
+
+	Machine string `json:"machine,omitempty"`
+
 	CutSend time.Time `json:"cut_send,omitempty"`
 	// Canon is the canonical form of the arguments Print is made of; not
 	// saved. The caller sets it before Open and keeps it for Settle.
@@ -355,7 +369,7 @@ func scan(dir string) (out []Intent, foreign []string) {
 }
 
 func Settle(dir string, done Intent, out history.Outcome) (kept []Intent) {
-	if done.Name == "" && done.Target == "" {
+	if out.CleanupPending || (done.Name == "" && done.Target == "") {
 		return nil
 	}
 	for _, in := range Pending(dir) {
@@ -363,6 +377,11 @@ func Settle(dir string, done Intent, out history.Outcome) (kept []Intent) {
 			continue
 		}
 		if in.Print != "" {
+			// The same arguments are the same call only on the same
+			// resources: a name may resolve to another resource now (a
+			// group renamed and its name taken by a new one, a VM's name
+			// given to another VM), and the outcome there says nothing
+			// of the cut call (R-101).
 			if !in.SameCall(done.Canon) || in.Target != "" && done.Target != "" && in.Target != done.Target ||
 				in.Parties != nil && done.Parties != nil && !slices.Equal(in.Parties, done.Parties) {
 				continue
@@ -401,7 +420,7 @@ func journal(in Intent, out history.Outcome) {
 	}
 	l := history.Line{Time: clock.Now().UTC().Format(time.RFC3339), Tool: in.Tool, Surface: surface,
 		ProjectID: in.ProjectID, Zone: in.Zone, Name: in.Name, Target: in.Target,
-		Kind: out.Kind, Parent: out.Parent, ResourceID: out.ResourceID, Outcome: out.Result, Reason: out.Reason, OperationID: out.OperationID,
+		CreateReceipt: out.CreateReceipt, Kind: out.Kind, Parent: out.Parent, ResourceID: out.ResourceID, Outcome: out.Result, Reason: out.Reason, OperationID: out.OperationID,
 		IntentID: in.ID, JobID: out.JobID, StateDir: stateDirOf(in.Dir), Key: in.Key}
 	if err := appendLine(history.DirOf(in.Dir), l); err != nil {
 		config.Warn(i18n.Tf("the journal of changes in %s got no line of %s (%v); the call is as it answered",

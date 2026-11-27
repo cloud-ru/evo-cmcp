@@ -89,8 +89,7 @@ func (s *Registry) planCertIssueLE(ctx context.Context, args map[string]any) (*P
 		// Async: return the operation; the caller polls cert_operation until done.
 		out := map[string]any{"status": "issuing", "note": i18n.T("Let's Encrypt issuance is async — poll cert_operation with this operation id until done=true. Domains must have delegated zones in Evolution DNS.",
 			"Сертификат Let's Encrypt выпускается асинхронно — опрашивайте evo cert operation с id этой операции до done=true. Зоны доменов должны быть делегированы в Evolution DNS."), "operation": op}
-		// The operation does not name the certificate; the list does, at once
-		// (fault matrix, process audit 1.2.1).
+
 		if items, err := list(ctx); err == nil {
 			if id, _, ok := takenName(items, name); ok {
 				out["certificate_id"] = id
@@ -107,6 +106,7 @@ func (s *Registry) planCertImport(ctx context.Context, args map[string]any) (*Pl
 	if name == "" || server == "" || key == "" {
 		return answered(usageT("'name', 'server_certificate' and 'private_key' (PEM, or Base64 of it) are required", "нужны 'name', 'server_certificate' и 'private_key' (PEM или он же в Base64)"), true), nil
 	}
+
 	preview := map[string]any{
 		"name": name,
 		"message": i18n.Tf("cert_import will upload certificate %q and its private key to Certificate Manager.",
@@ -139,6 +139,9 @@ func (s *Registry) planCertImport(ctx context.Context, args map[string]any) (*Pl
 	}}, nil
 }
 
+// pemArg is a PEM argument of cert_import as Certificate Manager takes it,
+// Base64: a PEM given as it is ("-----BEGIN …") is encoded, Base64 goes as
+// given (Q17, decision 21.10).
 func pemArg(args map[string]any, key string) string {
 	v := stringArg(args, key)
 	// The blank space before a pasted PEM goes; the PEM itself, its last
@@ -149,13 +152,9 @@ func pemArg(args map[string]any, key string) string {
 	return v
 }
 
-// certNameTaken lists the certificates of the name: one there is refused
-// (its answer, else ""), since a repeat after a lost answer made a second
-// certificate (fault matrix, process audit 1.2.1). The previews stay
-// offline, so the check is the confirmed call's. list is for lostCreate.
 func certNameTaken(ctx context.Context, cli *certmanager.Client, name string) (list func(context.Context) ([]map[string]any, error), taken string) {
 	list = func(ctx context.Context) ([]map[string]any, error) {
-		return cli.List(ctx, certmanager.ListOptions{Name: name})
+		return namedResources(cli.List(ctx, certmanager.ListOptions{Name: name}))
 	}
 	existing, err := list(ctx)
 	if err != nil {
@@ -198,9 +197,11 @@ func (s *Registry) planCertDelete(ctx context.Context, args map[string]any) (*Pl
 	if err != nil {
 		return nil, err
 	}
+
 	if _, err := cli.Get(ctx, id); err != nil {
 		return answered(s.deleteFailed("cert_delete", id, err)), nil
 	}
+
 	force, _ := args["force"].(bool)
 	preview := map[string]any{"force": force, "message": i18n.Tf("cert_delete permanently deletes certificate %q if no service uses it (force=false: if one does, the service refuses the delete, by its specification).",
 		"cert_delete безвозвратно удаляет сертификат %q, если его не использует ни один сервис (force=false: если использует, сервис откажет в удалении — по его спецификации).", id),

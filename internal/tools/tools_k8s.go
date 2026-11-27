@@ -112,6 +112,7 @@ func (s *Registry) handleK8sOptions(ctx context.Context, args map[string]any) (s
 	for _, f := range pc.Flavors {
 		if f.GPU == 0 {
 			row := map[string]any{"flavor_id": f.FlavorID, "name": f.Name, "cpu": f.CPU, "ram": f.RAM}
+
 			if f.Purpose != "" {
 				row["purpose"] = f.Purpose
 			}
@@ -273,7 +274,8 @@ func (s *Registry) resolveK8sPlan(ctx context.Context, args map[string]any) (k8s
 		ControlPlaneConfiguration: mk8s.ControlPlaneConfiguration{
 			Version:             version,
 			SizingConfiguration: mk8s.SizingConfiguration{MasterCount: masterCount, FlavorID: flavor.FlavorID},
-			Zones:               []string{zone.mk8sID},
+
+			Zones: []string{zone.mk8sID},
 		},
 		NetworkConfiguration:  mk8s.NetworkConfiguration{PrivateVipSubnetID: subnetID, KubeApiInternet: kubeApiInternet},
 		IdentityConfiguration: mk8s.IdentityConfiguration{ClusterSaID: clusterSaID},
@@ -303,6 +305,7 @@ func (s *Registry) handleK8sPlan(ctx context.Context, args map[string]any) (stri
 		"cluster_sa_id":     req.IdentityConfiguration.ClusterSaID,
 		"kube_api_internet": req.NetworkConfiguration.KubeApiInternet,
 		"warnings":          plan.warnings,
+
 		"note": i18n.T("Read-only plan. On the user's approval call k8s_create with the same args + confirmed=true. Cluster creation is async (5-10 min per the docs, 7-12 seen live); poll k8s_get. Add workers with k8s_add_nodepool.",
 			"План только для чтения: кластер не создан. Создать — evo k8s create с теми же флагами (без терминала — с --yes). Кластер создаётся асинхронно: 5–10 мин по документации, вживую 7–12; статус — evo k8s get <ID кластера>. Рабочие узлы — evo k8s add-nodepool <ID кластера>."),
 	}), false
@@ -313,6 +316,7 @@ func (s *Registry) planK8sCreate(ctx context.Context, args map[string]any) (*Pla
 	if err := k8sArgsError(args); err != nil {
 		return nil, err
 	}
+
 	name := k8sClusterNameArg(args)
 	cli, _, _, err := s.k8sClient(ctx)
 	if err != nil {
@@ -324,7 +328,7 @@ func (s *Registry) planK8sCreate(ctx context.Context, args map[string]any) (*Pla
 		for _, c := range clusters {
 			listed = append(listed, map[string]any{"id": c.ID, "name": c.Name, "status": c.Status})
 		}
-		return listed, err
+		return namedResources(listed, err)
 	}
 	listed, err := list(ctx)
 	if err != nil {
@@ -333,6 +337,7 @@ func (s *Registry) planK8sCreate(ctx context.Context, args map[string]any) (*Pla
 	if id, st, ok := takenName(listed, name); ok {
 		return answered(nameTakenResult(i18n.T("Kubernetes cluster", "кластер Kubernetes"), name, id, st, "k8s_get cluster_id="+id)), nil
 	}
+
 	plan, err := s.resolveK8sPlan(ctx, args)
 	if err != nil {
 		return nil, err
@@ -592,6 +597,7 @@ func (s *Registry) planK8sNodePoolScale(ctx context.Context, args map[string]any
 	if _, ok := args["count"]; !ok {
 		return nil, usageErr("count is required", "нужен count")
 	}
+
 	count := intArg(args, "count", 0)
 	cli, _, _, err := s.k8sClient(ctx)
 	if err != nil {
@@ -731,6 +737,7 @@ func (s *Registry) planK8sNodePoolScale(ctx context.Context, args map[string]any
 		}
 		preview["message"] = i18n.Tf("k8s_nodepool_scale adds %d billable node(s) to node pool %s: %d → %d.",
 			"k8s_nodepool_scale добавляет платные узлы в группу %[2]s: %[1]d шт., было %[3]d, станет %[4]d.", add, label, desired, count)
+
 		will["price_classes"] = []engine.ResourcePrice{{Resource: engine.ResourceK8sNodePool, Class: engine.PricePaidUnpriced,
 			Note: i18n.T("price unknown, the resource is billable: the nodes of a pool are billed for their flavor and disk by the rates at tariff_url",
 				"цена неизвестна, ресурс платный: узлы группы тарифицируются по своей конфигурации и диску, тарифы — по tariff_url")}}
@@ -750,6 +757,7 @@ func (s *Registry) planK8sNodePoolScale(ctx context.Context, args map[string]any
 		warnings = append(warnings, i18n.Tf("the pool is in status %s, not running: whether the platform accepts the scale is unknown",
 			"группа в состоянии %s, а не работает: примет ли платформа изменение — неизвестно", quoteCloud(status)))
 	}
+
 	if len(warnings) > 0 {
 		preview["warning"] = strings.Join(warnings, "; ")
 	}
@@ -894,6 +902,7 @@ func (s *Registry) planK8sNodePoolDelete(ctx context.Context, args map[string]an
 			i18n.Tf("node pool %s: the node pools of its cluster could not be read, so evo cannot tell whether it is the last one; nothing was sent", "группа узлов %s: список групп её кластера не прочитан — последняя ли она, evo сказать не может; ничего не отправлено", id),
 			i18n.T("Repeat the call; k8s_nodepools shows the pools of the cluster.", "Повторите вызов; группы кластера показывает evo k8s nodepools."), err)
 	}
+
 	last, running := true, false
 	var idle []string
 	for _, o := range pools {
@@ -1006,11 +1015,10 @@ func (s *Registry) planK8sAddNodePool(ctx context.Context, args map[string]any) 
 	if err != nil {
 		return nil, err
 	}
-	// A pool of the name in the cluster: a repeat after a lost answer made
-	// a second billable pool (fault matrix, process audit 1.2.1).
+
 	name := nodePoolName(args)
 	list := func(ctx context.Context) ([]map[string]any, error) {
-		return cli.ListNodePools(ctx, clusterID)
+		return namedResources(cli.ListNodePools(ctx, clusterID))
 	}
 	listed, err := list(ctx)
 	if err != nil {
@@ -1019,6 +1027,7 @@ func (s *Registry) planK8sAddNodePool(ctx context.Context, args map[string]any) 
 	if id, st, ok := takenName(listed, name); ok {
 		return answered(nameTakenResult(i18n.T("node pool", "группа узлов"), name, id, st, "k8s_nodepools cluster_id="+clusterID)), nil
 	}
+
 	pc, err := cli.ProductConfiguration(ctx)
 	if err != nil {
 		return nil, err
@@ -1027,6 +1036,7 @@ func (s *Registry) planK8sAddNodePool(ctx context.Context, args map[string]any) 
 	if err != nil {
 		return nil, err
 	}
+
 	zoneRef := stringArg(args, "zone")
 	if zoneRef == "" {
 		// Not the product's default zone when the cluster's is unreadable:
@@ -1082,6 +1092,7 @@ func (s *Registry) planK8sAddNodePool(ctx context.Context, args map[string]any) 
 			map[string]any{"flavor": flavor.Name, "cpu": flavor.CPU, "ram_gb": flavor.RAM, "count": count, "disk_gb": diskSize,
 				"zone": zone.name, "nodes_subnet_id": nodesSubnetID, "nodes_subnet_name": nodesSubnetName,
 				"security_group_id": sgID, "security_group_name": sgName,
+
 				"update_strategy": mk8s.StrategyRollingUpdate}))
 		if err != nil {
 			return nil, err
@@ -1133,6 +1144,7 @@ func k8sArgsError(args map[string]any) error {
 				i18n.T("1 — a zonal control plane; 3 or 5 — a highly available one.", "1 — зональные мастер-узлы; 3 или 5 — отказоустойчивые."))
 		}
 	}
+
 	return k8sClusterName(k8sClusterNameArg(args))
 }
 
@@ -1187,6 +1199,8 @@ func (s *Registry) k8sZone(ctx context.Context, pc *mk8s.ProductConfig, ref stri
 			}
 		}
 	}
+	// The Russian hint is the CLI's (MCP speaks English, D6): evo's
+	// commands, not the tools (Cursor review of 1.2.2, CUR122-5).
 	hint := i18n.T("k8s_options lists the zones of Managed Kubernetes.", "Зоны Managed Kubernetes — в выводе evo k8s options.")
 	if len(offered) > 0 {
 		hint = i18n.Tf("Zones of Managed Kubernetes: %s (k8s_options).", "Зоны Managed Kubernetes: %s (evo k8s options).", strings.Join(offered, ", "))
@@ -1198,6 +1212,7 @@ func (s *Registry) k8sZone(ctx context.Context, pc *mk8s.ProductConfig, ref stri
 		return k8sZoneRef{}, clierrors.New(clierrors.CodeUsage,
 			i18n.Tf("zone %s is not offered for Managed Kubernetes", "зона %s недоступна для Managed Kubernetes", z.name), hint)
 	case z.mk8sID == "":
+
 		z.mk8sID = z.computeID
 	case z.computeID == "":
 		z.computeID = z.mk8sID

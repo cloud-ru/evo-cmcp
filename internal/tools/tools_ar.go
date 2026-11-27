@@ -75,7 +75,11 @@ func (s *Registry) planArCreate(ctx context.Context, args map[string]any) (*Plan
 	if err != nil {
 		return nil, err
 	}
-	existing, err := cli.ListRegistries(ctx)
+
+	list := func(ctx context.Context) ([]map[string]any, error) {
+		return namedResources(cli.ListRegistries(ctx))
+	}
+	existing, err := list(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("check the name is free: list registries: %w", "проверка, что имя свободно: список реестров: %w"), err)
 	}
@@ -104,15 +108,14 @@ func (s *Registry) planArCreate(ctx context.Context, args map[string]any) (*Plan
 			if err == nil {
 				err = noID("operation")
 			}
-			return lostCreate(ctx, "ar_create", cli.ListRegistries, i18n.T("registry", "реестр"), name, nil, "ar_get id", fmt.Errorf(i18n.T("create registry: %w", "создание реестра: %w"), err))
+			return lostCreate(ctx, "ar_create", list, i18n.T("registry", "реестр"), name, nil, "ar_get id", fmt.Errorf(i18n.T("create registry: %w", "создание реестра: %w"), err))
 		}
 		out := map[string]any{
 			"status": "creating", "operation_id": op.ID,
 			"note": i18n.T("Async — poll ar_operation(operation_id) until done=true; then ar_get for the status ACTIVE. Push images to <registry>.cr.cloud.ru (docker login with the SA key).",
 				"Асинхронно — опрашивайте evo ar operation <operation_id> до done=true; затем статус ACTIVE покажет evo ar get. Образы отправляйте в <registry>.cr.cloud.ru (docker login с ключом сервисного аккаунта)."),
 		}
-		// The registry's id is in the create's answer: named at once, not left
-		// to ar_list (fault matrix, process audit 1.2.1; as pg_create, N-07).
+
 		if op.ResourceID != "" {
 			out["registry_id"] = op.ResourceID
 		} else {

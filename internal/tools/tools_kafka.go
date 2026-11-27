@@ -139,6 +139,9 @@ func everyZoneClosed(zones []*provision.AvailabilityZone) error {
 		i18n.T("Pass 'zone' once a zone takes new resources: list_zones (evo vm zones) shows them.", "Передайте 'zone', когда зона снова примет новые ресурсы: их показывает list_zones (evo vm zones)."))
 }
 
+// subnetMissingError is "no subnet of the project in this zone". The plan
+// answers it with missing=subnet_id so the CLI words the hint with
+// --subnet-id (G130-27); CLIError.Details are not used.
 type subnetMissingError struct{ error }
 
 func (e *subnetMissingError) Unwrap() error { return e.error }
@@ -167,6 +170,7 @@ func dbaasSubnet(ctx context.Context, eng *engine.Engine, subnetArg string) (sub
 	if err != nil {
 		return "", "", "", "", err
 	}
+
 	if cerr := provision.ClosedZoneError(zones, zoneID); cerr != nil {
 		return "", "", "", "", cerr
 	}
@@ -198,6 +202,7 @@ func pickDBaaSSubnet(ctx context.Context, eng *engine.Engine, subnetArg string, 
 			}
 		}
 		if picked == nil && len(subs) > 0 {
+
 			ids := make([]string, len(subs))
 			for i, sn := range subs {
 				ids[i] = sn.ID
@@ -350,7 +355,7 @@ func (s *Registry) planKafkaCreate(ctx context.Context, args map[string]any) (*P
 	if err != nil {
 		return nil, err
 	}
-	existing, err := cli.ListClusters(ctx, kafkaQuery())
+	existing, err := namedResources(cli.ListClusters(ctx, kafkaQuery()))
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("check the name is free: list clusters: %w", "проверка, что имя свободно: список кластеров: %w"), err)
 	}
@@ -361,6 +366,7 @@ func (s *Registry) planKafkaCreate(ctx context.Context, args map[string]any) (*P
 	versionID := stringArg(args, "version_id")
 	vers, e := cli.ListVersions(ctx, kafkaQuery())
 	if versionID != "" {
+
 		if e == nil {
 			if err := notInCatalogue(i18n.T("Kafka version", "версии Kafka"), versionID, listed(vers, "id"), "kafka_versions"); err != nil {
 				return nil, err
@@ -411,6 +417,9 @@ func (s *Registry) planKafkaCreate(ctx context.Context, args map[string]any) (*P
 		"cpu": spec["cpu"], "memory_gb": spec["memory"], "storage_gib": storage, "brokers": brokers, "subnet_id": subnetID,
 		"availability_zone": zone, "ui_enabled": boolArg(args, "ui_enabled", false),
 		"cruise_control_enabled": false, "cruise_control_rebalance_auto_enabled": false,
+		// evo sends no controller_spec: by the spec of 10.11 every host is
+		// then a broker and a controller, and the mode cannot be changed
+		// after the creation — the preview names it (axis 4).
 		"controllers": "combined"}
 	if subnetName != "" {
 		willCreate["subnet_name"] = subnetName
@@ -439,7 +448,9 @@ func (s *Registry) planKafkaCreate(ctx context.Context, args map[string]any) (*P
 			if err == nil {
 				err = noID("operation")
 			}
-			list := func(ctx context.Context) ([]map[string]any, error) { return cli.ListClusters(ctx, kafkaQuery()) }
+			list := func(ctx context.Context) ([]map[string]any, error) {
+				return namedResources(cli.ListClusters(ctx, kafkaQuery()))
+			}
 			return lostCreate(ctx, "kafka_create", list, i18n.T("Kafka cluster", "кластер Kafka"), name, willCreate, "kafka_get cluster_id", fmt.Errorf(i18n.T("create cluster: %w", "создание кластера: %w"), err))
 		}
 		out := map[string]any{"status": "creating", "operation_id": op.ID, "cluster_id": op.ResourceID,
@@ -486,6 +497,8 @@ func (s *Registry) planKafkaDelete(ctx context.Context, args map[string]any) (*P
 			op, err := cli.DeleteCluster(ctx, id)
 			if err != nil {
 				if msg := fmt.Sprintf("delete cluster: %v", err); strings.Contains(msg, "API 500") {
+					// Cloud.ru answers 500 to the delete of a cluster still being
+					// created (register DB-17) and of a FAILED one (G13-19).
 					return errResult(clierrors.New(clierrors.CodeAPIError, msg, i18n.T(
 						"Cloud.ru refuses to delete a cluster still being created or in FAILED. Still being created (DEPLOYING): wait until kafka_get shows it READY, then call kafka_delete again. In FAILED: ",
 						"Cloud.ru не удаляет кластер, который ещё создаётся или в FAILED. Ещё создаётся (DEPLOYING): дождитесь READY в kafka_get и повторите kafka_delete. В FAILED: ")+engine.FailedDeleteNote(id))), true

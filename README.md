@@ -22,7 +22,7 @@ Registry и Container Apps — и развёртывает `docker-compose`-пр
 
   [Руководство пользователя](https://cdn.cloud.ru/docs/files/cmcp/evolution-cmcp-1.9.0-cloud.ru-v14.pdf)
 
-## Возможности (v1.9.0)
+## Возможности (v1.9.1)
 
 **Ресурсы облака.** Виртуальные машины, диски, образы и продукты
 маркетплейса; VPC, подсети, группы безопасности и их правила, floating IP,
@@ -98,7 +98,7 @@ Artifact Registry и Container Apps. Только чтение — биллин�
 
 Что изменилось от версии к версии и ломающие изменения с инструкцией «было →
 стало → что поменять» — в [CHANGELOG.md](CHANGELOG.md); анонс выпуска —
-[docs/release-notes/v1.9.0.md](docs/release-notes/v1.9.0.md).
+[docs/release-notes/v1.9.1.md](docs/release-notes/v1.9.1.md).
 
 ## Что понадобится
 
@@ -139,7 +139,7 @@ evo version
 Скрипт ставит последний стабильный релиз, проверяет sha256 архива и, если
 установлен `cosign`, подпись релиза, и кладёт бинарь в `~/.local/bin` (под
 root — в `/usr/local/bin`). Конкретная версия —
-`CLOUDRU_VM_VERSION=v1.9.0` перед `sh` (см. [install.md](docs/install.md)).
+`CLOUDRU_VM_VERSION=v1.9.1` перед `sh` (см. [install.md](docs/install.md)).
 
 Windows: скачайте `evo_<версия>_windows_amd64.zip` (или `arm64`) из
 [Releases](https://github.com/cloud-ru/evo-cmcp/releases), распакуйте `evo.exe`
