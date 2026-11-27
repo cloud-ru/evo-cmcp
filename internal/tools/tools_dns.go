@@ -15,6 +15,7 @@ import (
 	"github.com/cloud-ru/evo-cmcp/internal/engine"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 )
 
 // dnsClient builds an authenticated Evolution DNS client (standalone → newEngine token).
@@ -47,6 +48,11 @@ func dnsDelegationWarning(vis string) string {
 		"публичная зона обслуживает запросы только после делегирования домена")
 }
 
+// dnsZoneVisibility is the visibility of zone zoneID: type when given,
+// otherwise the list (public, then private) that holds the zone, as
+// dns_zones reads them. Without type the tools went to the public API,
+// and a private zone answered 403 there (live run 18.10: dns_zone_delete
+// left the zone). A zone in neither list is NOT_FOUND.
 func dnsZoneVisibility(ctx context.Context, cli *dns.Client, args map[string]any, zoneID string) (string, error) {
 	if stringArg(args, "type") != "" {
 		return dnsVisibility(args), nil
@@ -143,6 +149,9 @@ func (s *Registry) handleDnsZones(ctx context.Context, args map[string]any) (str
 				"id": z["id"], "name": firstNonNil(z["name"], z["domain"]),
 				"domain": z["domain"], "visibility": vis,
 				"valid": z["valid"], "delegated": z["delegated"],
+				// the zone's lifecycle state (dns/openapi.yaml: state; a public
+				// zone also has confirmState): without it a zone being deleted
+				// looked alive (live run 18.10: "Удаляется" in the console)
 				"state": z["state"], "confirm_state": z["confirmState"],
 			})
 		}
@@ -184,10 +193,12 @@ func (s *Registry) planDnsZoneCreate(ctx context.Context, args map[string]any) (
 	if name == "" {
 		name = domain
 	}
-	list := func(ctx context.Context) ([]map[string]any, error) { return cli.ListZones(ctx, vis) }
+
+	list := func(ctx context.Context) ([]map[string]any, error) { return namedResources(cli.ListZones(ctx, vis)) }
 	if ans, refused := nameFree(ctx, list, i18n.T("DNS zone", "зона DNS"), name, "dns_zones"); refused {
 		return answered(ans, true), nil
 	}
+
 	will := map[string]any{"name": stringArg(args, "name"), "visibility": vis}
 	var vpcID string
 	switch {
@@ -227,11 +238,11 @@ func (s *Registry) planDnsZoneCreate(ctx context.Context, args map[string]any) (
 		}
 		out := map[string]any{"status": "creating", "visibility": vis, "operation_id": op.ID, "note": i18n.T("Async — poll dns_operation(operation_id); then dns_zones for the id (public zones return a verification_token to delegate).",
 			"Асинхронно — опрашивайте evo dns operation <operation_id>; затем id покажет evo dns zones (у публичной зоны есть verification_token для делегирования).")}
-		// The zone's id is in the create's answer: named at once (fault matrix,
-		// process audit 1.2.1; as pg_create, N-07).
+
 		if op.ResourceID != "" {
 			out["zone_id"] = op.ResourceID
 		}
+
 		nextStep(out, "dns_operation", map[string]any{"operation_id": op.ID})
 		return toJSON(out), false
 	}}, nil
@@ -267,6 +278,7 @@ func (s *Registry) planDnsZoneDelete(ctx context.Context, args map[string]any) (
 	if err != nil {
 		return answered(s.deleteFailed("dns_zone_delete", id, err)), nil
 	}
+
 	if stringArg(args, "type") != "" || vis == "private" {
 		zone, err := cli.GetZone(ctx, vis, id)
 		if err != nil {
@@ -444,14 +456,17 @@ func (s *Registry) planDnsRecordCreate(ctx context.Context, args map[string]any)
 	if err != nil {
 		return nil, err
 	}
-	// A record is known by its name and type in the zone: a repeat after a
-	// lost answer added a second one (fault matrix, process audit 1.2.1).
+
 	key := name + " " + rtype
 	list := func(ctx context.Context) ([]map[string]any, error) {
 		records, err := cli.ListRecords(ctx, vis, zoneID)
 		listed := make([]map[string]any, 0, len(records))
 		for _, r := range records {
-			listed = append(listed, map[string]any{"id": r["id"], "name": fmt.Sprint(r["name"]) + " " + strings.ToLower(fmt.Sprint(r["type"]))})
+			recordName, recordType := stringArg(r, "name"), stringArg(r, "type")
+			if strings.TrimSpace(recordName) == "" || strings.TrimSpace(recordType) == "" {
+				return nil, pager.Incomplete(i18n.T("a DNS record has no name or type to check", "у записи DNS нет имени или типа для проверки"))
+			}
+			listed = append(listed, map[string]any{"id": r["id"], "name": recordName + " " + strings.ToLower(recordType)})
 		}
 		return listed, err
 	}
@@ -505,6 +520,7 @@ func (s *Registry) planDnsRecordDelete(ctx context.Context, args map[string]any)
 	if err != nil {
 		return answered(s.deleteFailed("dns_record_delete", id, err)), nil
 	}
+
 	if stringArg(args, "type") != "" {
 		if _, err := dnsGetRecord(ctx, cli, vis, id); err != nil {
 			return answered(s.deleteFailed("dns_record_delete", id, err)), nil

@@ -37,10 +37,12 @@ func (r *Registry) beginIntent(ctx context.Context, name string, args map[string
 	// before it goes out, and a record of a killed call without the mark
 	// sent nothing (intent.Intent.Counts).
 	_, in.Counts = httpretry.Writes(ctx)
+
 	eng, noEngine := r.engineOfCall(args)
 	if eng != nil {
 		in.Zone, in.Key = eng.Config.Region, eng.Maker()
 	}
+
 	if callerOf(ctx) != nil {
 		in.Surface = "cli"
 	}
@@ -82,6 +84,7 @@ func (r *Registry) beginIntent(ctx context.Context, name string, args map[string
 		// written and the record ended: not on the way of the change, once
 		// a day, with a limit of time (history.Prune).
 		defer r.pruneJournal(dir)
+
 		if own, ok := ctx.Value(callRecordsKey{}).(*callRecords); ok && own.hasOpen && own.open.ID == rec.ID {
 			rec.Parties = own.open.Parties
 		}
@@ -89,7 +92,16 @@ func (r *Registry) beginIntent(ctx context.Context, name string, args map[string
 			rec.Parties = r.partiesOf(ctx, name, args)
 		}
 		out := historyOutcome(name, args, answer)
+		if name == "deploy" && out.ResourceID != "" {
+			var res struct {
+				Region string `json:"region"`
+			}
+			if json.Unmarshal([]byte(answer), &res) == nil && res.Region != "" {
+				rec.Zone = res.Region
+			}
+		}
 		if ctx.Err() != nil || intent.OutcomeUnknown(answerReason(answer), answerHTTPStatus(answer)) {
+
 			if n, counted := httpretry.Writes(ctx); counted && n == 0 {
 				out.Result = history.Error
 				if out.Reason == "" {
@@ -104,6 +116,7 @@ func (r *Registry) beginIntent(ctx context.Context, name string, args map[string
 			intent.End(rec, out)
 			return
 		}
+
 		if next, goesOn := sameToolNext(name, answer); goesOn && answerReason(answer) == "" {
 			// Named as a call of the step would be (the same rule of the
 			// project of a call addressed by id).
@@ -178,9 +191,12 @@ func (r *Registry) canonArgs(name string, args map[string]any) []byte {
 type changeRule struct {
 	// read is the tool that shows the resource after a call whose outcome
 	// is not known.
-	read      string
-	target    func(ctx context.Context, r *Registry, args map[string]any) (name, target string, err error)
-	made      bool
+	read string
+
+	target func(ctx context.Context, r *Registry, args map[string]any) (name, target string, err error)
+
+	made bool
+
 	notBilled bool
 	// settledBy reads the resource and says what the record of a cut call
 	// of the tool means now: the change is made (the record closes, no
@@ -226,25 +242,33 @@ func unbilledCreate(tool, parent string, name func(args map[string]any) string) 
 func nameArg(args map[string]any) string { return stringArg(args, "name") }
 
 var everySendIsAChange = map[string]changeRule{
-	"vm_reboot":        {read: "vm_get", target: vmTarget("vm_reboot")},
-	"vm_start":         {read: "vm_get", target: vmTarget("vm_start"), settledBy: vmSettled("vm_start")},
-	"vm_stop":          {read: "vm_get", target: vmTarget("vm_stop"), settledBy: vmSettled("vm_stop")},
-	"backup_create":    {read: "backup_list"},
-	"backup_restore":   {read: "disk_list"},
-	"sg_rule_create":   {read: "list_security_groups", target: groupTarget("security_group", sgRuleArgsValid)},
+
+	"vm_reboot": {read: "vm_get", target: vmTarget("vm_reboot")},
+
+	"vm_start": {read: "vm_get", target: vmTarget("vm_start"), settledBy: vmSettled("vm_start")},
+	"vm_stop":  {read: "vm_get", target: vmTarget("vm_stop"), settledBy: vmSettled("vm_stop")},
+
+	"backup_create": {read: "backup_list"},
+
+	"backup_restore": {read: "disk_list"},
+
+	"sg_rule_create": {read: "list_security_groups", target: groupTarget("security_group", sgRuleArgsValid)},
+
 	"pg_create":        paidCreate("pg_create", "", nameArg),
 	"kafka_create":     paidCreate("kafka_create", "", nameArg),
 	"redis_create":     paidCreate("redis_create", "", nameArg),
 	"k8s_create":       paidCreate("k8s_create", "", k8sClusterNameArg),
 	"k8s_add_nodepool": paidCreate("k8s_add_nodepool", "cluster_id", nodePoolName),
 	"lb_create":        paidCreate("lb_create", "", nameArg),
+
 	"vpc_create":       paidCreate("vpc_create", "", nameArg),
 	"tg_create":        paidCreate("tg_create", "", nameArg),
 	"ar_create":        paidCreate("ar_create", "", nameArg),
 	"cert_import":      paidCreate("cert_import", "", nameArg),
 	"pg_backup_create": paidCreate("pg_backup_create", "cluster_id", nameArg),
-	"pg_db_create":     unbilledCreate("pg_db_create", "cluster_id", nameArg),
-	"pg_user_create":   unbilledCreate("pg_user_create", "cluster_id", nameArg),
+
+	"pg_db_create":   unbilledCreate("pg_db_create", "cluster_id", nameArg),
+	"pg_user_create": unbilledCreate("pg_user_create", "cluster_id", nameArg),
 	"secret_add_version": {read: "secret_get", target: func(_ context.Context, _ *Registry, args map[string]any) (string, string, error) {
 		if path := stringArg(args, "path"); path != "" {
 			return "", "path=" + path, nil
@@ -329,6 +353,7 @@ func (r *Registry) callsOn(ctx context.Context, name string, args map[string]any
 		if (in.Held && in.CutSend.IsZero()) || in.Tool != name || in.Key == nil {
 			continue
 		}
+
 		if in.InFlight() != inFlight {
 			continue
 		}
@@ -392,6 +417,7 @@ func (r *Registry) callsOn(ctx context.Context, name string, args map[string]any
 				forgetPending(ctx)
 				continue
 			case err == nil && o == outcomeGoesOn:
+
 				if in.CutSend.IsZero() {
 					intent.HoldCut(in, in.StartedAt)
 					forgetPending(ctx)
@@ -458,6 +484,7 @@ func goingOnAnswer(name string, going []intent.Intent) string {
 	last := going[len(going)-1]
 	what := firstNonEmptyStr(last.Name, last.Target)
 	rule := everySendIsAChange[name]
+
 	return toJSON(map[string]any{"status": "confirmation_required", "reason": clierrors.CodeConfirmationRequired, "going_on": map[string]any{"calls": len(going), "read": rule.read},
 		"message": i18n.Tf("An earlier %s of %s, started %s, has not returned yet: it is going on. A call now would be one more change, not a repeat of that one, so nothing was sent. Once it returns, %s shows the resource; whether to send one more is the person's decision.",
 			"Предыдущий вызов %s для %s, начатый %s, ещё не вернулся: он идёт. Вызов сейчас — ещё одно изменение, а не повтор того, поэтому ничего не отправлено. Когда он вернётся, ресурс покажет %s; отправлять ли ещё одно — решение человека.",
@@ -539,6 +566,7 @@ func (r *Registry) settleHeld(ctx context.Context, name string, args map[string]
 		if !in.Held || in.Tool != name {
 			continue
 		}
+
 		if (in.Name == resource && in.Target == target && (resource != "" || target != "")) ||
 			(in.Name == "" && answerNames(answer, in.Target)) {
 			held = append(held, in)
@@ -731,6 +759,9 @@ func answerHTTPStatus(answer string) int {
 	return int(a.Status)
 }
 
+// withoutAPIStatus is answer without apiStatusField: the status is the
+// record's, not the caller's — the answer stays the same whichever 4xx
+// the platform gave (CMP-7).
 func withoutAPIStatus(answer string) string {
 	if !strings.Contains(answer, `"`+apiStatusField+`"`) {
 		return answer
@@ -745,6 +776,7 @@ func withoutAPIStatus(answer string) string {
 
 // answerReason is the reason of a tool's answer, "" when it has none.
 func answerReason(answer string) string {
+
 	var a map[string]any
 	if json.Unmarshal([]byte(answer), &a) != nil {
 		return ""
@@ -775,6 +807,7 @@ func (r *Registry) pendingNotes(root string, own []string, call callResource) (n
 		}
 		named = append(named, in)
 	}
+
 	slices.SortStableFunc(named, func(a, b intent.Intent) int { return a.StartedAt.Compare(b.StartedAt) })
 	others := 0
 	for _, in := range named {
@@ -796,6 +829,7 @@ func (r *Registry) pendingNotes(root string, own []string, call callResource) (n
 		notes = append(notes, r.pendingNote(in, cur))
 	}
 	if folded > 0 {
+
 		notes = append(notes, i18n.Tf("and %d more, started before these: evo doctor (over MCP on stdio — the doctor tool) shows every one",
 			"и ещё %d, начатых раньше этих: evo doctor (по MCP по stdio — инструмент doctor) показывает все", folded))
 	}
@@ -859,14 +893,20 @@ func (r *Registry) pendingNote(in intent.Intent, cur *state.Maker) string {
 		name = quoteCloud(name)
 	}
 	tool := quoteCloud(in.Tool)
+
 	if in.InFlight() {
 		return i18n.Tf("%s %s%s, started %s (%s, pid %d): the call has not returned yet, it is going on",
 			"%s %s%s, начат %s (%s, pid %d): вызов ещё не вернулся, он идёт",
 			tool, name, where, started, quoteCloud(in.Surface), in.PID)
 	}
-	head := i18n.Tf("%s %s%s, started %s (%s, pid %d): the cloud did not answer, the outcome is unknown",
-		"%s %s%s, начат %s (%s, pid %d): облако не ответило, исход неизвестен",
-		tool, name, where, started, quoteCloud(in.Surface), in.PID)
+	outcome := i18n.T("the cloud did not answer, the outcome is unknown", "облако не ответило, исход неизвестен")
+	if in.Tool == "ca_delete" {
+		// The DELETE may have answered before cancellation interrupted the poll.
+		outcome = i18n.T("deletion has not been confirmed", "удаление не подтверждено")
+	}
+	head := i18n.Tf("%s %s%s, started %s (%s, pid %d): %s",
+		"%s %s%s, начат %s (%s, pid %d): %s",
+		tool, name, where, started, quoteCloud(in.Surface), in.PID, outcome)
 	// An operation that goes on: the call that started it ended at its
 	// time limit, and the step its answer named goes on with it.
 	if in.Held && !in.Key.Other(cur) {
@@ -880,12 +920,17 @@ func (r *Registry) pendingNote(in intent.Intent, cur *state.Maker) string {
 		return head + i18n.Tf(" — sent with another key (%s): a call with this key does not close the record; run evo doctor with that key",
 			" — отправлено другим ключом (%s): вызов этим ключом запись не закроет; запустите evo doctor с тем ключом", quoteCloud(in.Key.KeyID))
 	}
+	if in.Tool == "ca_delete" {
+		return head + i18n.T(" — check the app by name with ca_get (evo ca get in the CLI)",
+			" — проверьте приложение по имени через ca_get (в CLI — evo ca get)")
+	}
 	// Every call of the tool is one more change: the same call again does
 	// not settle the record, it changes the resource a second time.
 	if read := everySendIsAChange[in.Tool].read; read != "" {
 		return head + i18n.Tf(" — %s shows it; the same %s again is one more change, not a repeat: whether to send it is the person's decision",
 			" — его показывает %s; тот же %s ещё раз — это ещё одно изменение, а не повтор: слать ли его — решает человек", quoteCloud(read), tool)
 	}
+
 	if _, k, id, byID := deleteByID(in); byID {
 		if k.card == nil {
 			// No read by id closes it: doctor says the same and no more.
@@ -1000,6 +1045,7 @@ func readSkipOf(k *ownerKind, key, cur *state.Maker) readSkip {
 }
 
 func (r *Registry) checkByList(ctx context.Context, in intent.Intent, active string) (found string, settled bool, listedID string) {
+
 	if in.ProjectID != "" && active != "" && in.ProjectID != active {
 		return i18n.Tf("the record is of project %s, the active one is %s: check it there", "запись из проекта %s, активный — %s: проверьте в нём", quoteCloud(in.ProjectID), active), false, ""
 	}
@@ -1035,6 +1081,7 @@ func (r *Registry) checkByList(ctx context.Context, in intent.Intent, active str
 		return "", false, ""
 	}
 	items, _ := m[c.field].([]any)
+
 	matched := false
 	listed := ""
 	for _, it := range items {
@@ -1113,6 +1160,7 @@ func withNotes(answer string, notes []string) (string, bool) {
 		return answer, false // not an object: the next answer carries them
 	}
 	m["pending_operations"] = notes
+
 	if u, _ := m["_untrusted"].([]any); slices.Contains(u, any("pending_operations")) {
 		// Named already: the answer of a call that kept a record.
 	} else if u != nil {

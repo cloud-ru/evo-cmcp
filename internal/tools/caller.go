@@ -54,7 +54,10 @@ type Caller struct {
 	// when the answer has them (the preview of a new VM). Without a Gate
 	// the tool gates on confirmed=true.
 	Gate func(ctx context.Context, answer string, human *confirm.Preview) (bool, error)
-	Yes  bool
+	// Yes is consent given in advance (--yes; destroy --force): the call
+	// is the one MCP makes with confirmed=true (TestParity_YesEqualsConfirmed),
+	// whether or not the engine finds anything to ask about.
+	Yes bool
 	// DryRun is the command's --dry-run: nothing is locked or changed.
 	DryRun bool
 	// NonInteractive is deploy --non-interactive: never prompt, Ctrl-C
@@ -80,7 +83,7 @@ type Caller struct {
 	// consent runs on a yes, before the engine writes anything: the gate
 	// writes the intent of the call there (engineGated). Its error refuses
 	// the call.
-	consent func() error
+	consent func(*confirm.Preview) error
 }
 
 func (c *Caller) ask(ctx context.Context, answer string, human *confirm.Preview) (bool, error) {
@@ -91,7 +94,7 @@ func (c *Caller) ask(ctx context.Context, answer string, human *confirm.Preview)
 	if ok && err == nil {
 		c.answeredYes = true
 		if c.consent != nil && !c.DryRun {
-			if err := c.consent(); err != nil {
+			if err := c.consent(human); err != nil {
 				return false, err
 			}
 		}

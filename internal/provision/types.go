@@ -32,6 +32,12 @@ type VM struct {
 	AvailabilityZone *ZoneRef `json:"availability_zone,omitempty"`
 }
 
+// UnmarshalJSON also reads the documented nested fields of GET /api/v1/vms
+// (openapi-v3): flavor{id}, image{id} and the public address on the
+// interfaces — interfaces[].floating_ip.ip_address, or ip_address of a
+// direct_ip interface. The flat flavor_id/image_id/public_ip/floating_ip are
+// not in the spec and came back empty (BACKLOG [04], api-contract §4.4);
+// they are kept for answers that still carry them.
 func (v *VM) UnmarshalJSON(b []byte) error {
 	type plain VM
 	var r struct {
@@ -175,6 +181,10 @@ func (s *Subnet) NoDNS() bool {
 	return s != nil && s.DNSServers != nil && len(*s.DNSServers) == 0
 }
 
+// UnmarshalJSON reads the zone from the documented nested
+// availability_zone{id,name}: the flat availability_zone_id is not in the
+// spec and was always empty, so subnets were matched to zones by name only
+// (api-contract §4.3).
 func (s *Subnet) UnmarshalJSON(b []byte) error {
 	type plain Subnet
 	var r struct {
@@ -198,6 +208,8 @@ func (s *Subnet) UnmarshalJSON(b []byte) error {
 // The documented list response has no rules, only their counts: read them
 // with ListSecurityGroupRules.
 type SecurityGroup struct {
+	// Only the complete cleanup inventory checks an explicitly returned scope.
+	projectID          json.RawMessage
 	ID                 string `json:"id"`
 	Name               string `json:"name"`
 	AvailabilityZoneID string `json:"availability_zone_id,omitempty"`
@@ -221,8 +233,9 @@ type Interface struct {
 	SecurityGroups []InterfaceGroup `json:"security_groups,omitempty"`
 	// Subnet is the subnet of the interface (vm_get): the card of a VM
 	// does not name it.
-	Subnet              *InterfaceSubnet `json:"subnet,omitempty"`
-	AllowedAddressPairs []AddressPair    `json:"allowed_address_pairs,omitempty"`
+	Subnet *InterfaceSubnet `json:"subnet,omitempty"`
+
+	AllowedAddressPairs []AddressPair `json:"allowed_address_pairs,omitempty"`
 }
 
 // AddressPair is an allowed address pair of an interface
@@ -260,12 +273,14 @@ func (g *SecurityGroup) UnmarshalJSON(b []byte) error {
 	type plain SecurityGroup
 	var r struct {
 		plain
-		AvailabilityZone *ZoneRef `json:"availability_zone"`
+		AvailabilityZone *ZoneRef        `json:"availability_zone"`
+		ProjectID        json.RawMessage `json:"project_id"`
 	}
 	if err := json.Unmarshal(b, &r); err != nil {
 		return err
 	}
 	*g = SecurityGroup(r.plain)
+	g.projectID = r.ProjectID
 	if g.AvailabilityZoneID == "" && r.AvailabilityZone != nil {
 		g.AvailabilityZoneID = r.AvailabilityZone.ID
 	}
@@ -363,16 +378,17 @@ type AvailabilityZone struct {
 
 // Flavor represents a VM sizing tier.
 type Flavor struct {
-	ID       string       `json:"id"`
-	Name     string       `json:"name"`
-	VCPUs    int          `json:"cpu"`
-	RAMGB    int          `json:"ram"`
-	DiskGB   int          `json:"disk_gb,omitempty"`
-	FreeTier bool         `json:"free_tier"`
-	GPU      *int         `json:"gpu,omitempty"`
-	Share    string       `json:"oversubscription,omitempty"`
-	Type     *FlavorType  `json:"flavor_type,omitempty"`
-	Zones    []FlavorZone `json:"availability_zones,omitempty"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	VCPUs    int    `json:"cpu"`
+	RAMGB    int    `json:"ram"`
+	DiskGB   int    `json:"disk_gb,omitempty"`
+	FreeTier bool   `json:"free_tier"`
+
+	GPU   *int         `json:"gpu,omitempty"`
+	Share string       `json:"oversubscription,omitempty"`
+	Type  *FlavorType  `json:"flavor_type,omitempty"`
+	Zones []FlavorZone `json:"availability_zones,omitempty"`
 }
 
 // FlavorType is the part of FlavorTypeSchema evo reads.
@@ -382,10 +398,13 @@ type FlavorType struct {
 
 // FlavorZone is a zone of a flavor (AvailabilityZoneFlavorSchema).
 type FlavorZone struct {
-	ID        string `json:"availability_zone_id"`
-	Name      string `json:"availability_zone_name"`
-	Enabled   bool   `json:"enabled"`
-	Available *bool  `json:"available,omitempty"`
+	ID      string `json:"availability_zone_id"`
+	Name    string `json:"availability_zone_name"`
+	Enabled bool   `json:"enabled"`
+	// Available is the zone's «available» when the answer has it: the
+	// specification makes it required, the platform sends none (CMP-25,
+	// api-probe 28 and 29, 2 of 2). nil is not «unavailable».
+	Available *bool `json:"available,omitempty"`
 	// State is the zone's FlavorState: created, creating, deleting,
 	// error_creating, error_deleting (the specification); "" when not sent.
 	State string `json:"state,omitempty"`
@@ -394,6 +413,12 @@ type FlavorZone struct {
 // Spot reports whether the flavor's type makes interruptible VMs.
 func (f *Flavor) Spot() bool { return f.Type != nil && f.Type.IsSpot }
 
+// ZoneNames are the zones a VM of the flavor can be created in: enabled,
+// not marked unavailable (the platform sends no «available», CMP-25), and
+// created — a flavor still being created or deleted in a zone, or failed
+// there, is not one to promise (the values the platform sends are not
+// probed yet: the specification's FlavorState). Empty when it names zones
+// and none is, nil when the answer names no zones.
 func (f *Flavor) ZoneNames() []string {
 	if f.Zones == nil {
 		return nil
@@ -427,13 +452,15 @@ type Image struct {
 	ProjectID string `json:"project_id,omitempty"`
 	Public    bool   `json:"public,omitempty"`
 	// MinCPU is in vCPU, MinRAM and MinDisk in GB.
-	MinCPU      int              `json:"min_cpu,omitempty"`
-	MinRAM      int              `json:"min_ram,omitempty"`
-	MinDisk     int              `json:"min_disk,omitempty"`
-	CreatedTime string           `json:"created_time,omitempty"`
-	OS          string           `json:"os"`     // not in the spec; usually empty
-	Status      string           `json:"status"` // not in the spec; usually empty
-	AvailZones  []ImageAvailZone `json:"availability_zones,omitempty"`
+	MinCPU      int    `json:"min_cpu,omitempty"`
+	MinRAM      int    `json:"min_ram,omitempty"`
+	MinDisk     int    `json:"min_disk,omitempty"`
+	CreatedTime string `json:"created_time,omitempty"`
+	OS          string `json:"os"`     // not in the spec; usually empty
+	Status      string `json:"status"` // not in the spec; usually empty
+	// AvailZones is the documented build state per zone
+	// (availability_zones[].state, .enabled; api-contract §4.6).
+	AvailZones []ImageAvailZone `json:"availability_zones,omitempty"`
 	// NotInProject marks a shared image that the project's own view of the
 	// catalogue (GET /images?project_id=) leaves out: creating a VM from it
 	// fails with 422 wrong_image (seen live 16.10.2026). images.Catalog sets
@@ -598,12 +625,13 @@ type ImageMetadataField struct {
 // Interface/VM are raw because the list endpoint may return them as nested
 // objects, strings, or omit them; presence is what signals "in use".
 type FloatingIP struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	IPAddress string          `json:"ip_address"`
-	State     string          `json:"state"`
-	Interface json.RawMessage `json:"interface,omitempty"`
-	VM        json.RawMessage `json:"vm,omitempty"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	IPAddress   string          `json:"ip_address"`
+	State       string          `json:"state"`
+	Interface   json.RawMessage `json:"interface,omitempty"`
+	VM          json.RawMessage `json:"vm,omitempty"`
+	Description string          `json:"description,omitempty"`
 	// NATGateway: the SNAT gateway the address belongs to
 	// (PublicFloatingIpResponse.nat_gateway). Such an address is the
 	// gateway's: it cannot be released on its own (DELETE answers 422
@@ -659,6 +687,7 @@ func isEmptyRaw(r json.RawMessage) bool {
 
 // CreateFloatingIPRequest contains parameters for floating IP creation.
 type CreateFloatingIPRequest struct {
+	Description        string `json:"description,omitempty"`
 	Name               string `json:"name"`
 	ProjectID          string `json:"project_id"`
 	InterfaceID        string `json:"interface_id,omitempty"` // empty: a free FIP, attached later

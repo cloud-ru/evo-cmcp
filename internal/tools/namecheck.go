@@ -11,9 +11,24 @@ import (
 
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 	"github.com/cloud-ru/evo-cmcp/internal/provision"
 	"github.com/cloud-ru/evo-cmcp/internal/receipt"
 )
+
+// namedResources requires a name on every row before deciding that a name
+// is available. A display list may otherwise include an unnamed resource.
+func namedResources(items []map[string]any, err error) ([]map[string]any, error) {
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if strings.TrimSpace(stringArg(item, "name")) == "" {
+			return nil, pager.Incomplete(i18n.T("a resource in the list has no name to check", "у ресурса в списке нет имени для проверки"))
+		}
+	}
+	return items, nil
+}
 
 func takenName(items []map[string]any, name string) (id, status string, ok bool) {
 	for _, m := range items {
@@ -66,7 +81,8 @@ func nameTakenResult(kind, name, id, status, getHint string) (string, bool) {
 // of what it made (operation or resource): the API's fault, API_ERROR, not
 // the caller's.
 func noID(what string) error {
-	return clierrors.New(clierrors.CodeAPIError, "the API answered no "+what+" id", "")
+	return clierrors.New(clierrors.CodeAPIError,
+		i18n.Tf("the API answered no %s id", "в ответе API нет идентификатора (тип «%s»)", what), "")
 }
 
 func noReceipt(err error, read string) error {
@@ -87,13 +103,19 @@ func lostCreate(ctx context.Context, tool string, list func(context.Context) ([]
 		return errResult(createErr), true
 	}
 	items, err := list(ctx)
-	if err != nil {
+	var id, status string
+	var ok bool
+	if err == nil {
+		id, status, ok = takenName(items, name)
+	}
+	// A server-assigned identity must actually be in the recovered row.
+	// A resource keyed by its input (such as a secret path) is identified by that match.
+	if err != nil || (ok && c.arg == "" && strings.TrimSpace(id) == "") {
 		return errAnswer(createErr, map[string]any{"warning": i18n.Tf(
 			"the %s %q may have been made and be billed: check %s by its name before any repeat — a repeat while it is not listed there may make a second",
 			"%s %q мог быть создан и оплачиваться: до любого повтора проверьте %s по имени — повтор, пока его там нет, может создать второй",
 			kind, name, listTool)}), true
 	}
-	id, status, ok := takenName(items, name)
 	if !ok {
 		// The request went out and the list does not show what it may
 		// have made: the answer sends to the read, not to a repeat.
@@ -110,6 +132,7 @@ func lostCreate(ctx context.Context, tool string, list func(context.Context) ([]
 	out := map[string]any{"status": answer, idField: id, "resource_status": status, "created": created,
 		"warning": i18n.Tf("the create answer did not come back, but the %s %q exists (id %s, status %s) and is billed", "ответ на создание не пришёл, но %s %q есть (id %s, статус %s) и оплачивается", kind, name, quoteCloud(id), quoteCloud(status)),
 		"note":    i18n.Tf("Poll %s for its status.", "Статус — %s.", getHint)}
+
 	cloudText(out, "resource_status")
 	return toJSON(out), false
 }

@@ -85,22 +85,17 @@ func opToMap(v any) map[string]any {
 	return m
 }
 
-// waitForOpJSON polls fetch() with capped exponential backoff (2s → 15s, capped at
-// wait_seconds, hard max opWaitMaxSeconds) until the operation is terminal or the
-// budget elapses. Returns the last observed state. Honors ctx cancellation.
-// The person at the CLI sees the wait as one line (Caller.Progress).
+// waitForOpJSON polls for the caller's time limit or the remaining MCP budget,
+// whichever comes first. The *_operation tools cap their wait_seconds argument.
 func waitForOpJSON(ctx context.Context, waitSeconds int, fetch func(context.Context) (map[string]any, error)) (map[string]any, error) {
-	if waitSeconds > opWaitMaxSeconds {
-		waitSeconds = opWaitMaxSeconds
-	}
-	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
-	callCtx, cancel := callCtx(ctx)
+	pollCtx, cancel := callCtx(ctx)
 	defer cancel()
-	if until, bounded := callCtx.Deadline(); bounded && until.Before(deadline) {
+	deadline := time.Now().Add(time.Duration(waitSeconds) * time.Second)
+	if until, bounded := pollCtx.Deadline(); bounded && until.Before(deadline) {
 		deadline = until
 	}
 	// cut: the budget, not the caller, ended a read or the sleep.
-	cut := func() bool { return ctx.Err() == nil && callCtx.Err() != nil }
+	cut := func() bool { return ctx.Err() == nil && pollCtx.Err() != nil }
 	delay := opWaitFirstDelay
 	pp, _ := progressOf(ctx)
 	wait := engine.NewWaitLine(pp, 0, func(elapsed, state string) string {
@@ -109,7 +104,7 @@ func waitForOpJSON(ctx context.Context, waitSeconds int, fetch func(context.Cont
 	defer wait.Done()
 	var last map[string]any
 	for {
-		m, err := fetch(callCtx)
+		m, err := fetch(pollCtx)
 		if err != nil {
 			if cut() && last != nil {
 				return stillRunning(last, waitSeconds), nil
@@ -121,16 +116,12 @@ func waitForOpJSON(ctx context.Context, waitSeconds int, fetch func(context.Cont
 			return m, nil
 		}
 		wait.State(opState(m))
-		if !time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return stillRunning(m, waitSeconds), nil
 		}
-		if rem := time.Until(deadline); rem < delay {
-			delay = rem
-		}
-		if delay <= 0 {
-			return stillRunning(m, waitSeconds), nil
-		}
-		if err := sleepShowing(callCtx, delay, wait); err != nil {
+		delay = min(delay, remaining)
+		if err := sleepShowing(pollCtx, delay, wait); err != nil {
 			if cut() {
 				return stillRunning(last, waitSeconds), nil
 			}
@@ -226,6 +217,7 @@ func waitState(ctx context.Context, eng *engine.Engine, limit time.Duration,
 	if t := eng.Timings.VMPollTimeout; t > 0 && t < timeout {
 		timeout = t
 	}
+
 	timeout, capped := callBound(ctx, timeout)
 	deadline := time.Now().Add(timeout)
 	last = "unknown"

@@ -16,6 +16,7 @@ import (
 	"github.com/cloud-ru/evo-cmcp/internal/output"
 	"github.com/cloud-ru/evo-cmcp/internal/provision"
 	"github.com/cloud-ru/evo-cmcp/internal/sgrules"
+	"github.com/cloud-ru/evo-cmcp/internal/state"
 	"github.com/cloud-ru/evo-cmcp/internal/verify"
 	"github.com/cloud-ru/evo-cmcp/internal/vmstage"
 )
@@ -36,7 +37,8 @@ type Engine struct {
 	SSHKeyLoader func() (privPEM []byte, pubKey string, err error)
 
 	// Timings overrides poll/retry waits; zero fields keep production defaults.
-	Timings    Timings
+	Timings Timings
+
 	QuotaProbe func(ctx context.Context, tp auth.TokenProvider, projectID string) error
 	// Probe runs post-deploy health checks; nil means verify.Check.
 	Probe func(ctx context.Context, ip string, ports []int, timeout time.Duration) []verify.ProbeResult
@@ -64,12 +66,21 @@ type Engine struct {
 	portsOnlyFromGroups []sgrules.GroupOnlyPort
 	// now is the clock of the bound (past); nil: time.Now. A test brings
 	// the bound at a point of the deploy with it, not by the wall clock.
-	now     func() time.Time
+	now func() time.Time
+
 	decided bool
+}
+
+// DeployResult identifies the VM this call created, updated or found unchanged.
+type DeployResult struct {
+	Record state.DeploymentRecord
+	Action string
 }
 
 // DeployOptions holds parameters for the deploy command.
 type DeployOptions struct {
+	// Result receives the outcome selected under the state lock.
+	Result         *DeployResult
 	ComposeFile    string
 	Flavor         string // "auto" or explicit flavor name
 	Region         string
@@ -86,7 +97,8 @@ type DeployOptions struct {
 	// shows the preview of the tool's answer (spec REQ-4, REQ-6). redeploy
 	// is the engine's words for an update of the existing VM, nil for a new
 	// VM, whose preview the tool makes itself.
-	Gate  func(ctx context.Context, redeploy *confirm.Preview) (bool, error)
+	Gate func(ctx context.Context, redeploy *confirm.Preview) (bool, error)
+
 	Until time.Time
 }
 

@@ -122,6 +122,7 @@ func run(args []string) int {
 	}()
 
 	commandStarted = false
+
 	if jsonRequested(args) {
 		defer i18n.SetLang(i18n.Lang())
 		i18n.SetLang(i18n.EN)
@@ -166,6 +167,7 @@ func run(args []string) int {
 		cmd = rootCmd
 	}
 	if !commandStarted && cmd == rootCmd {
+
 		if ferr := leadingUnknownFlag(rootCmd, args); ferr != nil {
 			err = ferr
 		}
@@ -374,6 +376,7 @@ func newRootCmd() *cobra.Command {
 					i18n.T("the value of EVO_LANG is not supported (en or ru): the output for a person is in Russian",
 						"значение EVO_LANG не поддерживается (en или ru): вывод на русском")})
 			}
+
 			if cwd, err := stateDir(); err == nil {
 				printWarnings(output.New(flagJSON, flagNoColor), reg.PendingNotes(cwd))
 			}
@@ -402,6 +405,7 @@ func newRootCmd() *cobra.Command {
 		newStatusCmd(),
 		newLogsCmd(),
 		newDestroyCmd(),
+		newCleanupCmd(),
 		newVerifyCmd(),
 		newInitCmd(),
 		newVersionCmd(),
@@ -426,17 +430,20 @@ func newRootCmd() *cobra.Command {
 	groupCommands(cmd)
 	localizeHelp(cmd)
 	helpTopicsUnechoed(cmd)
+
 	cmd.InitDefaultCompletionCmd()
 	for _, c := range cmd.Commands() {
 		if c.Name() == "completion" {
 			asGroup(c)
 			zshMenuOfEvo(c)
+
 			for _, shell := range c.Commands() {
 				shell.Args = noArgs
 			}
 		}
 	}
 	tabNoFiles(cmd)
+
 	asGroup(cmd)
 
 	return cmd
@@ -468,6 +475,7 @@ func buildEngine(flagOverrides map[string]any) (*engine.Engine, error) {
 
 	auth := tokenProvider(cfg)
 	cloud := provision.NewCloudRuAdapter(httpClient, "")
+
 	cloud.SetTokenSource(func(ctx context.Context) (string, error) {
 		tok, err := auth.Token(ctx)
 		return tok.Value, err
@@ -482,7 +490,8 @@ func buildEngine(flagOverrides map[string]any) (*engine.Engine, error) {
 		// CLOUDRU_TIMEOUT / timeout: how long deploy and provision wait
 		// for the VM to become active (default config.DefaultTimeout, the
 		// engine's own default).
-		Timings:    engine.Timings{VMPollTimeout: time.Duration(cfg.Timeout) * time.Second},
+		Timings: engine.Timings{VMPollTimeout: time.Duration(cfg.Timeout) * time.Second},
+
 		QuotaProbe: tools.QuotaProbe,
 		// Port 22 of the VM from here before the question of an update
 		// (M2).
@@ -697,6 +706,7 @@ func handleError(p *output.Printer, err error) {
 	switch {
 	case code == clerrors.ExitInterrupted:
 		message = i18n.T("interrupted", "прервано")
+
 		if stderrors.As(err, &cliErr) && cliErr.Code != clerrors.CodeAPIUnreachable {
 			// e.g. deploy: which VM was left running and how to delete it.
 			message += ": " + cliErr.Message
@@ -733,6 +743,8 @@ func handleError(p *output.Printer, err error) {
 	if pw, _ := details["password"].(string); pw != "" {
 		p.Errorf("%s", vmPasswordLine(pw))
 	}
+	// --verbose: the underlying cause too (SSH exit status, HTTP error),
+	// which the message and hint summarise (QA r4 Q14).
 	if flagVerbose && cliErr != nil && cliErr.Err != nil {
 		p.Errorf(i18n.T("cause: %s", "причина: %s"), cliErr.Err)
 	}

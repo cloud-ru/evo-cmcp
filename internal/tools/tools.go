@@ -11,6 +11,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -47,16 +48,16 @@ func (s *Registry) registerTools() {
 	s.tools = []Tool{
 		{
 			Name:        "deploy",
-			Description: "Deploy the local compose project to a VM evo-<project_name> (billable when created) with a public floating IP: uploads the compose files over SSH, runs them; ports open from cidr in the zone's shared security group. Works in evo's directory (MCP: server's). Updates ask too (preview: compose_changed).",
+			Description: "Deploy the local compose project to a VM evo-<project_name> (billed on creation) with a public floating IP. It uploads the compose files over SSH and runs them. Ports open from cidr in the zone's shared security group. Works in evo's directory (MCP: server's). Updates ask too (compose_changed).",
 			InputSchema: objSchema(map[string]any{
 				"compose_file": strProp("Default: docker-compose.yml."),
-				"flavor":       strProp("Flavor or 'auto' (default)."),
+				"flavor":       strProp("Default: 'auto'."),
 				"region":       strProp("Zone UUID."),
 				"project_id":   strProp("Project UUID."),
 				"image_id":     strProp("Image UUID."),
-				"image":        strProp("Image, Ubuntu or Debian (not Astra, Alt, RED OS)."),
-				"disk_size":    atLeast(0, intProp("Boot disk, GB (default 10 or min_disk).")),
-				"force":        boolProp("Redeploy unchanged compose."),
+				"image":        strProp("Ubuntu or Debian; excludes Astra, Alt, RED OS."),
+				"disk_size":    atLeast(0, intProp("Boot disk GB (default 10 or min_disk).")),
+				"force":        boolProp("Redeploy unchanged files."),
 				"cidr":         cidrProp(portsCidrDesc),
 				"compose_hash": strProp("next_args: consented hash"),
 				"confirmed":    confirmedProp(),
@@ -65,8 +66,8 @@ func (s *Registry) registerTools() {
 		{
 			Name: "provision",
 			Description: "Provision a bare VM (docker-compose: use 'deploy'). Public floating IP unless no_public_ip. " +
-				"evo fills the image metadata (SSH key, VM name, login, random password); a mandatory field it cannot fill (image_get: fields_required) goes in image_metadata. " +
-				"Refused before any create: no image or region ('missing' names it), an image the project cannot use, a required field not given. " +
+				"evo fills the image metadata (SSH key, VM name, login, random password); supply other required fields in image_metadata (image_get: fields_required). " +
+				"Refused before create: no image or region (see 'missing'), inaccessible image or missing required field. " +
 				"Returns ssh, password (generated; this answer only), state_dir (key, state).",
 			InputSchema: objSchema(map[string]any{
 				"name":       strProp("VM name."),
@@ -201,11 +202,11 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name: "image_create",
-			Description: "Create a VM image from a bootable disk. The disk must be detached (disk_detach; disk_list state 'available'). " +
+			Description: "Create a VM image from a detached bootable disk (disk_detach; disk_list: 'available'). " +
 				"A Marketplace image needs user_data_template and image_metadata for every {{ var }}. Async: poll image_get until ready=true.",
 			InputSchema: objSchema(map[string]any{
 				"name":               strProp("Unique image name."),
-				"disk_id":            strProp("Source disk UUID."),
+				"disk_id":            strProp("Disk UUID."),
 				"display_name":       strProp("Console name."),
 				"description":        strProp("At most 255 characters."),
 				"zone":               strProp("Zone name or UUID; must be the disk's."),
@@ -250,12 +251,12 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "deploy_plan",
-			Description: "Step 1 of the deploy wizard, read-only: resolves a VM configuration (flavor, image, zone, disk, network, SSH) with its monthly cost and a plan_id (cost.source: the Cloud.ru price API, else a rate-card estimate; an image license is never included). auto mode: pass the product's cpu/ram_gb/disk_gb, defaults fill the rest; manual: flavor, zone, image, disk_type. Show the plan and its cost to the person, then deploy_apply with the plan_id.",
+			Description: "Read-only VM plan: flavor, image, zone, disk, network, SSH, monthly cost and plan_id (cost.source: the Cloud.ru price API, else a rate-card estimate; an image license is never included). auto mode: pass the product's cpu/ram_gb/disk_gb, defaults fill the rest; manual: flavor, zone, image, disk_type. Show the plan and its cost to the person, then deploy_apply with the plan_id.",
 			InputSchema: objSchema(map[string]any{
-				"base_plan_id": strProp("A prior plan_id to change: its parameters with only the fields given here overlaid, as a new plan_id."),
+				"base_plan_id": strProp("Patch a prior plan_id with these fields, yielding a new plan_id."),
 				"product":      strProp("Product (names the VM)."),
 				"mode":         strProp("'auto' (default) or 'manual'."),
-				"cpu":          intProp("vCPUs needed (auto picks the smallest fitting flavor)."),
+				"cpu":          intProp("vCPUs. Auto picks the smallest fitting flavor."),
 				"ram_gb":       intProp("RAM needed, GB."),
 				"disk_gb":      intProp("Boot disk, GB (default 10)."),
 				"ports":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Ports deploy_apply opens from cidr in the zone's shared security group, e.g. [80,443]; destroy deletes the rules it created."},
@@ -342,7 +343,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "open_ports",
-			Description: "Open inbound ports on a Cloud.ru security group (add ingress rules, tcp, from 0.0.0.0/0 by default). Use to make a service reachable (e.g. 80,443 for a web server). Identify the group by 'security_group' (name or UUID). Skips ports already open. NOTE: security groups are shared per availability zone — opening a port affects every VM in that group; the preview says how many. A source that is the whole internet (shorter than /8) on a shared group is refused without allow_internet_on_shared_group. Each rule added is billable, price unknown.",
+			Description: "Open inbound ports on a Cloud.ru security group (add ingress rules, tcp, from 0.0.0.0/0 by default). For web access, use e.g. 80,443. Pass the group name or UUID in 'security_group'. Skips ports already open. NOTE: security groups are shared per availability zone — opening a port affects every VM in that group; the preview says how many. A source that is the whole internet (shorter than /8) on a shared group is refused without allow_internet_on_shared_group. Each rule added is billable, price unknown.",
 			InputSchema: objSchema(map[string]any{
 				"security_group": strProp("Security group name (e.g. 'SSH-access_ru.AZ-2') or UUID (see list_security_groups)."),
 				"ports":          map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Ports to open, e.g. [80,443]."},
@@ -354,7 +355,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "close_ports",
-			Description: "Close inbound ports on a Cloud.ru security group: delete the ingress rules of the ports given (tcp, from 0.0.0.0/0 by default). Only rules of exactly that port, protocol and source go — one from before the task too: not an undo of open_ports. To close what an open_ports call added, pass only the ports of its opened, with its protocol and cidr. Ports with no such rule are already closed (already_deleted when none is open; NOT_FOUND on a server with --allow-project). A zone's group is shared: every VM in it is affected. The last rule letting TCP 22 in to a group with a deployment of this folder is refused, the call whole, without allow_cut_ssh.",
+			Description: "Delete ingress rules for the given ports in a Cloud.ru security group (defaults: tcp, 0.0.0.0/0). Only rules of exactly that port, protocol and source go — one from before the task too: not an undo of open_ports. To close what an open_ports call added, pass only the ports of its opened, with its protocol and cidr. Ports with no such rule are already closed (already_deleted when none is open; NOT_FOUND on a server with --allow-project). A zone's group is shared: every VM in it is affected. The last rule letting TCP 22 in to a group with a deployment of this folder is refused, the call whole, without allow_cut_ssh.",
 			InputSchema: objSchema(map[string]any{
 				"security_group": strProp("Security group: name or UUID (list_security_groups)."),
 				"ports":          map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "Ports to close."},
@@ -366,7 +367,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "sg_rule_create",
-			Description: "Add one rule to a Cloud.ru security group: direction, protocol, ports and source (CIDR or another group; no default — ask the person). The preview names the rule, the group and the VMs it acts on. Ingress from the whole internet on a shared group is refused without allow_internet_on_shared_group. The same rule there answers already_exists. Billable, price unknown.",
+			Description: "Add one rule to a Cloud.ru security group: direction, protocol, ports and source (CIDR or another group; no default — ask the person). Preview: rule, group and affected VMs. Ingress from the whole internet on a shared group is refused without allow_internet_on_shared_group. Duplicate rule: already_exists. Billable, price unknown.",
 			InputSchema: objSchema(map[string]any{
 				"security_group": strProp("Name or UUID (list_security_groups)."),
 				"direction":      enumProp("ingress or egress", "ingress", "egress"),
@@ -406,7 +407,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "k8s_plan",
-			Description: "Step 1 for Managed Kubernetes: resolve a cluster config (version, control-plane flavor, master count, subnet, service account) without creating anything. Show it to the person, then k8s_create with the same args.",
+			Description: "Preview Managed Kubernetes version, control-plane flavor, master count, subnet and service account. Show the plan to the person, then call k8s_create with the same args.",
 			InputSchema: objSchema(map[string]any{
 				"product":           strProp("What the cluster is for (names it)."),
 				"name":              strProp("Cluster name, 3-60 (default k8s-<product>)."),
@@ -415,8 +416,8 @@ func (s *Registry) registerTools() {
 				"cpu":               intProp("Control-plane vCPUs (default 2)."),
 				"ram_gb":            intProp("Control-plane RAM, GB (default 4)."),
 				"master_count":      intProp("Control-plane nodes: 1, 3 or 5 (default 1)."),
-				"zone":              strProp("Control-plane zone, name or UUID (default: subnet_id's, else the platform's)."),
-				"subnet_id":         strProp("Subnet UUID or name of the cluster's zone, for the control-plane VIP (default: the zone's main subnet)."),
+				"zone":              strProp("Control-plane zone name or UUID (default: subnet's, else platform's)."),
+				"subnet_id":         strProp("Control-plane VIP subnet in the cluster's zone: UUID or name (default: main subnet)."),
 				"cluster_sa_id":     strProp("Cluster service-account UUID (default: the agent's own)."),
 				"kube_api_internet": boolPropTrue("Publish kube-apiserver to the internet (default true)."),
 			}),
@@ -524,7 +525,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "k8s_add_addon",
-			Description: "Install a Managed Kubernetes addon release into a cluster. The preview only reads: the version picked, namespace, the release's requirements and the cluster checks (Kubernetes version, ready workers); what cannot be checked is in not_checked, a certain mismatch is refused. Async: status installing with operation_id; ready when the addon's pods run (k8s_kubectl get pods -n <namespace>). Pods in ImagePullBackOff may mean the cluster has no internet egress (snat_create).",
+			Description: "Install a Managed Kubernetes addon. Read-only preview: chosen version, namespace, release requirements and cluster checks (Kubernetes version, ready workers); what cannot be checked is in not_checked, a certain mismatch is refused. Async: status installing with operation_id; ready when the addon's pods run (k8s_kubectl get pods -n <namespace>). Pods in ImagePullBackOff may mean the cluster has no internet egress (snat_create).",
 			InputSchema: objSchema(map[string]any{
 				"cluster_id":   strProp("Cluster UUID."),
 				"name":         strProp("Addon name (k8s_addons)."),
@@ -555,13 +556,13 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "k8s_helm",
-			Description: "Helm on a cluster: install/upgrade/uninstall require confirmed=true after the user approves. Every call runs helm again: a repeated install/upgrade upgrades the same release, not a second one; over MCP: status deploying, then action=status. Nodes need egress (snat_create) to pull images; size the node pool for the chart.",
+			Description: "Helm on a cluster: install/upgrade/uninstall require confirmed=true after the user approves. Every call runs helm again; repeated install/upgrade updates the same release; over MCP: status deploying, then action=status. Nodes need egress (snat_create) to pull images; size the node pool for the chart.",
 			InputSchema: objSchema(map[string]any{
 				"cluster_id": strProp("Cluster UUID."),
 				"action":     strProp("install | upgrade | uninstall | list | status."),
 				"release":    strProp("Release name (all but list)."),
 				"chart":      strProp("Chart ref, e.g. 'bitnami/nginx' (install/upgrade)."),
-				"repo_url":   strProp("Chart repo URL to add first, named by the chart's prefix."),
+				"repo_url":   strProp("Chart repo URL to add under the chart's prefix."),
 				"namespace":  strProp("Namespace (created on install/upgrade)."),
 				"version":    strProp("Chart version (default latest: a repeat may change it)."),
 				"values":     strProp("Inline values.yaml."),
@@ -676,9 +677,9 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "ca_deploy",
-			Description: "Deploy a serverless Container App from an image; the preview lists every setting, root included. Async: ca_get gives its status and URL.",
+			Description: "Deploy a serverless Container App from an image. Preview: all settings, including root. Async: ca_get shows status and URL.",
 			InputSchema: objSchema(map[string]any{
-				"name":          strProp("App name, unique: an RFC 1123 label."),
+				"name":          strProp("Unique RFC 1123 label."),
 				"image":         strProp("Image URI (this project's Artifact Registry or public), linux/amd64, listening on 0.0.0.0:$PORT."),
 				"cpu":           strProp("CPU, e.g. '1' (default 0.1)."),
 				"memory":        strProp("Memory, e.g. '1Gi' (default 256Mi)."),
@@ -695,7 +696,7 @@ func (s *Registry) registerTools() {
 		{
 			Name:        "ca_delete",
 			Description: "Delete a Container App by name. Async.",
-			InputSchema: objSchema(map[string]any{"name": strProp("Container app name."), "confirmed": confirmedProp(), "wait": boolProp(deleteWaitDesc)}, "name"),
+			InputSchema: objSchema(map[string]any{"name": strProp("Container app name."), "confirmed": confirmedProp(), "wait": boolProp("Default: 45 s. true: up to 45 s in MCP or 2 min in the CLI. false skips the wait. On deleting, use ca_get with next_args or evo ca get <name> until NOT_FOUND.")}, "name"),
 		},
 		{
 			Name:        "ca_logs",
@@ -731,6 +732,7 @@ func (s *Registry) registerTools() {
 			Name:        "agent_skill",
 			Description: "Read the card of a tool group: its tools, where their ids come from, what deletes what a create made, what to wait with, and the group's notes. Without group: the groups. Read-only and local: asks the cloud nothing. For when a tool's description leaves a question; a card is not a preview.",
 			InputSchema: objSchema(map[string]any{
+
 				"group": withMinLength(enumProp("Tool group; none: the list of groups.", Groups()...)),
 			}),
 		},
@@ -746,7 +748,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "history",
-			Description: "What evo changed in the cloud from this folder of state: the journal of changes (.evo/history/, a line for each end of a call that changes the cloud). Read-only, local: no API call unless check. Answers lines (the last 30 days or since, at most 500: time, tool, project_id, name or target, resource_id, outcome, reason, intent_id) and live: what may still be in the cloud, made and not removed or with an outcome unknown, with check, the read that tells it. A line names a resource as the call did: it does not prove the resource is there or is evo's — read it before acting on it. journal_of is the base name of the folder of state of this evo (of the server, over MCP), not a path to read. check reads live lines by id with this key (at most 50) and writes nothing: would_close is what it does not see now, check_result why a line was not read. Codes: the auth group card.",
+			Description: "Local cloud change journal (.evo/history/): one line per completed call that changes the cloud. Read-only, local: no API call unless check. Answers lines (the last 30 days or since, at most 500: time, tool, project_id, name or target, resource_id, outcome, reason, intent_id) and live: what may still be in the cloud, made and not removed or with an outcome unknown, with check, the read that tells it. A line names a resource as the call did: it does not prove the resource is there or is evo's — read it before acting on it. journal_of is the state folder's base name (the server's over MCP), not a path to read. check reads live lines by id with this key (at most 50) and writes nothing: would_close is what it does not see now, check_result why a line was not read. Codes: the auth group card.",
 
 			InputSchema: objSchema(map[string]any{
 				"since":      withMinLength(strProp("Lines from this date (2026-11-01) or time (2026-11-01T10:00:00Z); default: 30 days back.")),
@@ -813,7 +815,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "pg_create",
-			Description: "Create a Managed PostgreSQL cluster. Refuses a taken name. No subnet_id: the main subnet of the profile's zone. No public access (no API parameter).",
+			Description: "Create a Managed PostgreSQL cluster. Refuses a taken name. No subnet_id: the main subnet of the profile's zone. Private only (no API flag).",
 			InputSchema: objSchema(map[string]any{
 				"name":                  strProp("Cluster name."),
 				"version":               strProp("Version. Default: latest."),
@@ -823,7 +825,7 @@ func (s *Registry) registerTools() {
 				"storage_gb":            atLeast(1, intProp("Disk, GB. Default: the spec minimum.")),
 				"instances":             atLeast(1, intProp("Nodes: 1-2 standard, 1-3 business (default 1).")),
 				"subnet_id":             strProp("Subnet UUID or name; sets the zone."),
-				"initial_database":      strProp("Database made with the cluster (default 'defaultdb'), ownerless; pg_db_create makes an owned one."),
+				"initial_database":      strProp("Ownerless initial DB (default 'defaultdb'); pg_db_create makes an owned DB."),
 				"description":           strProp("Description."),
 				"no_backup":             boolProp("true: no automatic backups (they are on by default); CANNOT be changed after creation."),
 				"backup_schedule":       strProp("Backup CRON (default '0 3 * * 0'; every 6h at most)."),
@@ -874,7 +876,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "kafka_create",
-			Description: "Create a Managed Kafka cluster. Refuses a taken name. Default subnet: the main subnet of the configured zone, else of the first zone with one (ru.AZ-2 first); the cluster goes to the subnet's zone. Default brokers: the spec's min_brokers, else 1, with no replication. Controllers: combined; dedicated (controller_spec): Cloud.ru console only.",
+			Description: "Create a Managed Kafka cluster. Refuses a taken name. Default subnet: the main subnet of the configured zone, else of the first zone with one (ru.AZ-2 first); its zone hosts the cluster. Default brokers: spec min_brokers, else 1 (no replication). Controllers: combined; dedicated (controller_spec): Cloud.ru console only.",
 			InputSchema: objSchema(map[string]any{
 				"name":             strProp("Cluster name, 2-63 characters."),
 				"version_id":       strProp("Kafka version UUID. Default: latest."),
@@ -928,7 +930,7 @@ func (s *Registry) registerTools() {
 		},
 		{
 			Name:        "redis_create",
-			Description: "Create a Managed Redis cluster. Refuses a taken name. All hosts go to the subnet's zone (default: the zone's main subnet, else another zone's). MASTER_REPLICA (default): a master and two replicas, three billed hosts per shard; STANDALONE: one host.",
+			Description: "Create a Managed Redis cluster. Refuses a taken name. All hosts use the subnet's zone. Default: zone's main subnet, else another zone's. MASTER_REPLICA (default): a master and two replicas, three billed hosts per shard; STANDALONE: one host.",
 			InputSchema: objSchema(map[string]any{
 				"name":             strProp("Cluster name."),
 				"version_id":       strProp("Version UUID. Default: latest."),
@@ -937,7 +939,7 @@ func (s *Registry) registerTools() {
 				"ram":              intProp("RAM GB, with cpu."),
 				"storage_gb":       atLeast(1, intProp("Disk, GB. Default: the spec minimum.")),
 				"shards":           intProp("Shards, 1-8 (default 1)."),
-				"replicas":         intProp("Replicas per shard WITHOUT the master: 2 for MASTER_REPLICA (default), 0 for STANDALONE; redis_get counts the master too."),
+				"replicas":         intProp("Replicas/shard, master excluded: MASTER_REPLICA 2 (default), STANDALONE 0. redis_get counts it."),
 				"type":             enumProp("Default: MASTER_REPLICA.", "MASTER_REPLICA", "STANDALONE"),
 				"subnet_id":        strProp("Subnet UUID or name."),
 				"description":      strProp("Description."),
@@ -1737,13 +1739,14 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 	return s.engineGated(ctx, "deploy", args,
 		func(c *Caller) (string, bool) { return s.deployLive(ctx, args, overrides, c) },
 		func() (string, bool) {
+
 			eng, err := s.newEngine(overrides)
 			if err != nil {
 				return errResult(err), true
 			}
 			answer, err := s.deployAnswer(ctx, args, eng)
 			if err != nil {
-				return errAnswer(err, deployFields(err, nil)), true
+				return s.deployRefusal(eng, err, nil), true
 			}
 			return answer, true
 		},
@@ -1753,6 +1756,7 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 			if err != nil {
 				return errResult(err), true
 			}
+
 			if answer, changed := s.composeChangedSinceConsent(ctx, args, eng); changed {
 				return answer, true
 			}
@@ -1760,7 +1764,8 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 			eng.Printer = logAndProgress(ctx, &buf)
 
 			force, _ := args["force"].(bool)
-			opts := engine.DeployOptions{
+			var deployment engine.DeployResult
+			opts := engine.DeployOptions{Result: &deployment,
 				ComposeFile:    eng.Config.ComposeFile,
 				Flavor:         eng.Config.Flavor,
 				Region:         eng.Config.Region,
@@ -1769,6 +1774,7 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 				Yes:            true, // confirmed above
 				Cidr:           stringArg(args, "cidr"),
 			}
+
 			if left, capped := budgetLeft(ctx); capped {
 				opts.Until = time.Now().Add(left)
 			}
@@ -1779,10 +1785,11 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 			}
 
 			result := map[string]any{"log": buf.String()}
-			if sf, e := state.Read(state.DefaultPath(eng.StateDir)); e == nil {
-				if active := sf.ActiveComposeDeployment(); active != nil {
-					result["deployment"] = active
-				}
+			if record := &deployment.Record; record.VMID != "" {
+				result["deploy_action"] = deployment.Action
+				result["deployment"] = record
+				result["vm_id"] = record.VMID
+				result["region"] = record.Region
 			}
 			deployPortsOnlyFromGroups(result, eng.PortsOnlyFromGroups())
 			var going *engine.InProgress
@@ -1790,11 +1797,28 @@ func (s *Registry) handleDeploy(ctx context.Context, args map[string]any) (strin
 				return toJSON(deployInProgress(result, going, args)), false
 			}
 			if deployErr != nil {
-				return errAnswer(deployErr, deployFields(deployErr, result)), true
+				return s.deployRefusal(eng, deployErr, result), true
 			}
 			result["status"] = "ok"
 			return toJSON(result), false
 		})
+}
+
+// A refusal before the engine returns a VM can still describe the existing
+// Compose deployment. Only the engine result identifies work done by this call.
+func (s *Registry) deployRefusal(eng *engine.Engine, err error, fields map[string]any) string {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	if fields["deployment"] == nil {
+		if sf, readErr := state.Read(state.DefaultPath(eng.StateDir)); readErr == nil {
+			rec := sf.ActiveComposeDeployment()
+			if rec != nil && (!s.projectBound || (rec.ProjectID != "" && rec.ProjectID == eng.Config.ProjectID)) {
+				fields["deployment"] = rec
+			}
+		}
+	}
+	return errAnswer(err, deployFields(err, fields))
 }
 
 func deployPortsOnlyFromGroups(result map[string]any, only []sgrules.GroupOnlyPort) {
@@ -1829,7 +1853,7 @@ func (s *Registry) composeChangedSinceConsent(ctx context.Context, args map[stri
 	}
 	answer, err := s.deployAnswer(ctx, args, eng)
 	if err != nil {
-		return errAnswer(err, deployFields(err, nil)), true
+		return s.deployRefusal(eng, err, nil), true
 	}
 	var m map[string]any
 	if json.Unmarshal([]byte(answer), &m) != nil {
@@ -1853,15 +1877,18 @@ func deployInProgress(result map[string]any, going *engine.InProgress, args map[
 	}
 	repeat := maps.Clone(args)
 	repeat["confirmed"] = true
+
 	if rec, ok := result["deployment"].(*state.DeploymentRecord); ok && rec.ComposeHash != "" {
 		repeat["compose_hash"] = rec.ComposeHash
 	}
 	if going.Phase == "compose-up" || going.Phase == "verify" {
+
 		delete(repeat, "force")
 	}
 	result["next"] = i18n.Tf("Deploy is still in progress (%s). Call deploy again with the same arguments: it takes the VM in the state and goes on from there; a stage on the VM goes on without the call and is not run twice.",
 		"Развёртывание ещё идёт (%s). Повторите evo deploy с теми же аргументами: команда возьмёт ВМ из состояния и продолжит; этап на ВМ идёт и без вызова и не запускается дважды.", going.Phase)
 	if going.Note != "" {
+
 		result["next"] = i18n.T("Read warning first: it says why the phase may never end. ", "Сначала прочитайте warning: там сказано, почему этап может не закончиться. ") + result["next"].(string)
 	}
 	nextStep(result, "deploy", repeat)
@@ -1880,6 +1907,7 @@ func (s *Registry) deployAnswer(ctx context.Context, args map[string]any, eng *e
 			"deploy создаёт платную ВМ с публичным floating IP, если развёртывания ещё нет (иначе обновляет существующую ВМ). В preview — новая ВМ и её цена в месяц."),
 		"will_deploy": will,
 	}
+
 	warning, err := eng.DeployComposeCheck()
 	if err != nil {
 		return "", err
@@ -1967,11 +1995,13 @@ func (s *Registry) deployLive(ctx context.Context, args, overrides map[string]an
 		return failed(ctx, err, nil), true
 	}
 	eng.Printer = c.Printer
+
 	if c.Yes && composeChanged(args, eng) {
 		return failed(ctx, errComposeChangedSinceConsent(), nil), true
 	}
 	force, _ := args["force"].(bool)
-	err = eng.Deploy(ctx, engine.DeployOptions{
+	var deployment engine.DeployResult
+	err = eng.Deploy(ctx, engine.DeployOptions{Result: &deployment,
 		ComposeFile:    eng.Config.ComposeFile,
 		Flavor:         eng.Config.Flavor,
 		Region:         eng.Config.Region,
@@ -1990,7 +2020,7 @@ func (s *Registry) deployLive(ctx context.Context, args, overrides map[string]an
 	if err != nil {
 		return failed(ctx, err, deployFields(err, nil)), true
 	}
-	return toJSON(map[string]any{"status": "ok"}), false
+	return toJSON(map[string]any{"status": "ok", "vm_id": deployment.Record.VMID, "region": deployment.Record.Region, "deploy_action": deployment.Action}), false
 }
 
 func deployFields(err error, fields map[string]any) map[string]any {
@@ -2012,6 +2042,7 @@ func deployFields(err error, fields map[string]any) map[string]any {
 		if out, _ := ce.Details["output"].(string); out != "" {
 			add("output", out)
 		}
+
 		if id, _ := ce.Details["existing_id"].(string); id != "" {
 			add("existing_id", id)
 		}
@@ -2020,6 +2051,7 @@ func deployFields(err error, fields map[string]any) map[string]any {
 }
 
 func (s *Registry) planProvision(ctx context.Context, args map[string]any) (*Plan, error) {
+
 	if _, given := args["name"]; given {
 		if err := provision.ValidName(i18n.T("VM", "ВМ"), stringArg(args, "name")); err != nil {
 			return nil, err
@@ -2044,6 +2076,7 @@ func (s *Registry) planProvision(ctx context.Context, args map[string]any) (*Pla
 	if _, _, err := oneOfArgs(args, imageRefNotBoth(), "image", "image_id"); err != nil {
 		return nil, err
 	}
+
 	if err := s.continuedVM(ctx, "provision", args, stringArg(args, "name")); err != nil {
 		return nil, err
 	}
@@ -2055,6 +2088,7 @@ func (s *Registry) planProvision(ctx context.Context, args map[string]any) (*Pla
 	if err != nil {
 		return nil, err
 	}
+
 	eng, err := s.engineFor(ctx, overrides)
 	if err == nil && eng == nil {
 		err = stderrors.New("engine unavailable")
@@ -2103,12 +2137,14 @@ func (s *Registry) planProvision(ctx context.Context, args map[string]any) (*Pla
 		"will_create": will,
 		"preview":     preview,
 	}
+
 	actx, cancel := context.WithTimeout(ctx, engine.PreviewLookupTimeout)
 	rec, vm, err := creatingVM(actx, eng, stringArg(args, "name"), false)
 	cancel()
 	if err != nil {
 		return nil, err
 	}
+
 	if vm == nil {
 		lctx, cancel := context.WithTimeout(ctx, engine.PreviewLookupTimeout)
 		ans, refused := vmNameFree(lctx, eng, stringArg(args, "name"), func(string) bool { return false })
@@ -2122,6 +2158,7 @@ func (s *Registry) planProvision(ctx context.Context, args map[string]any) (*Pla
 		answer["message"] = i18n.Tf("provision finishes VM %s (%s), which an earlier call of this name left creating in this folder: no second VM is created; it waits for the VM, then gives it its public IP and ports. preview has the VM and its monthly cost.",
 			"provision доделывает ВМ %s (%s), которую прошлый вызов с этим именем оставил создаваться в этом каталоге: второй ВМ не будет; он дождётся ВМ и даст ей внешний IP и порты. В preview — ВМ и её цена в месяц.", rec.VMID, vm.Status)
 	}
+
 	if vm == nil && !noPublicIP {
 		project := firstNonEmptyStr(stringArg(args, "project_id"), eng.Config.ProjectID)
 		if ask := addressAsked(ctx, eng, project, stringArg(args, "name")); ask != nil {
@@ -2199,10 +2236,12 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 	if err := eng.EnsureSSHKey(); err != nil {
 		return errResult(err), true
 	}
+
 	adoptRec, adopted, err := creatingVM(ctx, eng, stringArg(args, "name"), true)
 	if err != nil {
 		return errResult(err), true
 	}
+
 	var password string
 	imgMeta, filled, err := images.FillMetadata(imgDetail.MetadataFields, images.Inputs{
 		PublicKey: strings.TrimSpace(eng.SSHPubKey),
@@ -2411,7 +2450,8 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 		if err == nil {
 			return ""
 		}
-		return fmt.Sprintf(" WARNING: the state file could not be saved (%v), so VM %s is NOT in the state and destroy will not find it by this folder; whether and when to delete it (by its id, or in the Cloud.ru console) — ask the person.", err, vmID)
+		return i18n.Tf(" WARNING: the state file could not be saved (%v), so VM %s is NOT in the state and destroy will not find it by this folder; whether and when to delete it (by its id, or in the Cloud.ru console) — ask the person.",
+			" Не удалось сохранить файл состояния (%v). Запись о ВМ %s отсутствует, поэтому destroy из этой папки её не найдёт. Спросите человека, нужно ли удалить ВМ по ID или в консоли Cloud.ru.", err, vmID)
 	}
 
 	vm := adopted
@@ -2421,10 +2461,14 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 		createStart := time.Now()
 		created, err := provision.CreateVMChecked(ctx, eng.Cloud, req)
 		if err != nil && provision.CreateRejected(err) {
+
 			fipErr := eng.ReleaseBootFIP(bootFIP, projectID)
 			if provision.IsNameTaken(err) {
 				return fipLeftAnswer(clierrors.Wrap(clierrors.CodeUsage,
 					i18n.Tf("a VM named %s already exists in this project (Cloud.ru answered 409); no VM was created", "ВМ с именем %s в проекте уже есть (Cloud.ru ответил 409); ВМ не создана", vmName),
+					// The Russian hint is the CLI's (MCP speaks English, D6): a
+					// repeat after Ctrl-C lands here, and the VM is the one the
+					// interrupted run is still creating.
 					i18n.Tf("Check that VM with vm_get %s (or vm_list); pass another name.",
 						"Проверьте её: evo vm get %s — если это ВМ прерванного запуска, она ещё создаётся; иначе укажите другое имя.", vmName), err), bootFIP, fipErr), true
 			}
@@ -2442,6 +2486,9 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 			}
 			return fipLeftAnswer(fmt.Errorf(i18n.T("create VM: %w", "создание ВМ: %w"), err), bootFIP, eng.ReleaseBootFIP(bootFIP, projectID)), true
 		}
+		// Recorded at once, as the CLI deploy does: a hard stop during the wait
+		// below (kill, OOM) must not leave the VM and its boot FIP billed with no
+		// record (QA r3 R5). The later saves update it.
 		vm = created
 		_ = saveState(vm.ID, "creating", "")
 		pp.StepDone(i18n.Tf("Request accepted: VM %s, id %s", "Запрос принят: ВМ %s, id %s", vmName, vm.ID))
@@ -2478,6 +2525,7 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 	// The wait in deploy's words; closed on every way out.
 	wait := eng.VMWaitLine(pp)
 	defer wait.Done()
+
 	var budget <-chan time.Time
 	// readCtx is ctx ended by the budget too, which leaves the call time
 	// to answer (callBound): the reads of the VM and the wait for its
@@ -2506,6 +2554,7 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 	for {
 		select {
 		case <-budget:
+			// The state now, not the one of the last tick (axis 2).
 			if updated, err := eng.Cloud.GetVM(endCtx, vm.ID); err == nil && updated.Status != "" {
 				vmStatus = updated.Status
 			}
@@ -2514,8 +2563,13 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 			// Billed whatever its state: keep it where destroy finds it.
 			serr := saveState(vm.ID, "creating", "")
 			pp.Hint(vmLeftNote(vm.ID, "") + i18n.T("; to wait longer next time: CLOUDRU_TIMEOUT (seconds)", "; ждать дольше: CLOUDRU_TIMEOUT (в секундах)"))
-			return errAnswer(fmt.Errorf("VM %s created but did not become active within %s; it is still being created and is billed, and it is recorded in the state — check it with vm_get; whether to delete it (destroy vm_id %s) — ask the person; to wait longer, set CLOUDRU_TIMEOUT (seconds).%s", vm.ID, pollTimeout, vm.ID, notInState(vm.ID, serr)),
-				leftFields(map[string]any{"status": "timeout"})), true
+			saved := ""
+			if serr == nil {
+				saved = i18n.T(", and it is recorded in the state", ". Запись о ВМ сохранена в файле состояния")
+			}
+			msg := i18n.Tf("VM %[1]s created but did not become active within %[2]s; it is still being created and is billed%[3]s — check it with vm_get; whether to delete it (destroy vm_id %[1]s) — ask the person; to wait longer, set CLOUDRU_TIMEOUT (seconds).%[4]s",
+				"ВМ %[1]s не стала активной за %[2]s. Создание продолжается, ВМ оплачивается%[3]s. Проверьте её через vm_get. Спросите человека, нужно ли удалить ВМ (destroy vm_id %[1]s). Чтобы ждать дольше, задайте CLOUDRU_TIMEOUT в секундах.%[4]s", vm.ID, pollTimeout, saved, notInState(vm.ID, serr))
+			return errAnswer(stderrors.New(msg), leftFields(map[string]any{"status": "timeout"})), true
 		case <-wait.C():
 			wait.Show()
 		case <-ticker.C:
@@ -2528,6 +2582,7 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 				pp.StepDone(i18n.Tf("VM %s active (%s)", "ВМ %s активна (%s)", vmName, engine.ElapsedText(wait.Elapsed())))
 				// Assign a floating (public) IP unless a private VM was requested.
 				publicIP := ""
+
 				var fipErr error
 				switch {
 				case bootFIP != nil:
@@ -2542,6 +2597,7 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 						return err
 					})
 					if _, lost := floatingip.AsLost(err); lost {
+
 						serr := saveState(vm.ID, "provisioned", "")
 						fields := leftFields(addressFields(err, werr))
 						return errAnswer(fmt.Errorf("%w%s", err, notInState(vm.ID, serr)), fields), true
@@ -2653,6 +2709,8 @@ func (s *Registry) provisionVM(ctx context.Context, eng *engine.Engine, args map
 			vmStatus = updated.Status
 			wait.State(updated.Status)
 			if provision.VMFailed(updated.Status) {
+				// Billed with its boot FIP: record both so destroy finds
+				// them, and say so (QA H3).
 				ip := ""
 				if bootFIP != nil {
 					ip = bootFIP.IPAddress
@@ -2794,7 +2852,14 @@ func (s *Registry) handleDestroy(ctx context.Context, args map[string]any) (stri
 		})(ctx, args)
 	}
 
-	if liveCaller(ctx) == nil {
+	if s.projectBound {
+		ctx = engine.WithBoundDestroy(ctx)
+	}
+	// Default: delete the current local deployment. Destructive and previously
+	// ungated — now requires the same explicit confirmation as targeted deletes.
+	// Nothing to destroy is the answer 'evo destroy' gives, status none and
+	// no question (W5): there is nothing to consent to.
+	if !s.projectBound && liveCaller(ctx) == nil {
 		if eng, err := s.newEngine(nil); err == nil && eng != nil {
 			if none, ok := eng.NothingToDestroy(); ok {
 				return toJSON(none), false
@@ -2822,24 +2887,43 @@ func (s *Registry) handleDestroy(ctx context.Context, args map[string]any) (stri
 			if err != nil {
 				return errResult(err), true
 			}
-			if vmID := recordedTarget(eng.StateDir); vmID != "" {
+
+			var vmID string
+			if s.projectBound {
+				vmID, err = eng.BoundDestroyTarget(ctx)
+				if err != nil {
+					return errResult(err), true
+				}
+			} else {
+				vmID = recordedTarget(eng.StateDir)
+			}
+			if vmID != "" {
 				return errResult(clierrors.New(clierrors.CodeUsage,
 					i18n.T("destroy without vm_id or name deletes nothing when confirmed without a terminal: name the target from the preview",
 						"destroy без vm_id или name с подтверждением без терминала ничего не удаляет: назовите цель из превью"),
-					i18n.Tf("Call destroy with vm_id %s and confirmed=true ('evo tools call destroy --arg vm_id=%s --yes'); destroy without arguments shows what it deletes.",
-						"Вызовите destroy с vm_id %s и confirmed=true ('evo tools call destroy --arg vm_id=%s --yes'); destroy без аргументов показывает, что он удалит.", vmID, vmID))), true
+					destroyRetry(ctx, vmID, nil, false))), true
 			}
 			var buf bytes.Buffer
 			eng.Printer = bufferPrinter(&buf)
 
-			if err := eng.Destroy(ctx, engine.DestroyOptions{Force: true}); err != nil {
-				fields := logField(buf.String())
-				if stderrors.Is(err, engine.ErrDeletionUnconfirmed) {
-					fields["status"] = "partial"
+			var result engine.DestroyResult
+			if err := eng.Destroy(ctx, engine.DestroyOptions{Force: true, Result: &result}); err != nil {
+				fields := destroyErrorFields(err, result)
+				if buf.Len() != 0 {
+					fields["log"] = buf.String()
 				}
 				return errAnswer(err, fields), true
 			}
-			return toJSON(map[string]any{"status": "ok", "log": buf.String()}), false
+			out := map[string]any{"status": "ok", "log": buf.String(), "deleted_vm": result.VMID, "cleanup_pending": result.CleanupPending}
+			if result.CleanupPending {
+				if pending, _ := eng.PendingFloatingIPReceipts(""); len(pending) > 0 {
+					out["hint"] = receiptHint(ctx)
+				}
+			}
+			if result.RuleCleanupPending {
+				appendCleanupHint(out, destroyRetry(ctx, result.VMID, nil, s.projectBound))
+			}
+			return toJSON(out), false
 		})
 }
 
@@ -2887,18 +2971,79 @@ func (s *Registry) destroyLive(ctx context.Context, c *Caller) (string, bool) {
 		return failed(ctx, err, nil), true
 	}
 	eng.Printer = c.Printer
-	err = eng.Destroy(ctx, engine.DestroyOptions{DryRun: c.DryRun,
+	var result engine.DestroyResult
+	err = eng.Destroy(ctx, engine.DestroyOptions{Result: &result, DryRun: c.DryRun,
 		Gate: func(ctx context.Context, p confirm.Preview) (bool, error) {
 			return c.ask(ctx, destroyAnswer(p, s.deploymentProject()), &p)
 		}})
 	if err != nil {
-		fields := map[string]any{}
-		if stderrors.Is(err, engine.ErrDeletionUnconfirmed) {
-			fields["status"] = "partial"
-		}
-		return failed(ctx, err, fields), true
+		return failed(ctx, err, destroyErrorFields(err, result)), true
 	}
-	return toJSON(map[string]any{"status": "ok"}), false
+	out := map[string]any{"status": "ok", "deleted_vm": result.VMID, "cleanup_pending": result.CleanupPending}
+	if result.RuleCleanupPending {
+		appendCleanupHint(out, sgrules.RuleRetryHint())
+	}
+	return toJSON(out), false
+}
+
+// Populate errors from the operation under the state lock, after consent.
+func destroyErrorFields(err error, result engine.DestroyResult) map[string]any {
+	fields := map[string]any{}
+	if result.VMID != "" {
+		fields["vm_id"] = result.VMID
+	}
+	if result.CleanupPending {
+		fields["cleanup_pending"] = true
+	}
+	if result.FloatingIPID != "" {
+		fields["floating_ip_id"] = result.FloatingIPID
+	}
+	if stderrors.Is(err, engine.ErrDeletionUnconfirmed) {
+		fields["status"] = "partial"
+	}
+	return fields
+}
+
+func receiptHint(ctx context.Context) string {
+	if callerOf(ctx) != nil {
+		return engine.FloatingIPReceiptHint()
+	}
+	return i18n.T("Ask the person to run 'evo cleanup receipts' in a terminal on the MCP host in the same state directory and project. Only the person can verify independent evidence and use 'evo cleanup resolve'.",
+		"Попросите человека выполнить 'evo cleanup receipts' в терминале на машине MCP, в том же каталоге состояния и проекте. Человек сверяет независимое свидетельство и при подтверждении закрывает квитанцию через 'evo cleanup resolve'.")
+}
+
+func (s *Registry) checkVMHint(ctx context.Context, vmID string) string {
+	if callerOf(ctx) != nil {
+		return i18n.Tf("Check the VM with evo vm get %s.", "Проверьте ВМ командой evo vm get %s.", shellQuoteMCP(vmID))
+	}
+	if s.served != nil && !s.served("vm_get") {
+		return i18n.Tf("Ask the person to review the VM in a destroy preview with vm_id=%q.", "Спросите человека, соответствует ли ВМ в предпросмотре destroy с vm_id=%q выбранной цели.", vmID)
+	}
+	return i18n.Tf("Check vm_get with vm_id %q.", "Проверьте ВМ инструментом vm_get с vm_id %q.", vmID)
+}
+
+// Preserve an explicit keep or release across the next preview. Authorizing
+// release explicitly differs from the default for an address evo did not make.
+func destroyRetry(ctx context.Context, vmID string, args map[string]any, boundGone bool) string {
+	if vmID == "" {
+		return i18n.T("Preview destroy again in the same state directory and ask the person before continuing.", "Повторите предпросмотр destroy в том же каталоге состояния и запросите согласие человека.")
+	}
+	if boundGone || callerOf(ctx) != nil {
+		cmd := "evo vm delete " + shellQuoteMCP(vmID)
+		if release, ok := args["release_ip"].(bool); ok {
+			cmd += fmt.Sprintf(" --release-ip=%t", release)
+		}
+		if boundGone && callerOf(ctx) == nil {
+			return i18n.Tf("The VM is gone from this server's allowed project list. Ask the person to review the preview in a terminal on the MCP host, in the same state directory and project, using %s.",
+				"ВМ больше нет в списке разрешённого проекта. Попросите человека открыть терминал на машине MCP в том же каталоге состояния и проекте и посмотреть предпросмотр командой %s.", cmd)
+		}
+		return i18n.Tf("Review the preview again in the same directory using %s.", "Повторите предпросмотр в том же каталоге командой %s.", cmd)
+	}
+	target := "vm_id=" + quoteCloud(vmID)
+	if release, ok := args["release_ip"].(bool); ok {
+		target += fmt.Sprintf(", release_ip=%t", release)
+	}
+	return i18n.Tf("Call destroy with %s again for a new preview. Get the person's approval before confirming it.", "Вызовите инструмент destroy с %s для нового предпросмотра. Запросите согласие человека перед подтверждением.", target)
 }
 
 func logField(log string) map[string]any {
@@ -2929,18 +3074,11 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 		return nil, err
 	}
 	eng.Cloud.SetToken(tok.Value)
-	if vmID != "" {
-		if recorded, rec := recordedVM(state.DefaultPath(eng.StateDir), vmID); recorded && (rec.ProjectID == "" || rec.ProjectID == projectID) {
-			if err := eng.VisibleToThisKey(ctx, rec); err != nil {
-				return nil, err
-			}
-		}
-	}
-
 	vms, err := eng.Cloud.ListVMsInProject(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
+
 	var target *provision.VM
 	var byName []*provision.VM
 	for _, v := range vms {
@@ -2968,17 +3106,31 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 		target = byName[0]
 	}
 	statePath := state.DefaultPath(eng.StateDir)
+
+	if vmID != "" && (target != nil || !s.projectBound) {
+		if recorded, rec := recordedVM(statePath, vmID); recorded && (rec.ProjectID == "" || rec.ProjectID == projectID) {
+			if err := eng.VisibleToThisKey(ctx, rec); err != nil {
+				if s.projectBound {
+					return nil, boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+				}
+				return nil, err
+			}
+		}
+	}
 	// alreadyGone: the VM was deleted outside evo (console, another tool)
 	// but this directory still records it. The cloud confirms it is gone
 	// (404), so the record, its FIP and port rules are cleaned up as after
 	// a delete; "no VM matching" left the record for status to show forever.
 	alreadyGone := false
-	if target == nil {
+	// Without a listed VM a project-bound server cannot establish membership.
+	// Only an unrestricted call can recover by record or rule label.
+	if target == nil && !s.projectBound {
 		recorded, rec := false, state.DeploymentRecord{}
 		if vmID != "" {
 			recorded, rec = recordedVM(statePath, vmID)
 		}
 		recProject := rec.ProjectID
+
 		if recorded && recProject != "" && recProject != projectID {
 			return nil, clierrors.New(clierrors.CodeConfigInvalid,
 				i18n.Tf("VM %s is recorded for another project than the active one; nothing was deleted and its record is kept", "ВМ %s записана для другого проекта, не для активного; ничего не удалено, запись сохранена", vmID),
@@ -2989,6 +3141,15 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 			var ce *clierrors.CLIError
 			switch {
 			case stderrors.As(gerr, &ce) && ce.Code == clierrors.CodeVMNotFound:
+				sf, err := state.Read(statePath)
+				if err != nil {
+					return nil, err
+				}
+				if engine.RecordedCleanupProject(sf, &rec) != projectID {
+					return nil, clierrors.New(clierrors.CodeConfigInvalid,
+						i18n.T("The VM is not visible and its project cannot be verified from the saved record.", "ВМ не видна, и по сохранённой записи нельзя проверить её проект."),
+						i18n.T("Ask the person to check the original project and profile. The cleanup receipt is kept.", "Попросите пользователя сверить исходные проект и профиль. Квитанция уборки сохранена."))
+				}
 				target, alreadyGone = &provision.VM{ID: vmID}, true
 			case gerr != nil:
 				// Not "no VM matching": the cloud did not say the VM is gone.
@@ -3000,35 +3161,84 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 			// The VM is gone, and rules labelled for it may be left (P6):
 			// opened for it from another folder. Its delete closes them,
 			// or says they could not be checked.
-			if sf, serr := state.Read(statePath); serr == nil {
-				if found, ferr := eng.LabeledRules(ctx, sf, projectID, vmID, "", ""); len(found) > 0 || ferr != nil {
-					target, alreadyGone = &provision.VM{ID: vmID}, true
-				}
+			sf, err := state.Read(statePath)
+			if err != nil {
+				return nil, err
 			}
-		}
-		if target == nil {
-			key, ref := "vm_id", vmID
-			if vmID == "" {
-				key, ref = "name", name
+			if found, ferr := eng.LabeledRules(ctx, sf, projectID, vmID, "", ""); len(found) > 0 || ferr != nil {
+				target, alreadyGone = &provision.VM{ID: vmID}, true
 			}
-			return answered(s.deleteFailedAs("destroy", key, ref, clierrors.New(clierrors.CodeVMNotFound,
-				i18n.Tf("no VM %s in project %s; nothing was deleted", "ВМ %s в проекте %s нет; ничего не удалено", ref, projectID),
-				i18n.T("List the project's VMs with vm_list (evo vm list).", "ВМ проекта — в выводе vm_list (evo vm list).")))), nil
 		}
 	}
+	if target == nil {
 
-	fipRec := state.DeploymentRecord{VMID: target.ID}
+		key, ref := "vm_id", vmID
+		if vmID == "" {
+			key, ref = "name", name
+		}
+		return answered(s.deleteFailedAs("destroy", key, ref, clierrors.New(clierrors.CodeVMNotFound,
+			i18n.Tf("no VM %s in project %s; nothing was deleted", "ВМ %s в проекте %s нет; ничего не удалено", ref, projectID),
+			i18n.T("List the project's VMs with vm_list (evo vm list).", "ВМ проекта — в выводе vm_list (evo vm list).")))), nil
+	}
+
+	// The VM's floating IP, found before the VM goes: the record deploy or
+	// provision wrote (floating_ip_id), else an address on the VM, else the
+	// one boot FIP named for it. The list's flat floating_ip field is often
+	// empty (BACKLOG [04]), which used to leave the FIP billed (QA H4).
+	releaseIP := true
+	if v, ok := args["release_ip"].(bool); ok {
+		releaseIP = v
+	}
+	fipRec := state.DeploymentRecord{VMID: target.ID, VMName: target.Name, ProjectID: projectID}
 	recordedHere := false
+	var matchedRecords int
+	var original state.DeploymentRecord
+	var trackedRequests []state.LostFloatingIP
 	var rulesPlanned []sgrules.Planned
 	sf, readErr := state.Read(statePath)
-	if readErr == nil {
+	if readErr != nil {
+		if s.projectBound {
+			return nil, boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+		}
+		if vmID != "" && target.ID == vmID && !alreadyGone {
+			// The exact VM was listed in this project. Its card can be shown
+			// without assuming anything about the unreadable local receipts.
+			preview := destroyTargetPreview(target, false, projectID, releaseIP, false, &fipRec, "", "", nil)
+			preview["floating_ip"] = i18n.T("unknown until the directory's state can be read", "неизвестно до чтения состояния каталога")
+			preview["message"] = i18n.T("The VM is visible in the project. Ask the person to restore this directory's state before deleting it so its address and port rules can be checked.",
+				"ВМ видна в проекте. Попросите пользователя восстановить состояние этого каталога перед удалением, чтобы проверить адрес и правила портов.")
+			preview["provenance"] = engine.ProvenanceOf(engine.ProvenanceVM, target.ID, target.CreatedAt, nil, nil, readErr)
+			return &Plan{Preview: preview, Execute: func(context.Context) (string, bool) { return errResult(readErr), true }}, nil
+		}
+		return nil, readErr
+	}
+	{
 		var ids []string
+		hasResolution, otherMaker := false, false
 		for _, d := range sf.Deployments {
 			if d.VMID == target.ID {
+				if d.ProjectID != "" && d.ProjectID != projectID {
+					if s.projectBound {
+						return nil, boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+					}
+					return nil, clierrors.New(clierrors.CodeConfigInvalid,
+						i18n.T("The active project does not own this deployment record.", "Выбранный проект не соответствует записи развёртывания."),
+						i18n.T("Select the deployment's original project.", "Выберите исходный проект развёртывания."))
+				}
+				if err := eng.CheckDestroyReceipt(sf, &d, projectID); err != nil {
+					if s.projectBound {
+						return nil, boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+					}
+					return nil, err
+				}
+				otherMaker = otherMaker || d.CreatedBy.Other(eng.Maker())
+
 				if err := engine.AdoptedVM(d, target); err != nil {
 					return nil, err
 				}
 				recordedHere = true
+				original = d
+				hasResolution = hasResolution || d.LegacyFloatingIPPending || len(d.FloatingIPResolutions) > 0
 				ids = append(ids, d.ID)
 				if d.FloatingIPID != "" {
 					fipRec.FloatingIPID = d.FloatingIPID
@@ -3039,29 +3249,44 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 				}
 			}
 		}
+		matchedRecords = len(ids)
+		if matchedRecords == 1 {
+			// A reconciliation applies only to this exact deployment, including
+			// its saved name and creation time when the VM no longer exists.
+			fipRec = original
+		}
+		trackedRequests = floatingip.Of(sf, projectID, firstNonEmptyStr(fipRec.VMName, target.Name), target.ID)
+		if otherMaker && (alreadyGone || hasResolution || len(trackedRequests) > 0 || fipRec.Status == "destroying" && eng.HasUnresolvedLegacyFloatingIP(&fipRec)) {
+			return nil, cleanupProfileMismatch()
+		}
+		if matchedRecords > 1 && (hasResolution || len(trackedRequests) > 0) {
+			return nil, ambiguousCleanupTarget()
+		}
 		rulesPlanned = sgrules.Plan(sf, ids...)
+	}
+	if err := eng.CheckDestroyReceipt(sf, &fipRec, projectID); err != nil {
+		if s.projectBound {
+			return nil, boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+		}
+		return nil, err
 	}
 	// The rules labelled for the VM that no record here holds (P6): this
 	// delete closes them too, once the VM is gone. A VM still there has
 	// only its zone's groups read; a gone one, every group.
 	var labeled []sgrules.Planned
 	var uncheckedErr error
-	if sf, serr := state.Read(statePath); serr == nil {
-		zoneID, zoneName := "", ""
-		if !alreadyGone && target.AvailabilityZone != nil {
-			zoneID, zoneName = target.AvailabilityZone.ID, target.AvailabilityZone.Name
-		}
-		labeled, uncheckedErr = eng.LabeledRules(ctx, sf, projectID, target.ID, zoneID, zoneName)
+	zoneID, zoneName := "", ""
+	if !alreadyGone && target.AvailabilityZone != nil {
+		zoneID, zoneName = target.AvailabilityZone.ID, target.AvailabilityZone.Name
 	}
+	labeled, uncheckedErr = eng.LabeledRules(ctx, sf, projectID, target.ID, zoneID, zoneName)
 	rulesPlanned = append(rulesPlanned, labeled...)
-	releaseIP := true
-	if v, ok := args["release_ip"].(bool); ok {
-		releaseIP = v
-	}
 	_, releaseAsked := args["release_ip"]
 	explicitRelease := releaseAsked && releaseIP
 	keptFIP, keptWhy := "", i18n.T("evo did not make it", "его создал не evo")
-	if fipRec.VMIP == "" {
+	hasPriorIPDecision := eng.HasLegacyFloatingIPResolution(&fipRec)
+	// The saved address, including its absence, is part of the receipt ID.
+	if fipRec.VMIP == "" && !hasPriorIPDecision {
 		addr := firstNonEmptyStr(target.FloatingIP, target.PublicIP)
 		// An address found only on a VM this directory did not record is
 		// released when evo made it; one the user reserved stays unless
@@ -3084,28 +3309,23 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 		}
 		fipRec.VMIP = addr
 	}
-	if releaseIP && fipRec.FloatingIPID == "" && fipRec.VMIP == "" && target.Name != "" {
-		if fips, e := eng.Cloud.ListFloatingIPs(ctx, projectID); e == nil {
-			// Named exactly for this VM (not "web-2" for "web"); of several
-			// such, the one the answer binds to this VM.
-			var named, bound []*provision.FloatingIP
-			for _, f := range fips {
-				if provision.IsEvoFIPOf(f.Name, target.ID, target.Name) {
-					named = append(named, f)
-					if f.BoundTo(target.ID) {
-						bound = append(bound, f)
-					}
-				}
-			}
-			if len(named) != 1 {
-				named = bound
-			}
-			if len(named) == 1 {
-				fipRec.FloatingIPID, fipRec.VMIP = named[0].ID, named[0].IPAddress
-			}
+	missingAddressID := fipRec.FloatingIPID == ""
+	var identifyErr error
+	// A destroyed VM with only rule receipts carries no authority to
+	// start a new floating-IP lookup by a generated name on a later retry.
+	onlyRuleReceipts := alreadyGone && matchedRecords == 1 && fipRec.Status == "destroyed" && (len(fipRec.OpenedRules) > 0 || fipRec.PendingRuleScan != nil) &&
+		!fipRec.LegacyFloatingIPPending && len(trackedRequests) == 0
+	// Keeping an IP can still contradict a recorded release. Read the
+	// binding before the VM detaches it, without authorizing an IP DELETE.
+	if (releaseIP || hasPriorIPDecision) && keptFIP == "" && !onlyRuleReceipts {
+		// The preview must not modify the snapshot used for the locked check.
+		fipRec.FloatingIPResolutions = slices.Clone(fipRec.FloatingIPResolutions)
+		identifyErr = eng.RecordLegacyFloatingIP(ctx, &fipRec, target, trackedRequests...)
+		if matchedRecords > 1 && (fipRec.LegacyFloatingIPPending || missingAddressID && fipRec.FloatingIPID != "") {
+			return nil, ambiguousCleanupTarget()
 		}
 	}
-	hasFIP := fipRec.FloatingIPID != "" || fipRec.VMIP != ""
+	hasFIP := !onlyRuleReceipts && (fipRec.FloatingIPID != "" || fipRec.VMIP != "" || identifyErr != nil)
 
 	preview := destroyTargetPreview(target, alreadyGone, projectID, releaseIP, hasFIP, &fipRec, keptFIP, keptWhy, rulesPlanned)
 	// What this delete leaves open to the internet in the VM's groups
@@ -3142,23 +3362,74 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 			eng.Printer = pp
 		}
 
-		if alreadyGone || strings.EqualFold(target.Status, "deleting") {
-			// Nothing to delete in the cloud, or the delete of an earlier
-			// call still going: Cloud.ru refuses another DELETE then with
-			// 409 (OPS-18), and the wait below is what the repeat is for.
-		} else if err := eng.Cloud.DeleteVMInProject(ctx, target.ID, projectID); err != nil {
+		deleteVM := func() error {
+			// This binding is available only while the VM still exists. Keep
+			// the state lock from its checkpoint through the initial DELETE.
+			unlock, err := state.Lock(statePath)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			current, err := state.Read(statePath)
+			if err != nil {
+				return err
+			}
+			if err := checkTargetDestroySnapshot(eng, sf, current, projectID, &fipRec); err != nil {
+				if s.projectBound {
+					return boundDeleteNotFound("destroy", firstNonEmptyStr(vmID, name))
+				}
+				return err
+			}
+			conflictChanged := !slices.Equal(original.FloatingIPResolutions, fipRec.FloatingIPResolutions)
+			if conflictChanged || missingAddressID && fipRec.FloatingIPID != "" {
+				if err := checkpointTargetAddress(eng, statePath, sf.FindDeployment(fipRec.ID), fipRec); err != nil {
+					return err
+				}
+			}
+			if !alreadyGone && recordedHere {
+				// Only the exact ID in the project list authorizes recording
+				// the scope before this VM disappears. A matching name alone cannot.
+				if err := pinLegacyDestroyProject(statePath, target.ID, projectID); err != nil {
+					return err
+				}
+			}
+			if alreadyGone || strings.EqualFold(target.Status, "deleting") {
+				// Nothing to delete in the cloud, or the delete of an earlier
+				// call still going: Cloud.ru refuses another DELETE then with
+				// 409 (OPS-18), and the wait below is what the repeat is for.
+				return nil
+			}
+			return eng.Cloud.DeleteVMInProject(ctx, target.ID, projectID)
+		}
+		if err := deleteVM(); err != nil {
+			fields := map[string]any{"vm_id": target.ID, "cleanup_pending": true}
+			if fipRec.FloatingIPID != "" {
+				fields["floating_ip_id"] = fipRec.FloatingIPID
+			}
 			var gone *clierrors.CLIError
 			if stderrors.As(err, &gone) && gone.Code == clierrors.CodeVMNotFound {
+
 				alreadyGone = true
 			} else if engine.IsNotDeletableYet(err) {
-				refused := eng.RefusedVMDelete(ctx, target.ID, firstNonEmptyStr(fipRec.FloatingIPID, fipRec.VMIP), err,
-					i18n.T(" Nothing was deleted.", " Ничего не удалено."))
-				return errAnswer(refused, map[string]any{"status": "not_deletable_yet", "vm_id": target.ID, "message": refused.Error()}), true
+
+				releaseTool := "release_floating_ip"
+				if !releaseIP {
+					releaseTool = "" // the caller explicitly chose to keep the address
+				} else if callerOf(ctx) != nil {
+					releaseTool = "evo vpc fip-release"
+				} else if s.served != nil && !s.served(releaseTool) {
+					releaseTool = i18n.T("the Cloud.ru console", "консоль Cloud.ru")
+				}
+				refused := eng.RefusedVMDelete(ctx, &fipRec, err,
+					i18n.T(" Nothing was deleted.", " Ничего не удалено."), s.checkVMHint(ctx, target.ID)+" "+destroyRetry(ctx, target.ID, args, false), releaseTool)
+				fields["status"], fields["message"] = "not_deletable_yet", refused.Error()
+				return errAnswer(refused, fields), true
 			} else {
-				return errResult(fmt.Errorf(i18n.T("delete VM: %w", "удаление ВМ: %w"), err)), true
+				return errAnswer(fmt.Errorf(i18n.T("delete VM: %w", "удаление ВМ: %w"), err), fields), true
 			}
 		}
 		if !alreadyGone {
+
 			waitCtx := ctx
 			if left, capped := budgetLeft(ctx); capped {
 				var cancel context.CancelFunc
@@ -3171,36 +3442,54 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 					// being deleted, the repeat waits for it again.
 					return destroyDeleting(ctx, eng, statePath, projectID, target, &fipRec, releaseIP && hasFIP, args), false
 				}
-				return destroyUnconfirmed(statePath, projectID, target, &fipRec, releaseIP && hasFIP, !releaseIP && hasFIP), true
+
+				return s.destroyUnconfirmed(ctx, statePath, projectID, target, &fipRec, releaseIP && hasFIP, args), true
 			}
 		}
 
+		// The floating IP first, as the CLI destroy does: it stays attached until
+		// the VM is gone. Only then the record goes — dropping it before a failed
+		// release left the FIP billed with no trace (QA r3 R1).
 		msg := i18n.T("VM deleted", "ВМ удалена")
 		if alreadyGone {
-			msg = i18n.T("VM already deleted (not found in the cloud); its local record is cleaned up",
-				"ВМ уже удалена (в облаке не найдена); локальная запись очищена")
+			msg = i18n.T("VM already deleted (not found in the cloud)",
+				"ВМ уже удалена (в облаке не найдена)")
 		}
 		if keptFIP != "" {
-			msg += i18n.Tf("; floating IP %s kept: %s — whether to release it (release_floating_ip, or destroy with release_ip=true), ask the person",
-				"; floating IP %s сохранён: %s — освобождать ли его (evo vpc fip-release или evo vm delete с --release-ip), решает человек", keptFIP, keptWhy)
+			msg += i18n.Tf("; floating IP %q kept: %s — ask the person whether to release it",
+				"; floating IP %q сохранён: %s. Спросите человека, освобождать ли его", keptFIP, keptWhy)
 		}
 		fipLeft := false
+		if !releaseIP && fipRec.LegacyFloatingIPPending && identifyErr != nil {
+			// Keeping an address does not settle a contradicted local decision.
+			msg += ". " + identifyErr.Error()
+		}
 		if releaseIP && hasFIP {
-			if ferr := eng.ReleaseFloatingIP(ctx, &fipRec); ferr != nil {
+			ferr := identifyErr
+			if ferr == nil {
+				ferr = eng.ReleaseFloatingIP(ctx, &fipRec)
+			}
+			if ferr != nil {
 				fipLeft = true
-				msg += i18n.Tf("; WARNING: the floating IP %s was NOT released and is still billed (%v) — "+
-					"call destroy with vm_id %s again: the record keeps the floating IP, and destroy retries the release",
-					"; ВНИМАНИЕ: floating IP %s НЕ освобождён и продолжает оплачиваться (%v) — "+
-						"повторите evo vm delete %s: запись хранит адрес, и команда повторит освобождение", firstNonEmptyStr(fipRec.VMIP, fipRec.FloatingIPID), ferr, target.ID)
-			} else {
+				msg += i18n.Tf("; WARNING: release of floating IP %q is unconfirmed; if it was NOT released, charges may continue (%v)",
+					"; ВНИМАНИЕ: освобождение floating IP %q не подтверждено, начисления могут продолжаться (%v)", firstNonEmptyStr(fipRec.VMIP, fipRec.FloatingIPID), ferr)
+			} else if fipRec.FloatingIPID != "" {
 				msg += i18n.T("; released floating IP ", "; освобождён floating IP ") + firstNonEmptyStr(fipRec.VMIP, fipRec.FloatingIPID)
 			}
 		}
+		// An unresolved create stays on the deployment until its own address is gone.
 		var lostReleased, lostMissing []string
+		var extraPending bool
 		if releaseIP {
 			var rel, miss []state.LostFloatingIP
-			lerr, _ := withAddressMarks(statePath, func(sf *state.File) (err error) {
-				rel, miss, err = floatingip.Release(ctx, eng.Cloud, sf, projectID, target.Name, target.ID, fipRec.FloatingIPID)
+			lerr, werr := withAddressMarks(statePath, func(sf *state.File) (err error) {
+				vmName := firstNonEmptyStr(fipRec.VMName, target.Name)
+				scoped := fipRec
+				scoped.VMName = vmName
+				if err := eng.CheckDestroyReceipt(sf, &scoped, projectID); err != nil {
+					return err
+				}
+				rel, miss, err = floatingip.Release(ctx, eng.Cloud, sf, projectID, vmName, target.ID, fipRec.FloatingIPID)
 				return err
 			})
 			for _, m := range rel {
@@ -3210,13 +3499,14 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 			}
 			for _, m := range miss {
 				lostMissing = append(lostMissing, m.Name)
-				msg += i18n.Tf("; floating IP %s, requested %s with no answer, is not listed: if list_floating_ips shows it later, it is billed — whether to release it (release_floating_ip), ask the person",
-					"; floating IP %s, запрошенного %s без ответа, нет в списке: если evo vpc fips покажет его позже, он оплачивается — освобождать ли его (evo vpc fip-release), решает человек",
+				msg += i18n.Tf("; floating IP %s, requested %s with no answer, is not listed. The receipt was kept. Check the request and address ID in the cloud before deciding whether to release it",
+					"; floating IP %s, запрошенный %s без ответа облака, в списке не найден. Квитанция сохранена. Перед решением об освобождении сверьте запрос и ID адреса в облаке",
 					m.Name, m.RequestedAt.UTC().Format(time.RFC3339))
 			}
-			if lerr != nil {
-				msg += i18n.Tf("; the floating IPs requested with no answer were not checked (%v): destroy checks them again",
-					"; floating IP, запрошенные без ответа, не проверены (%v): повтор evo vm delete проверит их снова", lerr)
+			if lerr = stderrors.Join(lerr, werr); lerr != nil {
+				extraPending = true
+				msg += i18n.Tf("; cleanup of the floating IPs requested with no answer is unconfirmed (%v)",
+					"; уборка floating IP, запрошенных без ответа облака, не подтверждена (%v)", lerr)
 			}
 		}
 
@@ -3224,18 +3514,53 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 		// code as the CLI destroy) and drop the record — unless its FIP is still
 		// billed: then it stays "destroying" with the FIP, for the next destroy.
 		var rules sgrules.CloseResult
+		var receiptPending bool
 		stateErr := state.Update(statePath, stateLockWait, func(sf *state.File) error {
+			// release_ip=false cannot settle a previous create or its receipt.
+			// Re-read under the lock before retiring the deployment.
+			legacyPending := fipRec.LegacyFloatingIPPending
 			var ids []string
 			for _, d := range sf.Deployments {
 				if d.VMID == target.ID {
+					if err := eng.CheckDestroyReceipt(sf, &d, projectID); err != nil {
+						return err
+					}
 					ids = append(ids, d.ID)
+					if fipRec.ID == d.ID && (legacyPending || !releaseIP && d.Status == "destroying") {
+						d.LegacyFloatingIPPending = d.LegacyFloatingIPPending || legacyPending
+						legacyPending = eng.HasUnresolvedLegacyFloatingIP(&d)
+					}
 				}
 			}
-			for _, id := range ids {
-				rules.Add(sgrules.Close(ctx, eng.Cloud, sf, id))
+			if len(labeled) > 0 || uncheckedErr != nil {
+				// A VM deleted from another directory can have labelled rules
+				// without any local record. Store their IDs before the first
+				// rule DELETE, so even an interrupted readback is retryable.
+				if len(ids) == 0 {
+					if sf.FindDeployment(target.ID) != nil {
+						return ambiguousCleanupTarget()
+					}
+					sf.UpsertDeployment(state.DeploymentRecord{ID: target.ID, VMID: target.ID, VMName: target.Name, ProjectID: projectID, CreatedBy: eng.Maker(), Status: "destroyed", CreatedAt: clock.Now()})
+					ids = append(ids, target.ID)
+				}
+				sgrules.TrackLabeled(sf, sf.FindDeployment(ids[0]), labeled)
 			}
-			if fipLeft {
-				rec := state.DeploymentRecord{ID: target.ID, VMID: target.ID, CreatedAt: time.Now()}
+			if uncheckedErr != nil {
+				for _, id := range ids {
+					sf.FindDeployment(id).NoteRuleScan(projectID, eng.Maker())
+				}
+			}
+			if len(labeled) > 0 || uncheckedErr != nil {
+				if err := state.Write(statePath, sf); err != nil {
+					return err
+				}
+			}
+			receiptPending = legacyPending || len(floatingip.Of(sf, projectID, firstNonEmptyStr(fipRec.VMName, target.Name), target.ID)) > 0
+			for _, id := range ids {
+				rules.Add(sgrules.Close(ctx, eng.Cloud, sf, id, projectID, eng.Maker()))
+			}
+			if fipLeft || extraPending || receiptPending {
+				rec := state.DeploymentRecord{ID: target.ID, VMID: target.ID, VMName: target.Name, ProjectID: projectID, CreatedAt: time.Now()}
 				for _, d := range sf.Deployments {
 					if d.VMID == target.ID {
 						rec = d
@@ -3243,24 +3568,42 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 					}
 				}
 				rec.Status = "destroying"
+				rec.LegacyFloatingIPPending = legacyPending
 				rec.FloatingIPID = firstNonEmptyStr(fipRec.FloatingIPID, rec.FloatingIPID)
 				rec.VMIP = firstNonEmptyStr(fipRec.VMIP, rec.VMIP)
-				rec.ProjectID = firstNonEmptyStr(rec.ProjectID, fipRec.ProjectID, projectID)
 				rec.UpdatedAt = time.Now()
 				sf.UpsertDeployment(rec)
 				return nil
 			}
 			for _, id := range ids {
+				d := sf.FindDeployment(id)
+				if uncheckedErr == nil && len(d.OpenedRules) == 0 {
+					d.PendingRuleScan = nil
+				}
 				sgrules.Retire(sf, id)
 			}
 			return nil
 		})
-		rules.Add(sgrules.CloseLabeled(ctx, eng.Cloud, labeled))
 
 		out := map[string]any{
 			"status":     "ok",
 			"deleted_vm": target.ID,
 			"name":       target.Name,
+		}
+		if receiptPending {
+			hint := receiptHint(ctx)
+			out["hint"] = hint
+			msg += ". " + hint
+		}
+		if fipLeft && fipRec.FloatingIPID != "" {
+			out["floating_ip_id"] = fipRec.FloatingIPID
+			if stateErr == nil {
+				msg += i18n.T(". The deployment record keeps this address ID for the next cleanup attempt.",
+					". ID этого адреса сохранён в записи развёртывания для следующей попытки уборки.")
+			}
+		}
+		if fipLeft || extraPending || receiptPending || len(rules.Failed) > 0 || stateErr != nil || uncheckedErr != nil || len(lostMissing) > 0 {
+			out["cleanup_pending"] = true
 		}
 		if alreadyGone {
 			out["status"] = "already_deleted"
@@ -3275,25 +3618,143 @@ func (s *Registry) planDestroyTargeted(ctx context.Context, args map[string]any,
 			msg += i18n.T("; closed ports ", "; закрыты порты ") + strings.Join(rules.Closed, ",")
 		}
 		if len(rules.Failed) > 0 {
-			msg += i18n.Tf("; WARNING: could not delete the rules for ports %s — call destroy again to retry",
-				"; ВНИМАНИЕ: не удалось удалить правила портов %s — повторите evo vm delete", strings.Join(rules.Failed, "; "))
+			msg += i18n.Tf("; WARNING: could not delete the rules for ports %s", "; ВНИМАНИЕ: не удалось удалить правила портов %s", strings.Join(rules.Failed, "; "))
+		}
+		if len(rules.Failed) > 0 || uncheckedErr != nil || fipLeft || extraPending {
+			retry := destroyRetry(ctx, target.ID, args, s.projectBound)
+			appendCleanupHint(out, retry)
+			msg += ". " + retry
 		}
 		if !rules.Empty() {
 			out["security_group_rules"] = rules
 		}
 		if uncheckedErr != nil {
-			msg += "; " + engine.UncheckedRules(uncheckedErr)
+			msg += i18n.Tf("; the rules labelled for this VM were not all checked (%s)", "; не удалось проверить все правила с меткой этой ВМ (%s)", clierrors.Reason(uncheckedErr))
 			out["labelled_rules_unchecked"] = clierrors.Reason(uncheckedErr)
 		}
 		if stateErr != nil {
 			// The VM is gone; only the local bookkeeping is stale. Say so rather
 			// than leave port rules open without a word.
-			msg += i18n.Tf("; WARNING: the local state was not updated (%v): its record of this VM stays, and the port rules that deployment opened were not closed — close them in the Cloud.ru console if nothing else uses them",
-				"; ВНИМАНИЕ: локальное состояние не обновлено (%v): запись этой ВМ осталась, а правила портов, открытые развёртыванием, не закрыты — закройте их в консоли Cloud.ru, если они больше не нужны", stateErr)
+			msg += i18n.Tf("; WARNING: the local state was not updated (%v); ask the person to check the original state directory and verify which port rules still belong to this deployment before any further removal",
+				"; ВНИМАНИЕ: локальное состояние не обновлено (%v). Попросите человека проверить исходный каталог состояния и принадлежность оставшихся правил портов этому развёртыванию перед их удалением", stateErr)
 		}
 		out["message"] = msg
 		return toJSON(out), false
 	}}, nil
+}
+
+// Called under the state lock after membership and approval. Read again
+// because checkpointTargetAddress may just have saved a new address ID.
+func pinLegacyDestroyProject(path, vmID, project string) error {
+	sf, err := state.Read(path)
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range sf.Deployments {
+		d := &sf.Deployments[i]
+		if d.VMID == vmID && d.ProjectID == "" && d.CleanupProjectID == "" {
+			d.CleanupProjectID = project
+			changed = true
+		}
+	}
+	if changed {
+		return state.Write(path, sf)
+	}
+	return nil
+}
+
+// Check the records and address requests of this VM only. An approval for
+// one project or owner cannot be applied to a replacement record.
+func checkTargetDestroySnapshot(eng *engine.Engine, before, now *state.File, project string, target *state.DeploymentRecord) error {
+	records := func(sf *state.File) []state.DeploymentRecord {
+		var matches []state.DeploymentRecord
+		for _, d := range sf.Deployments {
+			if d.VMID == target.VMID {
+				matches = append(matches, d)
+			}
+		}
+		return matches
+	}
+	if !reflect.DeepEqual(records(before), records(now)) ||
+		!reflect.DeepEqual(floatingip.Of(before, project, target.VMName, target.VMID), floatingip.Of(now, project, target.VMName, target.VMID)) {
+		return clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.T("The recorded cleanup target changed after the preview.", "После предпросмотра изменилась запись цели уборки."),
+			i18n.T("Ask the person to review the new destroy preview.", "Покажите пользователю новый предпросмотр удаления."))
+	}
+	return eng.CheckDestroyReceipt(now, target, project)
+}
+
+// checkpointTargetAddress runs under the state lock after consent. Only the
+// deployment seen in the preview may receive the newly proved address ID.
+func checkpointTargetAddress(eng *engine.Engine, path string, expected *state.DeploymentRecord, proved state.DeploymentRecord) error {
+	sf, err := state.Read(path)
+	if err != nil {
+		return err
+	}
+	changed := func() error {
+		return clierrors.New(clierrors.CodeConfigInvalid,
+			i18n.T("The deployment record changed before its floating IP could be saved.", "Запись развёртывания изменилась до сохранения его floating IP."),
+			i18n.T("Ask the person to check the target and review a new destroy preview.", "Покажите новый предпросмотр destroy и спросите человека, удалять ли указанную ВМ."))
+	}
+	var current *state.DeploymentRecord
+	for i := range sf.Deployments {
+		if sf.Deployments[i].VMID == proved.VMID {
+			if current != nil {
+				return ambiguousCleanupTarget()
+			}
+			current = &sf.Deployments[i]
+		}
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return changed()
+	}
+	if err := eng.CheckFloatingIPReceiptProject(sf, &proved); err != nil {
+		return err
+	}
+	if current != nil && !slices.Equal(current.FloatingIPResolutions, proved.FloatingIPResolutions) {
+		// Save the contradicted decision before DELETE can detach the address.
+		// Its digest includes the original project field, including an empty one.
+		current.FloatingIPResolutions = proved.FloatingIPResolutions
+		current.LegacyFloatingIPPending = true
+		current.Status = "destroying"
+		return state.Write(path, sf)
+	}
+	now := clock.Now()
+	if current == nil {
+		// A targeted delete may also release an explicitly selected address
+		// of an unrecorded VM. Do not overwrite another deployment's ID.
+		if sf.FindDeployment(proved.VMID) != nil {
+			return changed()
+		}
+		proved.ID, proved.CreatedAt = proved.VMID, now
+		proved.Status, proved.CreatedBy = "destroying", eng.Maker()
+	}
+	proved.ProjectID, proved.UpdatedAt = eng.Config.ProjectID, now
+	sf.UpsertDeployment(proved)
+	return state.Write(path, sf)
+}
+
+func appendCleanupHint(out map[string]any, retry string) {
+	if hint, ok := out["hint"].(string); ok && hint != "" {
+		out["hint"] = hint + " " + retry
+		return
+	}
+	out["hint"] = retry
+}
+
+func cleanupProfileMismatch() error {
+	return clierrors.New(clierrors.CodeConfigInvalid,
+		i18n.T("The current profile cannot confirm the original deployment's cleanup.", "Текущий профиль не может подтвердить уборку исходного развёртывания."),
+		i18n.T("Select the deployment's original profile.", "Выберите исходный профиль развёртывания."))
+}
+
+func ambiguousCleanupTarget() error {
+	return clierrors.New(clierrors.CodeConfigInvalid,
+		i18n.T("Several local deployments record this VM. The floating IP receipt cannot be attributed to one deployment.",
+			"Эта ВМ записана у нескольких развёртываний. Квитанцию плавающего IP нельзя однозначно отнести к одному из них."),
+		i18n.T("Ask the owner to inspect each deployment in a terminal in the same state directory with evo cleanup receipts --deployment-id <id>.",
+			"Попросите владельца проверить квитанции каждого развёртывания в терминале в том же каталоге состояния через evo cleanup receipts --deployment-id <id>."))
 }
 
 // vmZone is the VM's zone for an answer: its name when the list gave it,
@@ -3320,6 +3781,7 @@ func destroyTargetPreview(target *provision.VM, alreadyGone bool, projectID stri
 	if !target.CreatedAt.IsZero() {
 		tgt["created_at"] = target.CreatedAt
 	}
+
 	label := target.ID
 	if target.Name != "" {
 		label = quoteCloud(target.Name) + " (" + target.ID + ")"
@@ -3343,6 +3805,9 @@ func destroyTargetPreview(target *provision.VM, alreadyGone bool, projectID stri
 		fip = i18n.Tf("will be kept: %s — %s (call with release_ip=true to release it)",
 			"будет сохранён: %s — %s (чтобы освободить, вызовите с release_ip=true, в команде — --release-ip)", keptFIP, keptWhy)
 	case hasFIP && releaseIP:
+		// Future tense: the preview is before consent; "released:" read as
+		// already done (G130-36). The answer after confirmed=true still says
+		// "released floating IP …".
 		fip = i18n.T("will be released: ", "будет освобождён: ") + addrLabel(fipRec.VMIP, fipRec.FloatingIPID)
 	case hasFIP:
 		fip = i18n.T("will be kept (release_ip=false): ", "будет сохранён (release_ip=false, в команде — --release-ip=false): ") + addrLabel(fipRec.VMIP, fipRec.FloatingIPID)
@@ -3398,27 +3863,27 @@ func fipLeftAnswer(err error, fip *provision.FloatingIP, fipErr error) string {
 		err, fip.IPAddress, fip.ID, fipErr), map[string]any{"floating_ip_id": fip.ID, "floating_ip": fip.IPAddress})
 }
 
-func destroyUnconfirmed(statePath, projectID string, target *provision.VM, fipRec *state.DeploymentRecord, keepFIP, keepAsked bool) string {
+func (s *Registry) destroyUnconfirmed(ctx context.Context, statePath, projectID string, target *provision.VM, fipRec *state.DeploymentRecord, keepFIP bool, args map[string]any) string {
 	recorded, stateErr := markDestroying(statePath, projectID, target, fipRec, keepFIP)
-	msg := fmt.Sprintf("VM %s: Cloud.ru accepted the delete, but the VM is still listed, so the deletion is not confirmed; "+
-		"its floating IP and port rules are kept for now", target.ID)
-	hint := fmt.Sprintf("While the VM exists, it and its floating IP are billed. Check it with vm_get %s, then call destroy with vm_id %s again: once the VM is gone it releases the floating IP and closes the ports.", target.ID, target.ID)
-	if keepAsked {
-		hint = fmt.Sprintf("While the VM exists, it is billed. Check it with vm_get %s, then call destroy with vm_id %s and release_ip=false again: once the VM is gone it closes the ports and keeps the floating IP.", target.ID, target.ID)
-	}
+	msg := i18n.Tf("Cloud.ru accepted deletion of VM %q but it is still listed. Its floating IP and port rules have been kept.",
+		"Cloud.ru принял запрос на удаление ВМ %q, но ВМ по-прежнему в списке. Её floating IP и правила портов сохранены.", target.ID)
+	check := s.checkVMHint(ctx, target.ID)
+	hint := check + " " + destroyRetry(ctx, target.ID, args, false)
 	switch {
 	case stateErr != nil:
-		msg += fmt.Sprintf(" (WARNING: the local state was not updated: %v)", stateErr)
+		msg += i18n.Tf(" The local state was not updated (%v).", " Не удалось обновить локальную запись (%v).", stateErr)
 	case recorded:
-		msg += " and its local record stays (status destroying)"
+		msg += i18n.T(" The local record stays in status destroying.", " Локальная запись сохранена со статусом destroying.")
 	default:
-		// Nothing recorded here and no FIP found: a re-run after the VM is
-		// gone would be VM_NOT_FOUND, there is nothing left to clean up.
-		hint = fmt.Sprintf("Check it with vm_get %s: once it is VM_NOT_FOUND the deletion is done, nothing else needs a destroy.", target.ID)
+		hint = check + i18n.T(" No local cleanup was recorded for this VM.", " Для этой ВМ нет локальной записи об уборке.")
 	}
-	fields := map[string]any{"status": "partial", "vm_id": target.ID, "name": target.Name}
+	msg += i18n.T(" Charges may continue until deletion is confirmed.", " До подтверждения удаления начисления могут продолжаться.")
+	fields := map[string]any{"status": "partial", "vm_id": target.ID, "name": target.Name, "cleanup_pending": true}
+	if fipRec.FloatingIPID != "" {
+		fields["floating_ip_id"] = fipRec.FloatingIPID
+	}
 	if keepFIP {
-		fields["floating_ip"] = "kept until the VM is gone: " + addrLabel(fipRec.VMIP, fipRec.FloatingIPID)
+		fields["floating_ip"] = i18n.T("kept until the VM is gone: ", "сохранён до удаления ВМ: ") + addrLabel(fipRec.VMIP, fipRec.FloatingIPID)
 	}
 	return errAnswer(clierrors.New(clierrors.CodeAPIError, msg, hint), fields)
 }
@@ -3429,9 +3894,12 @@ func destroyDeleting(ctx context.Context, eng *engine.Engine, statePath, project
 	if vm, err := eng.Cloud.GetVM(ctx, target.ID); err == nil && vm.Status != "" {
 		vmStatus = vm.Status
 	}
-	out := map[string]any{"status": "deleting", "vm_id": target.ID, "name": target.Name, "vm_status": vmStatus,
-		"next": i18n.Tf("Cloud.ru is deleting VM %s; it is billed until it is gone. Call destroy with vm_id %s and confirmed=true again: it waits for the VM, then releases its floating IP and port rules and drops the record.",
-			"Cloud.ru удаляет ВМ %s; пока она не удалена, она оплачивается. Повторите evo vm delete %s с подтверждением: команда дождётся удаления ВМ, затем освободит её floating IP, удалит правила портов и запись.", target.ID, target.ID)}
+	out := map[string]any{"status": "deleting", "vm_id": target.ID, "name": target.Name, "vm_status": vmStatus, "cleanup_pending": true,
+		"next": i18n.Tf("Cloud.ru is deleting VM %q. The VM is billed until it is gone.", "Cloud.ru удаляет ВМ %q. Пока ВМ существует, она оплачивается.", target.ID) + " " + i18n.T("Use the same destroy call in next_args to continue waiting.", "Продолжите ожидание тем же вызовом destroy с параметрами из next_args.")}
+
+	if fipRec.FloatingIPID != "" {
+		out["floating_ip_id"] = fipRec.FloatingIPID
+	}
 	if keepFIP {
 		out["floating_ip"] = i18n.T("kept until the VM is gone: ", "сохранён до удаления ВМ: ") + addrLabel(fipRec.VMIP, fipRec.FloatingIPID)
 	}
@@ -3467,6 +3935,7 @@ func markDestroying(statePath, projectID string, target *provision.VM, fipRec *s
 			}
 			d.Status, d.UpdatedAt = "destroying", now
 			if keepFIP {
+				d.LegacyFloatingIPPending = fipRec.LegacyFloatingIPPending
 				d.FloatingIPID = firstNonEmptyStr(fipRec.FloatingIPID, d.FloatingIPID)
 				d.VMIP = firstNonEmptyStr(fipRec.VMIP, d.VMIP)
 			}
@@ -3477,7 +3946,8 @@ func markDestroying(statePath, projectID string, target *provision.VM, fipRec *s
 			// Not recorded here, but its FIP was found: recorded now, so a
 			// re-run releases it even once the VM is out of the list.
 			sf.UpsertDeployment(state.DeploymentRecord{ID: target.ID, VMID: target.ID, Status: "destroying",
-				FloatingIPID: fipRec.FloatingIPID, VMIP: fipRec.VMIP, ProjectID: projectID, CreatedAt: now, UpdatedAt: now})
+				FloatingIPID: fipRec.FloatingIPID, VMIP: fipRec.VMIP, ProjectID: projectID, CreatedAt: now, UpdatedAt: now,
+				LegacyFloatingIPPending: fipRec.LegacyFloatingIPPending})
 		}
 		recorded = marked || keepFIP
 		return nil
@@ -3493,18 +3963,21 @@ func provisionNoPublicIP(res map[string]any, vmID, fipID string, fipErr error) s
 	}
 	fipNote := ""
 	if fipID != "" {
-		fipNote = fmt.Sprintf(" Its floating IP %s is recorded in the state: a destroy of the VM releases it — ask the person before deleting.", fipID)
+		fipNote = i18n.Tf(" Its floating IP %s is recorded in the state: a destroy of the VM releases it — ask the person before deleting.",
+			" Плавающий IP %s записан в состоянии развёртывания. При удалении ВМ evo освобождает этот адрес. Сначала подтвердите удаление у пользователя.", fipID)
 	}
 	res["status"] = "partial"
 	res["vm_ip"] = ""
 	res["floating_ip_id"] = fipID
-	res["message"] = fmt.Sprintf("VM %s is active and billed, but it has no public IP: attaching one failed, so it cannot be reached by SSH from outside.%s", vmID, fipNote)
+	res["message"] = i18n.Tf("VM %s is active and billed, but it has no public IP: attaching one failed, so it cannot be reached by SSH from outside.%s",
+		"ВМ %s работает и тарифицируется. Подключить публичный IP не удалось, поэтому подключение по SSH извне недоступно.%s", vmID, fipNote)
 	if _, ok := res["password"]; ok {
 		res["message"] = res["message"].(string) + passwordOnce()
 	}
 	return errAnswer(clierrors.Wrap(code,
-		fmt.Sprintf("VM %s is active, but its public IP was not attached (%v)", vmID, fipErr),
-		fmt.Sprintf("Attach a free address with fip_attach (vm %s; addresses from list_floating_ips); whether to delete the VM instead (destroy vm_id=%s) — ask the person.", vmID, vmID),
+		i18n.Tf("VM %s is active, but its public IP was not attached (%v)", "ВМ %s работает, но публичный IP не привязан: %v", vmID, fipErr),
+		i18n.Tf("Attach a free address with fip_attach (vm %s; addresses from list_floating_ips); whether to delete the VM instead (destroy vm_id=%s) — ask the person.",
+			"Посмотрите свободные адреса командой evo vpc fips. Чтобы привязать выбранный адрес, выполните evo vpc fip-attach <адрес> --vm %s. Если хотите удалить ВМ, подтвердите у пользователя удаление ВМ %s.", vmID, vmID),
 		fipErr), res)
 }
 
@@ -3684,18 +4157,19 @@ var consentWords = map[string]string{
 	"k8s_nodepool_delete": consentDeletes,
 	"backup_delete":       consentDeletes,
 	"k8s_delete":          consentDeletes,
-	"disk_delete":         consentDeletes,
-	"image_delete":        consentDeletes,
-	"ar_delete":           consentDeletes,
-	"pg_db_delete":        consentDeletes,
-	"secret_delete":       consentDeletes,
-	"cert_delete":         consentDeletes,
-	"dns_zone_delete":     consentDeletes,
-	"vm_stop":             consentInterrupts,
-	"vm_reboot":           consentInterrupts,
-	"secret_value":        consentReveals,
-	"cert_private_key":    consentReveals,
-	"s3_put":              consentOverwrites,
+
+	"disk_delete":      consentDeletes,
+	"image_delete":     consentDeletes,
+	"ar_delete":        consentDeletes,
+	"pg_db_delete":     consentDeletes,
+	"secret_delete":    consentDeletes,
+	"cert_delete":      consentDeletes,
+	"dns_zone_delete":  consentDeletes,
+	"vm_stop":          consentInterrupts,
+	"vm_reboot":        consentInterrupts,
+	"secret_value":     consentReveals,
+	"cert_private_key": consentReveals,
+	"s3_put":           consentOverwrites,
 }
 
 var consentWordless = map[string]string{
@@ -3876,6 +4350,9 @@ func intArg(args map[string]any, key string, def int) int {
 	return def
 }
 
+// withProject names the project in a preview, resolved as the call will
+// resolve it: with a key that sees several projects the user must see where
+// the VM is created (QA P6).
 func withProject(will map[string]any, project string) map[string]any {
 	if project == "" {
 		project = "(not set: the call will fail)"
@@ -3967,6 +4444,10 @@ func errAnswer(err error, fields map[string]any) string {
 	for k, v := range fields {
 		res[k] = v
 	}
+	// Schema-rule refusals name the argument (and format) explicitly so
+	// the CLI can word the hint without parsing the text (G130-35). Other
+	// answer fields come only from the fields argument — CLIError.Details
+	// are not copied.
 	var re *ruleError
 	if stderrors.As(err, &re) {
 		if _, ok := res["argument"]; !ok {
@@ -4016,9 +4497,11 @@ func errAnswer(err error, fields map[string]any) string {
 	}
 	reason, msg, hint := errReason(err, res)
 	if httpretry.RouteNotFound(err) {
+
 		hint = clierrors.RouteNotFoundHint()
 	}
 	if quotaRefusal(err) != "" {
+
 		hint = quotaHint(false)
 	}
 	if hint != "" {
@@ -4040,6 +4523,7 @@ func errAnswer(err error, fields map[string]any) string {
 		res["access_denied"] = true
 		res["http_status"] = st
 	}
+
 	if st >= 400 && st < 600 {
 		res[apiStatusField] = st
 	}
@@ -4048,6 +4532,7 @@ func errAnswer(err error, fields map[string]any) string {
 			res["hint"] = h
 		}
 	}
+
 	var amb *images.AmbiguousError
 	if stderrors.As(err, &amb) {
 		res["candidates"] = imageCandidates(amb)
@@ -4061,6 +4546,7 @@ func errAnswer(err error, fields map[string]any) string {
 // other fields, which uncodedReason reads too.
 func errReason(err error, fields map[string]any) (reason, msg, hint string) {
 	msg = err.Error()
+
 	if stderrors.Is(err, context.Canceled) {
 		return clierrors.ReasonInterrupted, msg, ""
 	}
@@ -4081,6 +4567,9 @@ func errReason(err error, fields map[string]any) (reason, msg, hint string) {
 		}
 		f["error"] = msg
 		reason = uncodedReason(err, f)
+	}
+	if bareServiceStatus.MatchString(msg) {
+		msg = i18n.Tf("%s", "Сервис вернул ошибку: %s", msg)
 	}
 	return reason, msg, hint
 }
@@ -4153,6 +4642,18 @@ func provisionPreview(cfg config.Config, zone *provision.AvailabilityZone, args 
 	return p
 }
 
+// completePreview completes the preview of a tool before it answers
+// confirmation_required (spec REQ-7, owner's decision Q6): with reads only
+// (engine.CompletePreview), the configured project, zone names and, for a
+// VM, the flavor, the image, the boot disk it needs, the price (the
+// price-calculation API, else the rate card with price_api_error) and the
+// network check. The CLI did this itself before it showed the preview, so
+// an agent saw less than the command did; now the command only shows what
+// the tool answers. eng is the engine the tool has already built, nil for
+// the one of the configuration (the CLI's was). Best effort: without an
+// engine the preview stays as it is, and without credentials or a cloud
+// nothing is read. The error is a refusal the reads found (a VM image the
+// project cannot use): the call would be refused after consent.
 func (s *Registry) completePreview(ctx context.Context, eng *engine.Engine, p engine.CreatePreview) (engine.CreatePreview, error) {
 	if eng == nil {
 		var err error
@@ -4203,6 +4704,7 @@ func provisionInputError(ctx context.Context, eng *engine.Engine) (args []string
 			"Передайте region — имя зоны (например, ru.AZ-2) или её UUID (list_zones): у сервера не задан CLOUDRU_REGION.")
 		if zones, lerr := listZones(ctx, eng); lerr == nil {
 			if z := engine.DefaultZone(zones, engine.ZoneVM); z != nil {
+
 				fields["default_zone"] = z.Name
 				cloudText(fields, "default_zone")
 				hint = i18n.Tf("The default zone is %[1]s (list_zones): pass region: %[1]s; the server has no CLOUDRU_REGION to default to.",

@@ -78,6 +78,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 
 	existing := stateFile.ActiveComposeDeployment()
 	isNewDeploy := existing == nil
+
 	if err := composeRefusal(existing, opts.ComposeFile); err != nil {
 		return err
 	}
@@ -92,6 +93,10 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 			i18n.Tf("deployment %s is being destroyed", "развёртывание %s в процессе удаления", existing.ID),
 			i18n.T("Ask the person whether to finish its delete ('evo destroy'), then deploy again.", "Спросите человека, завершить ли удаление ('evo destroy'), затем разверните заново."))
 	}
+	// A VM that went to error_creating is not reused: it never boots, and a
+	// re-run would give it a billed floating IP and retry SSH in a loop
+	// (release QA, B-lifecycle 4; register CMP-9: such a VM is deleted
+	// through the API).
 	if !isNewDeploy && existing.Status == "error" {
 		return clerrors.New(clerrors.CodeVMProvisionFailed,
 			i18n.Tf("VM %s of this deployment is in an error state", "ВМ %s этого развёртывания в состоянии ошибки", existing.VMID),
@@ -108,6 +113,9 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 				"Обновите его с --project-id %s; чтобы развернуть в новом проекте, спросите человека, удалить ли его сначала ('evo destroy').", existing.ProjectID))
 	}
 
+	// A stopped VM takes no upload and runs nothing: refused with the cause
+	// before the question (axis 1), not asked and then timed out on SSH —
+	// and before «nothing to deploy», which would say the service runs.
 	if !isNewDeploy {
 		if err := e.DeployVMStopped(ctx, existing); err != nil {
 			return err
@@ -117,6 +125,9 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 	// an SSH or Docker failure, or a deploy cut before compose up, the hash
 	// is already recorded, and a plain re-run must retry.
 	if !isNewDeploy && existing.UpToDate(project.Hash) && !opts.Force {
+		if opts.Result != nil {
+			*opts.Result = DeployResult{Record: *existing, Action: "unchanged"}
+		}
 		if e.Printer.IsJSON() {
 			return e.Printer.JSON(map[string]any{"status": "unchanged", "vm_id": existing.VMID, "vm_ip": existing.VMIP})
 		}
@@ -125,6 +136,12 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 		e.Printer.Hint(i18n.T("Use --force to redeploy anyway.", "Развернуть заново всё равно: --force."))
 		return nil
 	}
+	// Updating the VM of an existing deployment needs consent as creating
+	// one does: it replaces what runs there, maybe in production, and the
+	// MCP deploy always asked for it (owner's decision Q1, spec REQ-12: one
+	// gate for both surfaces). Before v1.2 only a VM without a public IP
+	// was gated here, for the billed floating IP deploy makes for it
+	// (release QA, B-lifecycle 1); the preview still says so.
 	if !isNewDeploy {
 		if opts.DryRun {
 			// --dry-run must not touch the VM. It stops before step 2,
@@ -167,6 +184,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 		}
 		return clerrors.ProjectRequired()
 	}
+
 	if isNewDeploy {
 		if err := e.DeployInputError(); err != nil {
 			return err
@@ -199,6 +217,13 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 	}
 
 	var rec state.DeploymentRecord
+	if opts.Result != nil {
+		action := "updated"
+		if isNewDeploy {
+			action = "created"
+		}
+		defer func() { *opts.Result = DeployResult{Record: rec, Action: action} }()
+	}
 	if isNewDeploy {
 		// Step 3: Provision.
 		rec, err = e.provisionVM(ctx, opts, stateFile, statePath, project, region)
@@ -212,6 +237,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 			return err
 		}
 	}
+
 	ctx, cancel := e.bounded(ctx)
 	defer cancel()
 	if !isNewDeploy {
@@ -266,6 +292,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 	switch {
 	case isNewDeploy:
 	case rec.SSHHostKeyFingerprint == "" && unfinishedStatuses[existing.Status]:
+
 	case rec.SSHHostKeyFingerprint == "":
 		// Never reached over SSH (an earlier run timed out, or a VM made by
 		// vm create): it may be booting again after a reboot from the console.
@@ -289,13 +316,17 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 		var going *InProgress
 		switch {
 		case stderrors.As(err, &going):
+
 			keepUnfinished(&rec)
 			if clock.Since(rec.SSHWait.Since) >= e.timings().SSHSlowNote {
 				going.Note = sshSlowText(rec.VMIP, rec.SSHWait.Limit)
 			}
 		case caller.Err() != nil:
+
 			keepUnfinished(&rec)
 		default:
+			// The status says which: a refused key or a changed host key
+			// is not a timeout, and a re-run will not fix it (QA r4 Q7).
 			rec.SSHWait = nil
 			rec.Status = "ssh_timeout"
 			switch clerrors.Reason(err) {
@@ -326,6 +357,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 
 	// Install Docker if the image has none (Ubuntu/Debian chosen by init).
 	if err := e.prepareDocker(ctx, rec.VMIP, sshUserForConnect, rec.SSHHostKeyFingerprint); err != nil {
+
 		err = e.atBound(caller, err)
 		var going *InProgress
 		if !stderrors.As(err, &going) && ctx.Err() == nil {
@@ -353,6 +385,7 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 	}
 	e.phase = "upload"
 	if err := e.Deployer.Upload(ctx, files); err != nil {
+
 		err = e.atBound(caller, err)
 		var going *InProgress
 		if stderrors.As(err, &going) || ctx.Err() != nil {
@@ -379,12 +412,14 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 		err = fmt.Errorf("exit status %d", st.Exit)
 	}
 	if err != nil {
+
 		err = e.atBound(caller, err)
 		var going *InProgress
 		if stderrors.As(err, &going) || ctx.Err() != nil {
 			e.decided = true
 			return err
 		}
+
 		ce := clerrors.Wrap(clerrors.CodeComposeFailed,
 			i18n.T("docker compose up failed", "docker compose up завершился ошибкой"),
 			i18n.T("Check your compose file; logs shows the services' logs (none if compose up started no container).",
@@ -431,6 +466,8 @@ func (e *Engine) Deploy(ctx context.Context, opts DeployOptions) (retErr error) 
 		e.Printer.StepDone(i18n.T("No exposed ports to verify", "Открытых портов нет, проверять нечего"))
 	}
 
+	// --json: the result on stdout, as destroy and status give it (QA r4
+	// Q1: "evo deploy --yes --json > deploy.json" in docs/exit-codes.md).
 	if e.Printer.IsJSON() {
 		out := map[string]any{
 			"status": "deployed", "vm_id": rec.VMID, "vm_ip": rec.VMIP,
@@ -547,9 +584,11 @@ func (e *Engine) resolveFlavor(ctx context.Context, opts DeployOptions, project 
 	if err != nil {
 		return "", fmt.Errorf(i18n.T("list flavors: %w", "список flavor: %w"), err)
 	}
+
 	zone := e.deployZone(ctx, firstNonEmpty(opts.Region, e.Config.Region))
 
 	if flavor != "" && flavor != "auto" {
+
 		for _, f := range flavors {
 			if f.ID == flavor || f.Name == flavor {
 				return flavor, FlavorOutOfZone(f, zone)
@@ -640,6 +679,7 @@ func (e *Engine) provisionVM(ctx context.Context, opts DeployOptions, stateFile 
 	}
 
 	vmName := e.deployVMName()
+
 	if err := e.deployNameFree(ctx, projectID, vmName, stateFile); err != nil {
 		return state.DeploymentRecord{}, err
 	}
@@ -781,6 +821,7 @@ func (e *Engine) provisionVM(ctx context.Context, opts DeployOptions, stateFile 
 	createStart := time.Now()
 	vm, createErr := provision.CreateVMChecked(ctx, e.Cloud, req)
 	if createErr != nil && provision.CreateRejected(createErr) {
+
 		relErr := e.releaseBootFIP(bootFIP, projectID) // the warning is printed
 		if provision.IsNameTaken(createErr) {
 			created := i18n.T("nothing was created", "ничего не создано")
@@ -878,6 +919,10 @@ func (e *Engine) provisionVM(ctx context.Context, opts DeployOptions, stateFile 
 		wait.Done() // the question goes to the same terminal
 		deleted, err := e.handleInterrupt(sig, vm.ID, opts.NonInteractive)
 		if deleted {
+			// The VM goes asynchronously and its FIP stays attached until
+			// it is gone: wait, then release with retries, like destroy.
+			// Only then the record goes; if the FIP stays, the record keeps
+			// its floating_ip_id so 'evo destroy' finishes the job (QA H2).
 			rctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 			gone := e.waitVMGone(rctx, vm.ID)
@@ -906,6 +951,7 @@ func (e *Engine) provisionVM(ctx context.Context, opts DeployOptions, stateFile 
 	}
 
 	var vmPollRefusals refusals
+
 	var bound <-chan time.Time
 	if !e.until.IsZero() {
 		bound = time.After(time.Until(e.until))
@@ -994,9 +1040,12 @@ func (e *Engine) provisionVM(ctx context.Context, opts DeployOptions, stateFile 
 				return rec, nil
 			}
 			if provision.VMFailed(updated.Status) {
+				// The record says so too: status showed "creating" for a
+				// VM in error_creating (QA r4 Q6). destroy deletes it.
 				rec.Status = "error"
 				rec.UpdatedAt = time.Now()
 				stateFile.UpsertDeployment(rec)
+
 				return rec, e.writeDecided(statePath, stateFile, clerrors.New(clerrors.CodeVMProvisionFailed,
 					i18n.Tf("VM %s entered state %s", "ВМ %s перешла в состояние %s", vm.ID, strconv.Quote(updated.Status)),
 					i18n.T("Check Cloud.ru console for details.", "Подробности — в консоли Cloud.ru.")))
@@ -1054,7 +1103,7 @@ func (e *Engine) giveFloatingIP(ctx context.Context, progress func(string), vmID
 	name := floatingip.NameFor(sf, projectID, fipName(vmID), clock.Now())
 	ip, id, err := assignFloatingIP(ctx, e.Cloud, e.timings(), progress, vmID, name, projectID, azID)
 	if lost, ok := floatingip.AsLost(err); ok {
-		floatingip.Note(sf, state.LostFloatingIP{Name: lost.Name, ProjectID: projectID, VMName: vmName, VMID: vmID,
+		floatingip.Note(sf, state.LostFloatingIP{Name: lost.Name, Attempt: lost.Attempt, ProjectID: projectID, VMName: vmName, VMID: vmID,
 			RequestedAt: clock.Now(), CreatedBy: e.Maker()})
 		return "", "", LostAddressError(lost, vmID, "")
 	}
@@ -1197,20 +1246,21 @@ func (e *Engine) createBootFIP(ctx context.Context, projectID, azID, vmName stri
 	}
 	// A free boot FIP of this VM name left by an earlier run (its release
 	// failed after a 409, break r3a R3A-2) is taken instead of a second
-	// billed address. A boot FIP name is unique to its VM name.
-	if f := e.leftBootFIP(ctx, projectID, vmName); f != nil {
+	// billed address. An unresolved create is reconciled only by its receipt.
+	if f := e.leftBootFIP(ctx, projectID, vmName, sf); f != nil {
 		e.Printer.StepDone(i18n.Tf("Reusing floating IP %s left by an earlier run",
 			"Использую floating IP %s, оставшийся от прошлого запуска", f.IPAddress))
 		return f, nil
 	}
-	name := provision.BootFIPName(vmName, clock.Now())
+	now := clock.Now()
+	name := floatingip.NameFor(sf, projectID, provision.BootFIPName(vmName, now), now)
 	fip, err := floatingip.Reserve(ctx, e.Cloud, provision.CreateFloatingIPRequest{
 		Name:               name,
 		ProjectID:          projectID,
 		AvailabilityZoneID: azID,
 	}, floatingip.Free, e.timings().FIPLookupInterval, e.Printer.StepDone)
 	if lost, ok := floatingip.AsLost(err); ok {
-		floatingip.Note(sf, state.LostFloatingIP{Name: lost.Name, ProjectID: projectID, VMName: vmName,
+		floatingip.Note(sf, state.LostFloatingIP{Name: lost.Name, Attempt: lost.Attempt, ProjectID: projectID, VMName: vmName,
 			RequestedAt: clock.Now(), CreatedBy: e.Maker()})
 		return nil, LostAddressError(lost, "", "")
 	}
@@ -1241,8 +1291,8 @@ func askAddress(err error) error {
 		return err
 	}
 	return clerrors.Wrap(clerrors.CodeConfirmationRequired,
-		i18n.Tf("floating IP %s, which an earlier run asked for, got no answer from the cloud, and the list does not show it: the request may have been accepted, and the address billed. No second address was requested",
-			"floating IP %s, который запросил прошлый запуск, не получил ответа облака, и список его не показывает: запрос мог быть принят, а адрес — тарифицироваться. Второй адрес не запрашивался", ask.Mark.Name),
+		i18n.Tf("floating IP %s, which an earlier run asked for, got no answer from the cloud, and its address could not be identified in the list: the request may have been accepted, and the address billed. No second address was requested",
+			"floating IP %s, который запросил прошлый запуск, не получил ответа облака, и установить его адрес по списку не удалось: запрос мог быть принят, а адрес — тарифицироваться. Второй адрес не запрашивался", ask.Mark.Name),
 		i18n.Tf("Check list_floating_ips for the name %s; whether to reserve another address is the person's to answer.",
 			"Проверьте 'evo vpc fips' по имени %s, затем запустите команду в терминале и ответьте на вопрос: резервировать ли другой адрес, решает человек.", ask.Mark.Name),
 		err)
@@ -1263,10 +1313,11 @@ func LostAddressError(lost *floatingip.LostError, vmID, vmState string) error {
 		return clerrors.Wrap(code,
 			i18n.Tf("reserving floating IP %s got no answer from the cloud (%v): the request may have been accepted, and the address billed. No VM was created, and no second address was requested",
 				"резервирование floating IP %s не получило ответа облака (%v): запрос мог быть принят, а адрес — тарифицироваться. ВМ не создана, второй адрес не запрашивался", lost.Name, lost.Err),
-			i18n.Tf("Check list_floating_ips for the name %s, then repeat the same call: it takes that address if the list shows it bound to nothing; if the list does not show it, the call asks first — whether to reserve another address is the person's to answer.",
-				"Проверьте 'evo vpc fips' по имени %s и повторите ту же команду: она возьмёт этот адрес, если список показывает его ни к чему не привязанным; если списка с ним нет, команда сначала спросит — резервировать ли другой адрес, решает человек.", lost.Name),
+			i18n.Tf("Check list_floating_ips for the name %s, then repeat the same call: it takes that address if the list confirms the create receipt and shows it bound to nothing; if the list does not show it, the call asks first — whether to reserve another address is the person's to answer.",
+				"Проверьте 'evo vpc fips' по имени %s и повторите ту же команду: она возьмёт этот адрес, если список подтверждает метку запроса и показывает адрес ни к чему не привязанным; если списка с ним нет, команда сначала спросит — резервировать ли другой адрес, решает человек.", lost.Name),
 			lost)
 	}
+
 	state := i18n.T("its state not reported", "состояние не сообщается")
 	if vmState != "" {
 		state = i18n.Tf("state %s", "состояние %s", strconv.Quote(vmState))
@@ -1274,8 +1325,8 @@ func LostAddressError(lost *floatingip.LostError, vmID, vmState string) error {
 	return clerrors.Wrap(code,
 		i18n.Tf("VM %s is created (%s) and billed, but reserving its floating IP %s got no answer from the cloud (%v): the request may have been accepted, and the address billed. No second address was requested",
 			"ВМ %s создана (%s) и тарифицируется, но резервирование её floating IP %s не получило ответа облака (%v): запрос мог быть принят, а адрес — тарифицироваться. Второй адрес не запрашивался", vmID, state, lost.Name, lost.Err),
-		i18n.Tf("Check list_floating_ips for the name %s and the VM with vm_get %s, then repeat the same call: it takes that address if the list shows it free or on this VM; if the list does not show it, the call asks first — whether to reserve another address is the person's to answer.",
-			"Проверьте 'evo vpc fips' по имени %s и ВМ — 'evo vm get %s', затем повторите ту же команду: она возьмёт этот адрес, если список показывает его свободным или на этой ВМ; если списка с ним нет, команда сначала спросит — резервировать ли другой адрес, решает человек.", lost.Name, vmID),
+		i18n.Tf("Check list_floating_ips for the name %s and the VM with vm_get %s, then repeat the same call: it takes that address if the list confirms the create receipt and shows it free or on this VM; if the list does not show it, the call asks first — whether to reserve another address is the person's to answer.",
+			"Проверьте 'evo vpc fips' по имени %s и ВМ — 'evo vm get %s', затем повторите ту же команду: она возьмёт этот адрес, если список подтверждает метку запроса и показывает адрес свободным или на этой ВМ; если списка с ним нет, команда сначала спросит — резервировать ли другой адрес, решает человек.", lost.Name, vmID),
 		lost)
 }
 
@@ -1325,7 +1376,12 @@ func BootFIPAttachID(fip *provision.FloatingIP) string {
 
 // leftBootFIP finds a free boot FIP of vmName in the project, or nil. A
 // failed lookup is nil: a new address is made then, as before.
-func (e *Engine) leftBootFIP(ctx context.Context, projectID, vmName string) *provision.FloatingIP {
+func (e *Engine) leftBootFIP(ctx context.Context, projectID, vmName string, sf *state.File) *provision.FloatingIP {
+	// An outstanding create requires its matching receipt, even after consent
+	// to reserve another address. Reuse by prefix would bypass Settle.
+	if len(floatingip.Of(sf, projectID, vmName, "")) > 0 {
+		return nil
+	}
 	fips, err := e.Cloud.ListFloatingIPs(ctx, projectID)
 	if err != nil {
 		return nil
@@ -1350,6 +1406,7 @@ func (e *Engine) releaseBootFIP(fip *provision.FloatingIP, projectID string) err
 	if fip == nil {
 		return nil
 	}
+
 	t := e.timings()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(t.settlePolls())*t.FIPPollInterval+30*time.Second)
 	defer cancel()
@@ -1545,6 +1602,7 @@ func (e *Engine) awaitCreated(ctx context.Context, rec *state.DeploymentRecord, 
 				rec.Status = "error"
 				rec.UpdatedAt = time.Now()
 				stateFile.UpsertDeployment(*rec)
+
 				return e.writeDecided(statePath, stateFile, clerrors.New(clerrors.CodeVMProvisionFailed,
 					i18n.Tf("VM %s entered state %s", "ВМ %s перешла в состояние %s", rec.VMID, strconv.Quote(vm.Status)),
 					i18n.T("Check Cloud.ru console for details.", "Подробности — в консоли Cloud.ru.")))
@@ -1601,11 +1659,14 @@ func (e *Engine) waitForSSH(ctx context.Context, ip, user, knownHostKey string, 
 		}
 		lastErr = err
 		w.Attempts++
+		// A fresh VM's sshd can take minutes: say so once a minute, as the
+		// wait for an active VM does, so it does not look hung (QA r4 Q13).
 		if time.Since(lastReport) >= time.Minute {
 			e.Printer.StepDone(i18n.Tf("waiting for SSH on %s (%s elapsed: %s)", "ожидание SSH на %s (прошло %s: %s)",
 				ip, clock.Since(w.Since).Round(time.Second), errLine(err)))
 			lastReport = time.Now()
 		}
+
 		if !noted && clock.Since(w.Since) >= t.SSHSlowNote {
 			e.Printer.Warning(sshSlowText(ip, w.Limit))
 			noted = true
@@ -1617,6 +1678,7 @@ func (e *Engine) waitForSSH(ctx context.Context, ip, user, knownHostKey string, 
 				return err
 			}
 		}
+
 		if e.past() {
 			return &InProgress{Phase: "ssh", Detail: errLine(err)}
 		}
@@ -1631,6 +1693,7 @@ func (e *Engine) waitForSSH(ctx context.Context, ip, user, knownHostKey string, 
 		case <-time.After(wait):
 		}
 	}
+
 	hint := i18n.Tf("What next — the person decides: an agent should ask them and not repeat deploy on its own. "+
 		"The VM stays running and is billed until the person deletes it. "+
 		"First check that SSH gets out of the network evo runs in: nc -vz %s 22 (outbound port 22 is often closed by a corporate firewall, a VPN or an agent's sandbox; then the VM is fine). "+
@@ -1651,10 +1714,6 @@ func (e *Engine) waitForSSH(ctx context.Context, ip, user, knownHostKey string, 
 		hint, lastErr)
 }
 
-// sshSlowText is why deploy still waits for SSH on ip past the usual few
-// minutes, and what that may mean. Two ends: the VM's first boot, and the
-// network evo runs in — outbound port 22 closed there looks the same
-// (agent run C2, Ц-8: the agent's sandbox let no SSH out).
 func sshSlowText(ip string, attempts int) string {
 	return i18n.Tf("SSH on %s does not answer yet. A new VM usually answers within 2-5 minutes; on Cloud.ru its first boot "+
 		"sometimes does not bring the network up, and then SSH never answers. The network evo runs in may also let no SSH out "+
@@ -1726,12 +1785,14 @@ func (e *Engine) prepareDocker(ctx context.Context, ip, user, hostKey string) er
 	e.Printer.StepDone(i18n.T("Preparing Docker on the VM (a fresh VM takes a few minutes)...",
 		"Подготовка Docker на ВМ (на новой ВМ — несколько минут)..."))
 	var lastErr error
+
 	var lastOut, failOut string
 	// permanent: the install refused in a way another attempt repeats
 	// (an unsupported OS, no keyring for the official mirror): no retries
 	// until the deadline (break r4, R4-15, R4-17).
 	permanent := false
 	for attempt := 1; ; attempt++ {
+
 		st, err := e.runStage(ctx, "docker", stageInput(installCmd), installCmd, deadline, attempt > 1)
 		var going *InProgress
 		if stderrors.As(err, &going) {
@@ -1749,6 +1810,7 @@ func (e *Engine) prepareDocker(ctx context.Context, ip, user, hostKey string) er
 				_, err = e.Deployer.Exec(ctx, dockerReadyCmd)
 			}
 			if err == nil {
+
 				for _, l := range installNotes(out.String()) {
 					e.Printer.StepDone(l)
 				}
@@ -1821,6 +1883,9 @@ func (e *Engine) prepareDocker(ctx context.Context, ip, user, hostKey string) er
 	if d := installDiagnosis(failOut + "\n" + lastOut); d != "" {
 		hint = d + "\n" + hint
 	}
+	// The install's own output, and always how the last attempt ended: with
+	// an empty output (a dropped session, sudo refused, a timeout) the
+	// reason is all there is to tell "no DNS" from the rest (QA r4 Q14).
 	reason := i18n.Tf("Last attempt ended with: %s", "Последняя попытка завершилась так: %s", errLine(lastErr))
 	if tail := lastLines(lastOut, 15); tail != "" {
 		hint = i18n.T("Last output of the Docker install:\n", "Последние строки установки Docker:\n") + tail + "\n" + reason + "\n" + hint
@@ -1973,6 +2038,7 @@ func (e *Engine) vmLeftRunning(ctx context.Context, err error, vmID string) erro
 	if !stderrors.Is(ctx.Err(), context.Canceled) && !stderrors.Is(err, context.Canceled) {
 		return err
 	}
+
 	lost, isLost := floatingip.AsLost(err)
 	var cliErr *clerrors.CLIError
 	if !isLost && stderrors.As(err, &cliErr) && strings.Contains(cliErr.Hint, vmID) {
@@ -2023,9 +2089,11 @@ func (e *Engine) handleInterrupt(sig string, vmID string, nonInteractive bool) (
 
 	if confirm.IsYes(answer) {
 		e.Printer.StepDone(i18n.T("Deleting VM...", "Удаление ВМ..."))
+		// A VM still being created cannot be deleted yet: wait as destroy
+		// does instead of leaving it behind (QA H2).
 		deleteCtx, cancel := context.WithTimeout(context.Background(), e.timings().DeletableWaitTimeout+time.Minute)
 		defer cancel()
-		if err := e.deleteVMWhenDeletable(deleteCtx, vmID); err != nil {
+		if err := e.deleteVMWhenDeletable(deleteCtx, vmID, ""); err != nil {
 			e.Printer.Warning(i18n.Tf("Failed to delete VM: %v", "Не удалось удалить ВМ: %v", err))
 		} else {
 			e.Printer.StepDone(i18n.T("VM deleted", "ВМ удалена"))
@@ -2093,6 +2161,7 @@ func (e *Engine) waitVMGone(ctx context.Context, vmID string) bool {
 				return true
 			}
 		} else if vm != nil && vm.Status != last {
+
 			last = vm.Status
 			e.Printer.Step(0, 0, i18n.Tf("VM %s: %s, waiting until it is deleted…", "ВМ %s: %s, жду, пока она удалится…", vmID, vm.Status))
 		}
@@ -2109,8 +2178,8 @@ func (e *Engine) waitVMGone(ctx context.Context, vmID string) bool {
 // not found.
 func (e *Engine) WaitVMGone(ctx context.Context, vmID string) bool { return e.waitVMGone(ctx, vmID) }
 
-// ReleaseFloatingIP releases the FIP a record names (floating_ip_id, else
-// its address or the after-boot name), retrying while the platform still
+// ReleaseFloatingIP releases the FIP with the ID stored in the receipt,
+// retrying while the platform still
 // reports it attached to a just-deleted VM. Nothing to release is nil.
 func (e *Engine) ReleaseFloatingIP(ctx context.Context, rec *state.DeploymentRecord) error {
 	return e.releaseFloatingIP(ctx, rec)

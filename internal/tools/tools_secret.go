@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloud-ru/evo-cmcp/internal/engine"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 	"github.com/cloud-ru/evo-cmcp/internal/secret"
 )
 
@@ -94,6 +95,7 @@ func (s *Registry) planSecretCreate(ctx context.Context, args map[string]any) (*
 	if path == "" || value == "" {
 		return answered(usageT("'path' and 'value' are required", "нужны 'path' и 'value'"), true), nil
 	}
+
 	if err := plainName("secret", "name", path[strings.LastIndex(path, "/")+1:]); err != nil {
 		return nil, err
 	}
@@ -101,16 +103,22 @@ func (s *Registry) planSecretCreate(ctx context.Context, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+
 	list := func(ctx context.Context) ([]map[string]any, error) {
 		items, err := cli.List(ctx)
 		for _, it := range items {
-			it["name"] = it["path"]
+			path := stringArg(it, "path")
+			if strings.TrimSpace(path) == "" {
+				return nil, pager.Incomplete(i18n.T("a secret in the list has no path to check", "у секрета в списке нет пути для проверки"))
+			}
+			it["name"] = path
 		}
 		return items, err
 	}
 	if ans, refused := nameFree(ctx, list, i18n.T("secret", "секрет"), path, "secret_get path"); refused {
 		return answered(ans, true), nil
 	}
+
 	will := map[string]any{"path": path}
 	if d := stringArg(args, "description"); d != "" {
 		will["description"] = d
@@ -188,9 +196,11 @@ func (s *Registry) planSecretDelete(ctx context.Context, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+
 	if _, err := cli.Get(ctx, path); err != nil {
 		return answered(s.deleteFailed("secret_delete", path, err)), nil
 	}
+
 	force := true
 	if v, ok := args["force"].(bool); ok {
 		force = v

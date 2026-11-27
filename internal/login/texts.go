@@ -629,6 +629,10 @@ func eOrgStatus(status int, path string) string {
 	return i18n.Tf("the Organization API returned %d (%s)", "Organization API вернул %d (%s)", status, path)
 }
 
+func eOrgMissingID(collection string) string {
+	return i18n.Tf("entry without an ID in %s", "запись без ID в %s", collection)
+}
+
 // The items of «created / undone / left».
 func tUndoAccount(account string) string {
 	return i18n.Tf("service account %s", "сервисный аккаунт %s", account)
@@ -700,6 +704,8 @@ func TLogoutDone(profile string, key any) string {
 		"Профиль «%s» удален, %s. Сервисный аккаунт остался в проекте", profile, keyWords(key))
 }
 
+// keyWords is the status of the key in logout's answer, in words: the
+// line said «key: deleted» in English (plan 1.8, B-5 round 3 (в)).
 func keyWords(key any) string {
 	switch key {
 	case KeyDeleted:
@@ -724,6 +730,9 @@ func TLogoutRejected(keyID, accessKeyID string) string {
 		"IAM не принимает ключ %s (id в IAM %s): он отозван, истек или секрет неверен, поэтому evo не может его удалить. Если ключ еще виден в личном кабинете Cloud.ru («Сервисные аккаунты» → аккаунт → «Ключи доступа»), удалите его там", keyID, accessKeyID)
 }
 
+// eKeyNotDeleted names the key by its Key ID, as the preview did, and by
+// its id in IAM, as the console does: the two ids went without labels
+// (plan 1.8, B-5 round 3 (в)).
 func eKeyNotDeleted(keyID, accessKeyID string, err error) string {
 	return i18n.Tf("the access key %s (id in IAM %s) was not deleted: %v; the profile was kept",
 		"ключ доступа %s (id в IAM %s) не удален: %v; профиль сохранен", keyID, accessKeyID, err)

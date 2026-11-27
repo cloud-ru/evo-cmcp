@@ -18,6 +18,8 @@ func init() {
 	cobra.AddTemplateFunc("otherFlags", otherFlagUsages)
 }
 
+// commandGroups: group ID, English and Russian title, the commands in it.
+// A command missing here fails TestRootHelp_EveryCommandHasGroup.
 var commandGroups = []struct {
 	id, en, ru string
 	cmds       []string
@@ -41,7 +43,7 @@ var commandGroups = []struct {
 	{"account", "Monitoring, audit, billing, access:", "Мониторинг, аудит, биллинг, доступ:",
 		[]string{"metrics", "audit", "billing", "org", "iam"}},
 	{"scenarios", "Scenarios: a compose project, a stack:", "Сценарии: compose-проект, стек:",
-		[]string{"init", "deploy", "status", "logs", "verify", "destroy", "stack"}},
+		[]string{"init", "deploy", "status", "logs", "verify", "destroy", "cleanup", "stack"}},
 	{"setup", "Setup:", "Настройка:",
 		[]string{"login", "logout", "configure", "project", "whoami", "doctor", "history", "diag", "version", "completion", "help"}},
 	{"agents", "For AI agents:", "Для ИИ-агентов:",

@@ -10,6 +10,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
@@ -36,6 +37,10 @@ type deleteWatch struct {
 // operation. A variable only so that tests can shorten it.
 var deleteOutcomeWait = opWaitMaxSeconds
 
+// deleteOutcome is the answer of the delete w after the wait for its end;
+// with wait=false in the call's args it is deleting at once, reading
+// nothing (a script deleting many keeps its speed; the owner's decision
+// 03.11).
 func deleteOutcome(ctx context.Context, args map[string]any, w deleteWatch) (string, bool) {
 	// A delete with no operation (goneWatch: the resource is read until it
 	// is gone) names none: an empty operation_id read as one to wait for.
@@ -47,8 +52,30 @@ func deleteOutcome(ctx context.Context, args map[string]any, w deleteWatch) (str
 	if waitOff(args) {
 		return deleting(fields, w)
 	}
-	m, err := waitForOpJSON(ctx, deleteOutcomeWait, w.read)
+	wait := deleteOutcomeWait
+	readCtx := ctx
+	if w.tool == "ca_delete" && boolArg(args, "wait", false) {
+		wait = int(2 * time.Minute / time.Second)
+		if _, mcp := budgetLeft(ctx); mcp {
+			wait = opWaitMaxSeconds
+		}
+		// A GET started near the end of the polling window must end with it.
+		// Only the outcome reads inherit this deadline; DELETE has already returned.
+		var cancel context.CancelFunc
+		readCtx, cancel = context.WithTimeout(ctx, time.Duration(wait)*time.Second)
+		defer cancel()
+	}
+	m, err := waitForOpJSON(readCtx, wait, w.read)
+	// A transport can return the MCP cancellation cause instead of context.Canceled.
+	// Only the caller's cancellation interrupts a started delete; a read timeout leaves it pending.
+	if err != nil && ctx.Err() == context.Canceled {
+		err = context.Canceled
+	}
 	if errors.Is(err, context.Canceled) {
+
+		if w.tool == "ca_delete" {
+			nextStep(fields, w.next, w.nextArgs)
+		}
 		return errAnswer(err, fields), true
 	}
 	if err == nil && m != nil {

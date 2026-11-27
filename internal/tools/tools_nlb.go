@@ -209,15 +209,18 @@ func (s *Registry) planTgCreate(ctx context.Context, args map[string]any) (*Plan
 	if err != nil {
 		return nil, err
 	}
-	// A group of the name: a repeat after a lost answer made a second one
-	// (fault matrix, process audit 1.2.1).
-	existing, err := cli.ListTargetGroups(ctx)
+
+	list := func(ctx context.Context) ([]map[string]any, error) {
+		return namedResources(cli.ListTargetGroups(ctx))
+	}
+	existing, err := list(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("check the name is free: list target groups: %w", "проверка, что имя свободно: список целевых групп: %w"), err)
 	}
 	if id, st, ok := takenName(existing, name); ok {
 		return answered(nameTakenResult(i18n.T("target group", "целевая группа"), name, id, st, "tg_list")), nil
 	}
+
 	named := make([]map[string]any, 0, len(specs))
 	ifaceTypes := map[string]any{}
 	for i, sp := range specs {
@@ -259,7 +262,7 @@ func (s *Registry) planTgCreate(ctx context.Context, args map[string]any) (*Plan
 			if err == nil {
 				err = noID("operation")
 			}
-			return lostCreate(ctx, "tg_create", cli.ListTargetGroups, i18n.T("target group", "целевая группа"), name, nil, "tg_list", fmt.Errorf(i18n.T("create target group: %w", "создание целевой группы: %w"), err))
+			return lostCreate(ctx, "tg_create", list, i18n.T("target group", "целевая группа"), name, nil, "tg_list", fmt.Errorf(i18n.T("create target group: %w", "создание целевой группы: %w"), err))
 		}
 		out := map[string]any{"status": "creating", "operation_id": op.ID, "note": i18n.T("Async — poll lb_operation(operation_id) until done=true; then tg_list for the id.",
 			"Асинхронно — опрашивайте evo lb operation <operation_id> до done=true; затем id покажет evo tg list.")}
@@ -294,6 +297,10 @@ func (s *Registry) planTgDelete(ctx context.Context, args map[string]any) (*Plan
 
 // --- Load balancer create/delete ---
 
+// planLbCreate plans the create of a load balancer (gate.go). The preview
+// names the target group and the VPC by name as well as by id: the group
+// is read before the question, and the person agrees to what the
+// balancer serves (audit cli-ids-1.6, §3.2).
 func (s *Registry) planLbCreate(ctx context.Context, args map[string]any) (*Plan, error) {
 	name := stringArg(args, "name")
 	tgID := stringArg(args, "target_group_id")
@@ -315,7 +322,11 @@ func (s *Registry) planLbCreate(ctx context.Context, args map[string]any) (*Plan
 	if err != nil {
 		return nil, err
 	}
-	existing, err := cli.ListNLB(ctx)
+
+	list := func(ctx context.Context) ([]map[string]any, error) {
+		return namedResources(cli.ListNLB(ctx))
+	}
+	existing, err := list(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("check the name is free: list load balancers: %w", "проверка, что имя свободно: список балансировщиков: %w"), err)
 	}
@@ -332,6 +343,7 @@ func (s *Registry) planLbCreate(ctx context.Context, args map[string]any) (*Plan
 	tgVPC, _ := tg["vpc_id"].(string)
 	vpcID := stringArg(args, "vpc_id")
 	if vpcID != "" && tgVPC != "" && vpcID != tgVPC {
+
 		return nil, clierrors.New(clierrors.CodeConfigInvalid,
 			i18n.Tf("target group %s is in VPC %s, not in vpc_id %s; nothing was created", "целевая группа %s в VPC %s, а не в vpc_id %s; ничего не создано", tgID, quoteCloud(tgVPC), vpcID),
 			i18n.T("Omit vpc_id (the balancer takes its target group's VPC) or pass a target group of that VPC.", "Не указывайте vpc_id (балансировщик возьмёт VPC целевой группы) или передайте целевую группу этой VPC."))
@@ -410,12 +422,11 @@ func (s *Registry) planLbCreate(ctx context.Context, args map[string]any) (*Plan
 			if err == nil {
 				err = noID("operation")
 			}
-			return lostCreate(ctx, "lb_create", cli.ListNLB, i18n.T("load balancer", "балансировщик"), name, willCreate, "lb_get id", fmt.Errorf(i18n.T("create load balancer: %w", "создание балансировщика: %w"), err))
+			return lostCreate(ctx, "lb_create", list, i18n.T("load balancer", "балансировщик"), name, willCreate, "lb_get id", fmt.Errorf(i18n.T("create load balancer: %w", "создание балансировщика: %w"), err))
 		}
 		out := map[string]any{"status": "creating", "operation_id": op.ID, "created": willCreate, "note": i18n.T("Async — poll lb_operation(operation_id) until done=true; then lb_get for the external IP + status RUNNING.",
 			"Асинхронно — опрашивайте evo lb operation <operation_id> до done=true; затем внешний IP и статус RUNNING покажет evo lb get.")}
-		// The balancer's id is in the create's answer: named at once (fault
-		// matrix, process audit 1.2.1; as pg_create, N-07).
+
 		if op.ResourceID != "" {
 			out["lb_id"] = op.ResourceID
 		}
@@ -506,6 +517,7 @@ func lbZoneAndSubnet(ctx context.Context, eng *engine.Engine, args, tg map[strin
 			if zone == nil {
 				zone, from = z, "target group"
 			}
+
 			if n := quoteCloud(firstNonEmptyStr(z.Name, z.ID)); !slices.Contains(tzones, n) {
 				tzones = append(tzones, n)
 			}
@@ -528,6 +540,7 @@ func lbZoneAndSubnet(ctx context.Context, eng *engine.Engine, args, tg map[strin
 	}
 
 	if subnet != nil {
+
 		if subnet.VPCID != "" && vpcID != "" && subnet.VPCID != vpcID {
 			return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid,
 				i18n.Tf("subnet %s is not in VPC %s of the balancer; nothing was created", "подсеть %s не в VPC %s балансировщика; ничего не создано", subnetID, quoteCloud(vpcID)),
@@ -549,6 +562,7 @@ func lbZoneAndSubnet(ctx context.Context, eng *engine.Engine, args, tg map[strin
 	i := provision.PickSubnet(inVPC, zone.ID, zone.Name)
 	if i < 0 {
 		return none, "", "", nil, clierrors.New(clierrors.CodeConfigInvalid,
+
 			i18n.Tf("no subnet of VPC %[1]s in zone %[2]s for the balancer; nothing was created", "в зоне %[2]s нет подсети VPC %[1]s для балансировщика; ничего не создано",
 				quoteCloud(vpcID), quoteCloud(firstNonEmptyStr(zone.Name, zone.ID))),
 			i18n.T("Pass subnet_id (list: list_subnets) of a subnet in that zone and VPC, or another zone; ",

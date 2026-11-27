@@ -36,19 +36,23 @@ var pollInterval = 10 * time.Second
 
 // ApplyResult is the compact result returned to the agent after a deploy.
 type ApplyResult struct {
-	VMID         string `json:"vm_id"`
-	Status       string `json:"status"`
-	PublicIP     string `json:"public_ip,omitempty"`
+	VMID     string `json:"vm_id"`
+	Status   string `json:"status"`
+	PublicIP string `json:"public_ip,omitempty"`
+	// FloatingIPID is the VM's floating IP, kept in the state so destroy
+	// releases exactly it (QA r3 R2).
 	FloatingIPID string `json:"floating_ip_id,omitempty"`
 	// LostFloatingIP is the name of the VM's floating IP whose create got
 	// no answer: it may exist and be billed (floatingip.LostError). The
 	// tool keeps its mark in the state.
-	LostFloatingIP string `json:"lost_floating_ip,omitempty"`
-	SSH            string `json:"ssh,omitempty"`
-	Password       string `json:"password,omitempty"` // shown ONCE; not persisted
-	VMStatus       string `json:"vm_status,omitempty"`
-	ElapsedSec     int    `json:"elapsed_sec"`
-	Note           string `json:"note,omitempty"`
+	LostFloatingIP string               `json:"lost_floating_ip,omitempty"`
+	FIPReceipt     state.LostFloatingIP `json:"-"` // the attempt that was lost or recovered
+	SSH            string               `json:"ssh,omitempty"`
+	Password       string               `json:"password,omitempty"` // shown ONCE; not persisted
+
+	VMStatus   string `json:"vm_status,omitempty"`
+	ElapsedSec int    `json:"elapsed_sec"`
+	Note       string `json:"note,omitempty"`
 
 	// Ports is what Apply recorded about the security group: the group, the
 	// ports the VM needs and the rules Apply created (the caller keeps them
@@ -100,9 +104,12 @@ func ApplyWithTimeout(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 	// --- Idempotency: adopt an existing VM with the same name ---
 	existing, lookErr := findVMByName(ctx, cloud, plan.ProjectID, plan.VM.Name)
 	if lookErr != nil {
+		// Unknown is not "absent": creating now could make a second
+		// billed VM next to one a lost answer already created (QA H5).
 		return nil, fmt.Errorf(i18n.T("cannot check whether VM %q already exists (%w); nothing was created — retry deploy_apply", "не удалось проверить, есть ли уже ВМ %q (%w); ничего не создано — повторите deploy_apply"), plan.VM.Name, lookErr)
 	}
 	if existing != nil && !ownVM(plan, existing) {
+
 		return nil, &ForeignVMError{ID: existing.ID, Name: existing.Name, Status: existing.Status}
 	}
 	if existing != nil {
@@ -113,6 +120,8 @@ func ApplyWithTimeout(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 				Note:   "a VM with this name already exists in error state; whether to delete it (destroy) before a retry — ask the person",
 			}, nil
 		}
+		// Adopt only the plan's own VM: one with the same name in another
+		// zone is someone else's (QA r3 R8).
 		if z := existing.ZoneID(); z != "" && plan.VM.Zone.ID != "" && z != plan.VM.Zone.ID {
 			return nil, fmt.Errorf("a VM named %q already exists in another availability zone (%s); nothing was created — choose another name in deploy_plan", plan.VM.Name, z)
 		}
@@ -206,6 +215,7 @@ func ApplyWithTimeout(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 	createStart := time.Now()
 	vm, err := provision.CreateVMChecked(ctx, cloud, req)
 	if err != nil {
+
 		if provision.CreateRejected(err) {
 			return nil, fmt.Errorf(i18n.T("create VM: %w", "создание ВМ: %w"), err)
 		}
@@ -235,6 +245,7 @@ func finishApply(ctx context.Context, cloud provision.CloudAPI, plan *Plan, vm *
 	interrupted := func(ip, fipID string) (*ApplyResult, error) {
 		return &ApplyResult{
 				VMID: vm.ID, Status: "interrupted", PublicIP: ip, FloatingIPID: fipID,
+
 				Password:   password,
 				ElapsedSec: int(clock.Since(start).Seconds()),
 			}, fmt.Errorf("VM %s was created, but deploy_apply was interrupted; it is still running — "+
@@ -248,6 +259,7 @@ func finishApply(ctx context.Context, cloud provision.CloudAPI, plan *Plan, vm *
 		status = "running"
 	}
 	deadline := time.After(pollTimeout)
+
 	var budget <-chan time.Time
 	if !until.IsZero() {
 		budget = time.After(time.Until(until))
@@ -311,8 +323,12 @@ poll:
 	show.done(i18n.Tf("VM %s is running", "ВМ %s запущена", plan.VM.Name))
 
 	// --- Floating IP ---
-	var lostFIP string
+	var lostFIP state.LostFloatingIP
 	ip, fipID, fipNote := ensureFloatingIP(ctx, cloud, plan, vm.ID, &lostFIP)
+	var lostName string
+	if lostFIP.ID == "" {
+		lostName = lostFIP.Name
+	}
 	if ip != "" {
 		show.done(i18n.Tf("Public IP %s", "Публичный IP %s", ip))
 	}
@@ -321,7 +337,7 @@ poll:
 		// report a half-done VM as "running".
 		r, err := interrupted(ip, fipID)
 		if r != nil {
-			r.LostFloatingIP = lostFIP
+			r.LostFloatingIP, r.FIPReceipt = lostName, lostFIP
 		}
 		return r, err
 	}
@@ -357,7 +373,8 @@ poll:
 		Status:         status,
 		PublicIP:       ip,
 		FloatingIPID:   fipID,
-		LostFloatingIP: lostFIP,
+		LostFloatingIP: lostName,
+		FIPReceipt:     lostFIP,
 		SSH:            sshString(plan.SSH.Login, ip),
 		Password:       password,
 		ElapsedSec:     int(clock.Since(start).Seconds()),
@@ -444,6 +461,14 @@ func sshUnreachedNote(ip string, waited time.Duration, state portState) string {
 		ip, waited.Round(time.Second).String())
 }
 
+// ensureFloatingIP returns the VM's public IP, its floating IP id and a
+// note. The floating IP is evo's own, as in the CLI deploy: one already on
+// the VM (a retried deploy_apply adopts the VM with it — a second FIP used
+// to be created, QA r3 R2), the one a plan of an older version named, or a
+// new one. A free FIP of the user is never taken over: destroy releases the
+// deployment's FIP, and it used to release the user's reserved address with
+// it (QA r3 R9).
+// attachedFloatingIP is the floating IP already on the VM, if it can be read.
 func attachedFloatingIP(ctx context.Context, cloud provision.CloudAPI, vmID string) (ip, id string) {
 	detail, err := cloud.GetVMDetail(ctx, vmID)
 	if err != nil {
@@ -452,8 +477,8 @@ func attachedFloatingIP(ctx context.Context, cloud provision.CloudAPI, vmID stri
 	return detail.AttachedFloatingIP()
 }
 
-// lostName is set to the name of an address whose create got no answer.
-func ensureFloatingIP(ctx context.Context, cloud provision.CloudAPI, plan *Plan, vmID string, lostName *string) (ip, fipID, note string) {
+// lostMark records the attempt when its create got no answer.
+func ensureFloatingIP(ctx context.Context, cloud provision.CloudAPI, plan *Plan, vmID string, lostMark *state.LostFloatingIP) (ip, fipID, note string) {
 	if !plan.Network.FloatingIP {
 		return "", "", ""
 	}
@@ -486,10 +511,27 @@ func ensureFloatingIP(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 	// the interface. A free one of the name is an orphan of an earlier VM,
 	// not this VM's public IP (Cursor 1.2.3, A3).
 	own := func(x provision.FloatingIP) bool { return x.BoundTo(vmID) || x.BoundTo(ifaceID) || x.Pending() }
-	if x := floatingip.Find(ctx, cloud, plan.ProjectID, provision.FitName(plan.VM.Name, "-fip"), own); x != nil {
-		return x.IPAddress, x.ID, i18n.T("public IP attached (found the floating IP an earlier apply asked for by its name)",
-			"публичный IP подключён (найден по имени floating IP, запрошенный прошлым применением плана)")
+
+	var x *provision.FloatingIP
+	if len(plan.LostFIPs) != 0 {
+		sf := &state.File{LostFloatingIPs: append([]state.LostFloatingIP(nil), plan.LostFIPs...)}
+		x, err = floatingip.Settle(ctx, cloud, sf, plan.ProjectID, plan.VM.Name, vmID, own)
+		if err != nil {
+			return "", "", err.Error()
+		}
+		if x != nil {
+			*lostMark = state.LostFloatingIP{Name: x.Name, Attempt: x.Description, ID: x.ID}
+		}
+	} else {
+		x = floatingip.Find(ctx, cloud, plan.ProjectID, provision.FitName(plan.VM.Name, "-fip"), func(f provision.FloatingIP) bool {
+			return f.BoundTo(vmID) || f.BoundTo(ifaceID)
+		})
 	}
+	if x != nil {
+		return x.IPAddress, x.ID, i18n.T("public IP attached (matched the requested floating IP)",
+			"публичный IP подключён (подтверждён запрошенный floating IP)")
+	}
+
 	f, e := floatingip.Reserve(ctx, cloud, provision.CreateFloatingIPRequest{
 		Name:               name,
 		ProjectID:          plan.ProjectID,
@@ -503,7 +545,7 @@ func ensureFloatingIP(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 		return "", "", "⚠️ Floating-IP quota exhausted — the VM was created WITHOUT a public IP. Increase the floating-IP quota in the Cloud.ru console, then attach an IP to this VM manually."
 	}
 	if lost, ok := floatingip.AsLost(e); ok {
-		*lostName = lost.Name
+		lostMark.Name, lostMark.Attempt = lost.Name, lost.Attempt
 		return "", "", lostFIPNote(lost.Name, lost.Err)
 	}
 	// A refusal: no address came of it. deploy_apply again adopts the VM
@@ -516,7 +558,7 @@ func ensureFloatingIP(ctx context.Context, cloud provision.CloudAPI, plan *Plan,
 // was requested (ApplyResult.LostFloatingIP names it).
 func lostFIPNote(name string, err error) string {
 	return "the create of floating IP " + name + " got no answer from the cloud (" + err.Error() + "): the request may have been accepted, and the address billed. No second address was requested. Check list_floating_ips for the name " + name +
-		"; deploy_apply again with the same plan takes that address if the list shows it on this VM; if the list does not show it, it asks first — whether to reserve another address is the person's to answer"
+		"; deploy_apply again with the same plan takes that address if the list identifies this request and its address on the VM; otherwise it asks first — whether to reserve another address is the person's to answer"
 }
 
 // FloatingIPName is the name the plan's VM's floating IP is created by:
@@ -552,6 +594,10 @@ func (e *ForeignVMError) Error() string {
 		"ВМ с именем %q уже есть (id %q, %s), и её создал не evo этой папки (в её state её нет); ничего не создано", e.Name, e.ID, provision.VMStatusPhrase(e.Status))
 }
 
+// findVMByName looks the plan's VM up in its project. GET /vms without a
+// project_id returns no VMs (.github/review-context/cloudru-api.md), so the
+// adoption that a retry of deploy_apply promises never happened and the
+// retry created a second VM (QA H5).
 func findVMByName(ctx context.Context, cloud provision.CloudAPI, projectID, name string) (*provision.VM, error) {
 	vms, err := cloud.ListVMsInProject(ctx, projectID)
 	if err != nil {

@@ -41,10 +41,11 @@ type FlavorSpec struct {
 	RAMGB int    `json:"ram_gb"`
 	// FreeTier: the flavor of the free tier — the API's zero price for it
 	// is the price, not a failure (QuoteVM).
-	FreeTier bool   `json:"free_tier,omitempty"`
-	Share    string `json:"cpu_share,omitempty"`
-	GPU      int    `json:"gpu,omitempty"`
-	Spot     bool   `json:"spot,omitempty"`
+	FreeTier bool `json:"free_tier,omitempty"`
+
+	Share string `json:"cpu_share,omitempty"`
+	GPU   int    `json:"gpu,omitempty"`
+	Spot  bool   `json:"spot,omitempty"`
 }
 
 // RefSpec is an id+name reference (image, zone).
@@ -115,14 +116,17 @@ type Plan struct {
 	// one — a person said yes to one more while the first may still come
 	// (floatingip.NameFor). Not saved: the folder's state tells it.
 	FloatingIPName string `json:"-"`
+	// LostFIPs are the unresolved create receipts of this VM in the folder.
+	LostFIPs []state.LostFloatingIP `json:"-"`
 
 	// Internal fields needed by Apply (persisted, no secrets).
-	ComposeFile  string            `json:"compose_file,omitempty"`
-	MetaFields   []string          `json:"meta_fields,omitempty"` // image_metadata password fields generated at apply (older plans: also name/hostname/public_key)
-	MetaStatic   map[string]string `json:"meta_static,omitempty"` // image_metadata fields sent verbatim (no generated password; the caller's image_metadata values as given)
-	PublicKey    string            `json:"public_key,omitempty"`  // user public key (safe to persist)
-	UserKeysHash string            `json:"user_keys_hash,omitempty"`
-	SourceParams Params            `json:"source_params,omitempty"` // the request that produced this plan (for patch/re-plan)
+	ComposeFile string            `json:"compose_file,omitempty"`
+	MetaFields  []string          `json:"meta_fields,omitempty"` // image_metadata password fields generated at apply (older plans: also name/hostname/public_key)
+	MetaStatic  map[string]string `json:"meta_static,omitempty"` // image_metadata fields sent verbatim (no generated password; the caller's image_metadata values as given)
+	PublicKey   string            `json:"public_key,omitempty"`  // user public key (safe to persist)
+
+	UserKeysHash string `json:"user_keys_hash,omitempty"`
+	SourceParams Params `json:"source_params,omitempty"` // the request that produced this plan (for patch/re-plan)
 }
 
 // newPlanID returns a short random plan identifier.
@@ -174,6 +178,7 @@ func Save(stateDir string, p *Plan) error {
 	if err != nil {
 		return err
 	}
+
 	return config.WriteFileAtomic(filepath.Join(dir, p.PlanID+".json"), data, 0o600)
 }
 
@@ -204,12 +209,14 @@ func Load(stateDir, planID string) (*Plan, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf(i18n.T("plan %q is corrupt: %w", "план %q повреждён: %w"), planID, err)
 	}
+
 	if p.ExpiresAt.IsZero() {
 		return nil, fmt.Errorf(i18n.T("plan %q has no expires_at: deploy_plan did not make it; run deploy_plan again",
 			"у плана %q нет expires_at: его составил не deploy_plan; снова выполните deploy_plan"), planID)
 	}
 	if time.Now().After(p.ExpiresAt) {
-		return nil, fmt.Errorf("plan %q expired at %s; run deploy_plan again", planID, p.ExpiresAt.Format(time.RFC3339))
+		return nil, fmt.Errorf(i18n.T("plan %q expired at %s; run deploy_plan again",
+			"срок действия плана %q истёк %s. Снова выполните deploy_plan"), planID, p.ExpiresAt.Format(time.RFC3339))
 	}
 	return &p, nil
 }

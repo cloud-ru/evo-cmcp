@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"slices"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cloud-ru/evo-cmcp/internal/clock"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
+	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 	"github.com/cloud-ru/evo-cmcp/internal/images"
 	"github.com/cloud-ru/evo-cmcp/internal/pricing"
@@ -98,6 +100,7 @@ func Resolve(ctx context.Context, cloud provision.CloudAPI, projectID string, p 
 	if err != nil {
 		return nil, fmt.Errorf(i18n.T("list flavors: %w", "список flavor: %w"), err)
 	}
+
 	flavor, fwarn, err := selectFlavor(provision.FlavorsInZone(flavors, zone.ID, zone.Name), p)
 	if err != nil {
 		if f := flavorNamed(flavors, p.Flavor); f != nil {
@@ -181,6 +184,8 @@ func Resolve(ctx context.Context, cloud provision.CloudAPI, projectID string, p 
 		warnings = append(warnings, w)
 	}
 
+	// --- Floating IP: evo's own, created at apply. A free FIP of the user
+	// is not taken over — destroy releases the deployment's FIP (QA r3 R9).
 	wantFIP := p.ExternalIP
 	attachFIPID := ""
 
@@ -359,20 +364,22 @@ func pickImage(ctx context.Context, cloud provision.CloudAPI, projectID, want st
 				return *img, false, nil
 			}
 		}
-		// Ошибка выборки по проекту глотается намеренно: у токена может не быть
-		// прав на проектные образы, и тогда честный ответ — «такого образа нет»,
-		// а не «не удалось прочитать проект».
-		if own, e := cloud.ListImagesInProject(ctx, projectID); e == nil {
+		own, err := provision.ProjectImagesForSelection(ctx, cloud, projectID)
+		if err != nil && !maskedImageList(err) {
+			return provision.Image{}, false, err
+		}
+		if err == nil {
 			for _, img := range own {
 				if img.Name == want || img.ID == want {
 					return *img, true, nil
 				}
 			}
 		}
-		return provision.Image{}, false, fmt.Errorf(
-			i18n.T("image %q not found in the shared catalogue or in project %s (use the list_images tool to see options)",
-				"образ %q не найден ни в общем каталоге, ни в проекте %s (варианты — в выводе инструмента list_images)"),
-			want, projectID)
+		// The project catalogue can be hidden on its first page. Use the same
+		// answer as a completed search, without its URL, body or error chain.
+		return provision.Image{}, false, clierrors.New(clierrors.CodeNotFound,
+			i18n.T("Image not found.", "Образ не найден."),
+			i18n.T("Check the image name or ID in the list of available images.", "Проверьте имя или ID в списке доступных образов."))
 	}
 	// Default: prefer ubuntu 24.04 non-gpu.
 	for _, img := range images {
@@ -385,6 +392,19 @@ func pickImage(ctx context.Context, cloud provision.CloudAPI, projectID, want st
 		return *images[0], false, nil
 	}
 	return provision.Image{}, false, fmt.Errorf("no images available")
+}
+
+// Only a service 404 can conceal an image. A routing failure is produced
+// by the HTTP transport and retains its API_ERROR and routing hint.
+func maskedImageList(err error) bool {
+	if httpretry.RouteNotFound(err) {
+		return false
+	}
+	var coded *clierrors.CLIError
+	if errors.As(err, &coded) {
+		return coded.Code == clierrors.CodeNotFound
+	}
+	return provision.HTTPStatus(err) == http.StatusNotFound
 }
 
 // resolveAccess fills the image's metadata by its declared fields

@@ -8,13 +8,18 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/cloud-ru/evo-cmcp/internal/billing"
+	"github.com/cloud-ru/evo-cmcp/internal/clock"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
 )
 
+// maxBreakdown caps how many service line-items a billing tool returns. A tenant
+// can have 30+ services; an unbounded array overflows the agent's trajectory
+// (OpenClaw trajectory-array-size-limit → the turn becomes non-deliverable and
+// the agent "couldn't generate a response"). Top-N + a *_truncated count keeps
+// the signal (biggest spenders) without the overflow.
 const maxBreakdown = 12
 
 func (s *Registry) billingClient(ctx context.Context, args map[string]any) (*billing.Client, error) {
@@ -87,6 +92,7 @@ func (s *Registry) handleBillingBalance(ctx context.Context, args map[string]any
 	if err := s.balanceRefused(); err != nil {
 		return errResult(err), true
 	}
+
 	if os.Getenv("CLOUDRU_AGREEMENT_ID") == "" {
 		return errResult(billing.ErrBalanceNoAgreement()), true
 	}
@@ -143,6 +149,7 @@ func (s *Registry) handleBillingConsumption(ctx context.Context, args map[string
 	if end == "" {
 		end = start
 	}
+
 	if _, _, err := periodArgs(start, end); err != nil {
 		return errResult(err), true
 	}
@@ -231,6 +238,10 @@ type svcCost struct {
 	CostWithNDS float64 `json:"cost_with_nds"`
 }
 
+// serviceBreakdown is by_service: the services by cost excluding VAT,
+// descending, at most maxBreakdown, and how many were cut off. The cap keeps
+// a 30+-service array from overflowing the agent's trajectory (OpenClaw
+// trajectory-array-size-limit → non_deliverable turn).
 func serviceBreakdown(bySvc map[string]billSum) ([]svcCost, int) {
 	breakdown := make([]svcCost, 0, len(bySvc))
 	for k, v := range bySvc {
@@ -251,8 +262,9 @@ const maxFinopsDays = 366
 
 func (s *Registry) handleBillingFinops(ctx context.Context, args map[string]any) (string, bool) {
 	const layout = "2006-01-02"
-	now := time.Now().UTC()
+	now := clock.Now().UTC()
 	today := now.Format(layout)
+
 	days := pgInt(args, "days", 30)
 	end := stringArg(args, "end")
 	if end == "" {
@@ -284,6 +296,10 @@ func (s *Registry) handleBillingFinops(ctx context.Context, args map[string]any)
 	}
 	total, bySvc := aggregateConsumption(cons)
 
+	// Balance: billing.api.cloud.ru/v1/agreement is in none of Cloud.ru's
+	// published specs (api-contract §4.1). If it fails, the cost part of the
+	// summary still stands: the balance is "unknown", not an error. Without
+	// an agreement (consumption by project) there is no balance to ask for.
 	var bal map[string]any
 	balErr := s.balanceRefused()
 	if balErr == nil {
@@ -343,13 +359,16 @@ func (s *Registry) handleBillingFinops(ctx context.Context, args map[string]any)
 	}
 
 	out := map[string]any{
-		"period":              map[string]any{"start": start, "end": end, "days": periodDays},
-		"prev_period":         map[string]any{"start": prevStart, "end": prevEnd},
-		"currency":            "RUB",
-		"balance":             balance,
-		"active":              active,
-		"total_cost":          total.cost,
-		"daily_burn":          daily,
+		"period":      map[string]any{"start": start, "end": end, "days": periodDays},
+		"prev_period": map[string]any{"start": prevStart, "end": prevEnd},
+		"currency":    "RUB",
+		"balance":     balance,
+		"active":      active,
+		"total_cost":  total.cost,
+		"daily_burn":  daily,
+		// The sums including VAT (owner's decision 21.10); the runway and
+		// the budget stay on the sums excluding it until a live probe tells
+		// whether the balance is charged with VAT.
 		"total_cost_with_nds": total.withNDS,
 		"daily_burn_with_nds": total.withNDS / float64(periodDays),
 		"by_service":          breakdown,

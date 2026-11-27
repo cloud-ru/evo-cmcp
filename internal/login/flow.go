@@ -21,6 +21,7 @@ import (
 	"github.com/cloud-ru/evo-cmcp/internal/config"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/history"
+	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/iamadmin"
 	"github.com/cloud-ru/evo-cmcp/internal/intent"
 	"github.com/cloud-ru/evo-cmcp/internal/pager"
@@ -44,6 +45,8 @@ func (a Audience) account() string {
 	return "evo"
 }
 
+// Terms are the terms of a key the consent offers, in days; DefaultTerm is
+// the one chosen unless the person picks another (contract B-1, section 1).
 var Terms = []int{7, 30, 90}
 
 // DefaultTerm is the term chosen by default.
@@ -52,11 +55,13 @@ const DefaultTerm = 30
 // Choice is what the flags of evo login, or the terminal, choose before the
 // page: the page offers it chosen; an empty field leaves it to the page.
 type Choice struct {
-	Project                  string
-	For                      Audience
-	Days                     int
+	Project string
+	For     Audience
+	Days    int
+
 	Preselect, PreselectFrom string
-	PreselectEnv             bool
+
+	PreselectEnv bool
 }
 
 // Store is where the key goes: the profile of an audience, the key it holds
@@ -91,7 +96,8 @@ type Result struct {
 	// 35.4), the JSON answer has it.
 	Unchecked string
 	// CustomerName is the organization of the project, for the page.
-	CustomerName  string
+	CustomerName string
+
 	RoleExpiresAt time.Time
 	RoleUnbounded bool
 	AccountReused bool
@@ -176,7 +182,8 @@ type project struct {
 type session struct {
 	intentDone func(out history.Outcome, keep bool)
 	// undoLeft: the rollback could not remove what this login made.
-	undoLeft   bool
+	undoLeft bool
+
 	keyUnknown bool
 	cfg        Config
 	choice     Choice
@@ -430,6 +437,8 @@ func noRightIn(ps []project) error {
 	return clierrors.New(clierrors.CodeAuthFailed, eNoRightAny(len(ps)), eNoRightHint())
 }
 
+// noRight is the refusal of a person who may not make the access: AUTH_FAILED
+// before any write (contract B-1, step 12).
 func noRight(projectName string) error {
 	return clierrors.New(clierrors.CodeAuthFailed, eNoRight(projectName), eNoRightHint())
 }
@@ -463,21 +472,28 @@ func (s *session) orgList(ctx context.Context, path string, q url.Values, key st
 				eOrgUnreachable(),
 				clierrors.NetworkHint(err, eRetry()), err)
 		}
-		var m map[string]any
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &m) != nil {
-			return "", 0, withStatus(clierrors.New(clierrors.CodeAPIError,
-				eOrgStatus(resp.StatusCode, path), eRetry()), resp.StatusCode)
+		defer resp.Body.Close()
+		body, status, err := httpretry.ReadAPIResponse(req, resp, 4<<20)
+		if err != nil {
+			return "", 0, err
 		}
-		xs, _ := m[key].([]any)
-		for _, x := range xs {
-			if o, ok := x.(map[string]any); ok {
-				out = append(out, o)
+		err = pager.PageStatus(status, body, token != "", func(status int, _ []byte) error {
+			return withStatus(clierrors.New(clierrors.CodeAPIError, eOrgStatus(status, path), eRetry()), status)
+		})
+		if err != nil {
+			return "", 0, err
+		}
+		items, next, err := pager.ObjectPage[map[string]any](body, key, "next_page_token")
+		if err != nil {
+			return "", 0, err
+		}
+		for _, item := range items {
+			if strings.TrimSpace(str(item, "id")) == "" {
+				return "", 0, pager.Incomplete(eOrgMissingID(key))
 			}
 		}
-		next, _ := m["next_page_token"].(string)
-		return next, len(xs), nil
+		out = append(out, items...)
+		return next, len(items), nil
 	})
 	if err != nil {
 		return nil, err
@@ -537,6 +553,7 @@ func (s *session) grant(ctx context.Context, pl plan, say func(string)) (Result,
 	if err != nil && len(s.made) > 0 {
 		err = s.rollback(ctx, err)
 	}
+
 	if s.intentDone != nil {
 		s.intentDone(loginOutcome(err, s.keyUnknown, s.undoLeft), s.keyUnknown)
 		s.intentDone = nil
@@ -661,6 +678,7 @@ func (s *session) role(ctx context.Context, p project, sa string, term time.Time
 			if err := s.admin.ExtendPermission(ctx, perms[0].ID, term); err != nil {
 				return term, err
 			}
+
 			if perr == nil {
 				s.made = append(s.made, undo{tUndoRoleTerm(),
 					func(ctx context.Context) error { return s.admin.ExtendPermission(ctx, perms[0].ID, have) }})
@@ -762,6 +780,7 @@ func (s *session) rollback(ctx context.Context, cause error) error {
 	}
 	hint := eNotCompleteHint(len(left) > 0, next)
 	if s.keyUnknown {
+
 		hint = next
 	}
 	out := clierrors.Wrap(code, eNotComplete(why, made, undone, left), hint, cause)

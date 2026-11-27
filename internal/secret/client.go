@@ -23,6 +23,7 @@ import (
 
 	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
+	"github.com/cloud-ru/evo-cmcp/internal/pager"
 	"github.com/cloud-ru/evo-cmcp/internal/receipt"
 )
 
@@ -95,8 +96,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 		return nil, 0, fmt.Errorf(i18n.T("secret request failed: %w", "запрос к secret не удался: %w"), err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	return data, resp.StatusCode, nil
+	return httpretry.ReadAPIResponse(req, resp, 0)
 }
 
 func apiError(status int, body []byte) error {
@@ -121,16 +121,10 @@ func (c *Client) List(ctx context.Context) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status < 200 || status >= 300 {
-		return nil, apiError(status, data)
+	if err := pager.PageStatus(status, data, false, apiError); err != nil {
+		return nil, err
 	}
-	var out struct {
-		Secrets []map[string]any `json:"secrets"`
-	}
-	if err := json.Unmarshal(data, &out); err != nil {
-		return nil, fmt.Errorf(i18n.T("parse secrets: %w", "разбор секретов: %w"), err)
-	}
-	return out.Secrets, nil
+	return pager.UnpagedObjects[map[string]any](data, "secrets")
 }
 
 // Get returns one secret's metadata by path (no value).

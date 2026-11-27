@@ -7,6 +7,7 @@ import (
 	"context"
 	"maps"
 
+	"github.com/cloud-ru/evo-cmcp/internal/confirm"
 	clierrors "github.com/cloud-ru/evo-cmcp/internal/errors"
 	"github.com/cloud-ru/evo-cmcp/internal/httpretry"
 	"github.com/cloud-ru/evo-cmcp/internal/i18n"
@@ -16,7 +17,8 @@ import (
 type Plan struct {
 	// Preview is the answer the consent is asked on, without its status:
 	// the gate answers it as confirmation_required.
-	Preview   map[string]any
+	Preview map[string]any
+
 	PreviewOf func(ctx context.Context) (map[string]any, error)
 	// Execute makes the call; the gate runs it only with consent.
 	Execute func(ctx context.Context) (string, bool)
@@ -78,11 +80,21 @@ func (r *Registry) engineGated(ctx context.Context, name string, args map[string
 		// confirmed has it from intended already.
 		var end func(string)
 		prev := c.consent
-		c.consent = func() error {
+		c.consent = func(p *confirm.Preview) error {
 			if confirmed, _ := args["confirmed"].(bool); end != nil || confirmed {
 				return nil
 			}
-			e, err := r.beginIntent(ctx, name, args)
+			// Record the target the engine actually showed under its lock.
+			// Use the same identity and settlement rules as an addressed call.
+			journalArgs := args
+			if p != nil && len(p.TargetArgs) > 0 {
+				journalArgs = make(map[string]any, len(args)+len(p.TargetArgs))
+				maps.Copy(journalArgs, args)
+				for key, value := range p.TargetArgs {
+					journalArgs[key] = value
+				}
+			}
+			e, err := r.beginIntent(ctx, name, journalArgs)
 			end = e
 			return err
 		}
@@ -134,10 +146,12 @@ func (r *Registry) intended(t Tool, next Handler) Handler {
 			text = r.questionNamesTheCut(ctx, t.Name, args, text)
 			return r.namedKept(ctx, t.Name, args, text), isErr
 		}
+
 		holder := ctx
 		ctx = httpretry.CountWrites(ctx, func() (bool, error) {
 			return markSent(holder, func() []string { return r.partiesOf(holder, t.Name, args) })
 		})
+
 		if _, _, err := r.resourceOf(ctx, t.Name, args); err != nil {
 			return errResult(err), true
 		}
@@ -146,6 +160,7 @@ func (r *Registry) intended(t Tool, next Handler) Handler {
 		}); asked {
 			return text, true
 		}
+
 		var end func(string)
 		if held, goesOn := r.goesOn(ctx, t.Name, args); goesOn {
 			end = func(answer string) { cutSendOf(ctx, held, answer) }
@@ -155,6 +170,7 @@ func (r *Registry) intended(t Tool, next Handler) Handler {
 				return errResult(err), true
 			}
 		}
+
 		returned := false
 		defer func() {
 			if !returned {

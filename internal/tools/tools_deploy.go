@@ -69,10 +69,12 @@ func authorize(ctx context.Context, eng *engine.Engine) error {
 // from that plan's parameters and overlays only the provided fields (a patch),
 // so the user can tweak one value without restating everything.
 func (s *Registry) handleDeployPlan(ctx context.Context, args map[string]any) (string, bool) {
+
 	ports, err := portsArg("ports", args["ports"])
 	if err != nil {
 		return errResult(err), true
 	}
+
 	if _, ok := args["disk_gb"]; ok {
 		if err := provision.CheckBootDiskGB(intArg(args, "disk_gb", 0)); err != nil {
 			return errResult(err), true
@@ -151,6 +153,7 @@ func (s *Registry) handleDeployPlan(ctx context.Context, args map[string]any) (s
 	if err != nil {
 		return errResult(err), true
 	}
+
 	if ans, refused := vmNameFree(ctx, eng, plan.VM.Name, ownIn(folderVMs(eng))); refused {
 		return ans, true
 	}
@@ -162,6 +165,7 @@ func (s *Registry) handleDeployPlan(ctx context.Context, args map[string]any) (s
 	apply := i18n.T("On explicit approval, call deploy_apply with this plan_id and confirmed=true.",
 		"После явного согласия примените план: evo deploy apply с plan_id этого плана.")
 	if plan.ComposeRequired {
+		// deploy_apply makes the VM and nothing on it (G13-7).
 		apply += i18n.T(" deploy_apply creates the VM without the application: to deploy the compose project, call deploy instead.",
 			" evo deploy apply создаёт ВМ без приложения: чтобы развернуть проект compose, используйте evo deploy.")
 	}
@@ -245,16 +249,17 @@ func recordDeployment(stateDir string, maker *state.Maker, plan *deployplan.Plan
 	return state.Update(state.DefaultPath(stateDir), stateLockWait, func(sf *state.File) error {
 		now := time.Now()
 		rec := state.DeploymentRecord{
-			ID:                 res.VMID,
-			VMID:               res.VMID,
-			VMIP:               res.PublicIP,
-			FloatingIPID:       res.FloatingIPID,
-			CreatedBy:          maker,
-			ProjectID:          plan.ProjectID,
-			VMFlavor:           plan.VM.Flavor.Name,
-			Region:             plan.VM.Zone.ID,
-			SSHUser:            plan.SSH.Login,
-			Status:             status,
+			ID:           res.VMID,
+			VMID:         res.VMID,
+			VMIP:         res.PublicIP,
+			FloatingIPID: res.FloatingIPID,
+			CreatedBy:    maker,
+			ProjectID:    plan.ProjectID,
+			VMFlavor:     plan.VM.Flavor.Name,
+			Region:       plan.VM.Zone.ID,
+			SSHUser:      plan.SSH.Login,
+			Status:       status,
+
 			Source:             state.SourceDeployApply,
 			PlanID:             plan.PlanID,
 			SecurityGroupID:    res.Ports.SecurityGroupID,
@@ -263,12 +268,21 @@ func recordDeployment(stateDir string, maker *state.Maker, plan *deployplan.Plan
 			CreatedAt:          now,
 			UpdatedAt:          now,
 		}
+
 		if !plan.CreatedAt.IsZero() && plan.CreatedAt.Before(now) {
 			rec.CreatedAt = plan.CreatedAt
 		}
 		// An adopted VM opens nothing now: the rules an earlier apply
 		// created stay with it, so destroy still deletes them.
 		if old := sf.FindDeployment(res.VMID); old != nil {
+			if len(old.OpenedRules) > 0 {
+				if old.VMID != rec.VMID || old.ProjectID != "" && old.ProjectID != rec.ProjectID {
+					return clierrors.New(clierrors.CodeConfigInvalid, i18n.T("The saved port rules belong to another VM or project.", "Сохранённые правила портов относятся к другой ВМ или проекту."), "")
+				}
+				// An apply retry does not change who opened the saved rules
+				// or establish the missing project of a legacy receipt.
+				rec.CreatedBy, rec.ProjectID = old.CreatedBy, old.ProjectID
+			}
 			rec.CreatedAt = old.CreatedAt
 			// A retry that could not read the VM's interface returns no
 			// floating IP: the one recorded before stays, else destroy
@@ -287,14 +301,16 @@ func recordDeployment(stateDir string, maker *state.Maker, plan *deployplan.Plan
 			rec.OpenedRules = mergeRules(old.OpenedRules, rec.OpenedRules)
 		}
 		sf.UpsertDeployment(rec)
+		// A lost request stays open until this apply identifies the address of
+		// that same attempt. An unrelated address on the VM closes no receipt.
 		switch {
 		case res.LostFloatingIP != "":
-			floatingip.Note(sf, state.LostFloatingIP{Name: res.LostFloatingIP, ProjectID: plan.ProjectID, VMName: plan.VM.Name,
+			floatingip.Note(sf, state.LostFloatingIP{Name: res.LostFloatingIP, Attempt: res.FIPReceipt.Attempt, ProjectID: plan.ProjectID, VMName: plan.VM.Name,
 				VMID: res.VMID, RequestedAt: clock.Now(), CreatedBy: maker})
-		case res.FloatingIPID != "":
+		case res.FIPReceipt.ID != "" && res.FIPReceipt.ID == res.FloatingIPID:
 			for _, m := range floatingip.Of(sf, plan.ProjectID, plan.VM.Name, res.VMID) {
-				if !m.Answered {
-					floatingip.Forget(sf, plan.ProjectID, m.Name)
+				if m.Name == res.FIPReceipt.Name && m.Attempt != "" && m.Attempt == res.FIPReceipt.Attempt {
+					floatingip.Forget(sf, m)
 				}
 			}
 		}
@@ -317,6 +333,7 @@ func (s *Registry) planDeployApply(ctx context.Context, args map[string]any) (*P
 	}
 	plan, err := deployplan.Load(eng.StateDir, planID)
 	if err != nil {
+
 		if deployplan.Gone(eng.StateDir, planID) {
 			if applied := appliedPlan(eng.StateDir, planID); applied != nil {
 				return nil, applied
@@ -324,12 +341,15 @@ func (s *Registry) planDeployApply(ctx context.Context, args map[string]any) (*P
 		}
 		return nil, err
 	}
+
 	if err := s.continuedVM(ctx, "deploy_apply", args, plan.VM.Name); err != nil {
 		return nil, err
 	}
+
 	if err := eng.EnsureSSHKey(); err != nil {
 		return nil, err
 	}
+
 	var approvedKeys []string
 	approvedFile := ""
 	if plan.PublicKey == eng.SSHPubKey {
@@ -350,6 +370,7 @@ func (s *Registry) planDeployApply(ctx context.Context, args map[string]any) (*P
 		"expires_at": plan.ExpiresAt,
 		"preview":    preview,
 	}
+
 	if plan.Network.FloatingIP {
 		if ask := addressAsked(ctx, eng, plan.ProjectID, plan.VM.Name); ask != nil {
 			return answered(s.addressQuestion(ctx, "deploy_apply", eng, ask, answer), false), nil
@@ -382,15 +403,18 @@ func (s *Registry) applyDeployPlan(ctx context.Context, args map[string]any, eng
 	show := &deployplan.Progress{P: pp, Wait: eng.VMWaitLine(pp), Ports: func(r sgrules.OpenResult, rec *state.DeploymentRecord) {
 		engine.ShowOpenedPorts(pp, r, rec, cmp.Or(rec.SecurityGroupName, rec.SecurityGroupID))
 	}}
+
 	var until time.Time
 	if left, capped := s.waitLeft(ctx, args); capped {
+
 		until = time.Now().Add(left)
 	}
+
 	plan.Owned = folderVMs(eng)
+
 	if sf, err := state.Read(state.DefaultPath(eng.StateDir)); err == nil {
-		if name := provision.FitName(plan.VM.Name, "-fip"); floatingip.NameFor(sf, plan.ProjectID, name, clock.Now()) != name {
-			plan.FloatingIPName = floatingip.NameFor(sf, plan.ProjectID, name, clock.Now())
-		}
+		plan.LostFIPs = floatingip.Of(sf, plan.ProjectID, plan.VM.Name, "")
+		plan.FloatingIPName = floatingip.NameFor(sf, plan.ProjectID, provision.FitName(plan.VM.Name, "-fip"), clock.Now())
 	}
 	res, err := deployplan.ApplyWithTimeout(ctx, eng.Cloud, plan, eng.VMPollTimeout(), until, show)
 	var foreign *deployplan.ForeignVMError
@@ -405,6 +429,7 @@ func (s *Registry) applyDeployPlan(ctx context.Context, args map[string]any, eng
 			if rerr := recordDeployment(eng.StateDir, eng.Maker(), plan, res, "creating"); rerr != nil {
 				err = fmt.Errorf(i18n.T("%w (VM %s is not in the state either: %v)", "%w (ВМ %s тоже нет в state: %v)"), err, res.VMID, rerr)
 			}
+
 			fields = map[string]any{"vm_id": res.VMID, "plan_id": planID}
 			if res.Password != "" {
 				fields["password"] = res.Password
@@ -433,10 +458,12 @@ func (s *Registry) applyDeployPlan(ctx context.Context, args map[string]any, eng
 	case "running":
 		deployplan.Delete(eng.StateDir, planID)
 	case "creating":
+
 		out := map[string]any{"status": "creating", "vm_id": res.VMID, "vm_status": res.VMStatus, "plan_id": planID,
 			"elapsed_sec": res.ElapsedSec,
 			"next": i18n.Tf("The VM is still being created. Call deploy_apply again with next_args (plan_id %s, confirmed=true, vm_id): it adopts this VM (no second one), waits and finishes it (public IP, SSH, ports); if the VM is gone by then, it refuses and creates nothing. vm_get vm_id=%s shows its state.",
 				"ВМ ещё создаётся. Повторите evo deploy apply %s с --vm-id %[2]s: команда продолжит эту ВМ (вторую не создаст), дождётся её и доделает (публичный IP, SSH, порты); если ВМ к тому времени исчезнет — откажет и ничего не создаст. Состояние показывает evo vm get %[2]s.", planID, quoteCloud(res.VMID))}
+
 		nextStep(out, "deploy_apply", map[string]any{"plan_id": planID, "confirmed": true, continuedVMArg: res.VMID})
 		if res.Password != "" {
 			out["password"] = res.Password
@@ -450,6 +477,7 @@ func (s *Registry) applyDeployPlan(ctx context.Context, args map[string]any, eng
 			i18n.Tf("Whether to delete it (destroy vm_id %s) — ask the person; then run deploy_plan again (in another zone if it repeats).", "Удалять ли её (destroy vm_id %s) — спросите человека; затем снова выполните deploy_plan (при повторе — в другой зоне).", res.VMID)),
 			map[string]any{"vm_id": res.VMID}), true
 	case "timeout":
+
 		fields := map[string]any{"vm_id": res.VMID, "vm_status": res.Status, "plan_id": planID}
 		hint := fmt.Sprintf("Call deploy_apply again with the same plan_id %s in a few minutes: it adopts the VM and finishes it (IP, SSH, ports); it is billed meanwhile; whether to delete it instead (destroy vm_id %s) — ask the person.", planID, res.VMID)
 		if res.Password != "" {
@@ -598,6 +626,7 @@ func (s *Registry) handleListFlavors(ctx context.Context, args map[string]any) (
 		if f.Share != "" {
 			row["cpu_share"] = f.Share
 		}
+
 		if f.Share != "" && f.Share != "1:1" && est.Source == pricing.SourceVCPURAM {
 			row["est_note"] = "estimate without the vCPU share: the tariff prices a shared vCPU lower (tariff_url)"
 		}
@@ -633,6 +662,7 @@ func flavorMatches(f *provision.Flavor, args map[string]any) bool {
 	if s := stringArg(args, "share"); s != "" && f.Share != s {
 		return false
 	}
+
 	if z := stringArg(args, "zone"); z != "" && !provision.AvailableIn(f, z, z) {
 		return false
 	}
@@ -658,6 +688,7 @@ func (s *Registry) handleListDiskTypes(ctx context.Context, args map[string]any)
 	out := make([]map[string]any, 0, len(dts))
 	for _, d := range dts {
 		row := map[string]any{"id": d.ID, "name": d.Name}
+
 		if d.MinSize != nil {
 			row["min_size_gb"] = *d.MinSize
 		}
@@ -759,6 +790,7 @@ func (s *Registry) planOpenPorts(ctx context.Context, args map[string]any) (*Pla
 	if err != nil {
 		return nil, err
 	}
+
 	rules, _ := eng.Cloud.ListSecurityGroupRules(ctx, target.ID)
 	willOpen, alreadyOpen, wider := []string{}, []string{}, []string{}
 	// Ports a rule lets in only from another security group: not open to
@@ -779,6 +811,7 @@ func (s *Registry) planOpenPorts(ctx context.Context, args map[string]any) (*Pla
 			alreadyOpen = append(alreadyOpen, strconv.Itoa(p))
 		}
 	}
+
 	use := sgGroupUse(ctx, eng, target)
 	if len(willOpen) > 0 {
 		if err := internetOnSharedGroup(target, use, portsWords(willOpen, proto), cidr, boolArg(args, allowInternetArg, false)); err != nil {
@@ -803,6 +836,7 @@ func (s *Registry) planOpenPorts(ctx context.Context, args map[string]any) (*Pla
 			"В группе безопасности %q (%s из %s) уже открыты: %s. НЕ открыты, и open_ports правило для них не добавит: %s — правило пускает их только из другой группы безопасности (open_only_to_groups). Подтверждение ничего не изменит.",
 			target.Name, proto, cidr, open, strings.Join(only, ","))
 	} else if len(willOpen) == 0 {
+
 		message = i18n.Tf("Every port asked for is already open on security group %q (%s/%s from %s): the consent changes nothing, no rule is added.",
 			"Все запрошенные порты уже открыты в группе безопасности %q (%s/%s из %s): подтверждение ничего не изменит, правила не добавятся.",
 			target.Name, strings.Join(alreadyOpen, ","), proto, cidr)
@@ -831,6 +865,7 @@ func (s *Registry) planOpenPorts(ctx context.Context, args map[string]any) (*Pla
 	return &Plan{Preview: preview, Execute: func(ctx context.Context) (string, bool) {
 
 		var opened, skipped, skippedWider, failed []string
+
 		failures := map[string]string{}
 		var firstErr error
 		openedHere := map[int]bool{}
@@ -920,6 +955,7 @@ func securityGroupByRef(ctx context.Context, eng *engine.Engine, ref string) (*p
 		return named[0], nil
 	case 0:
 	default:
+
 		ids := make([]string, 0, len(named))
 		for _, g := range named {
 			ids = append(ids, g.ID)
@@ -1008,6 +1044,7 @@ func (s *Registry) planClosePorts(ctx context.Context, args map[string]any) (*Pl
 		var firstErr error
 		for _, c := range toClose {
 			port := strconv.Itoa(c.port)
+
 			if e := eng.Cloud.DeleteSecurityGroupRule(ctx, target.ID, c.id); e != nil && !isGone(e) {
 				failed = append(failed, port)
 				failures[port] = e.Error()
@@ -1042,6 +1079,7 @@ func (s *Registry) planClosePorts(ctx context.Context, args map[string]any) (*Pl
 
 // planReleaseFloatingIP plans the release of a floating IP (gate.go), refusing one in use.
 func (s *Registry) planReleaseFloatingIP(ctx context.Context, args map[string]any) (*Plan, error) {
+
 	ref, key, err := oneOfArgs(args, clierrors.New(clierrors.CodeUsage,
 		i18n.T("pass id or ip_address, not both", "укажите id или ip_address, не оба"),
 		i18n.T("The id comes from list_floating_ips; ip_address finds the floating IP by its address.",
@@ -1156,6 +1194,7 @@ func (s *Registry) handleListFloatingIPs(ctx context.Context, args map[string]an
 			"available":   f.Available(),
 			"nat_gateway": f.OnNATGateway(),
 		}
+
 		if f.Zone != nil && f.Zone.Name != "" {
 			row["zone"] = f.Zone.Name
 		}
